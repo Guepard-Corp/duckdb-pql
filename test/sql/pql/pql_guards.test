@@ -154,3 +154,26 @@ query I
 SELECT CAST(count(*) > 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users WHERE id < 3 USING MODEL gen');
 ----
 1
+
+# The same statement, run twice in one session, gives the same model. The SAGE
+# optimiser state used to persist between calls, so a second TRAIN started from
+# the previous model's Adam moments.
+statement ok
+TRAIN MODEL rep1 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 20, hidden = 32, arch = 'sage');
+
+statement ok
+TRAIN MODEL between PREDICT EXISTS(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 20, hidden = 16, arch = 'sage', layers = 2);
+
+statement ok
+TRAIN MODEL rep2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 20, hidden = 32, arch = 'sage');
+
+query I
+SELECT CAST(
+    (SELECT test FROM pql_exec('TRAIN MODEL rep3 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20, hidden = 32, arch = ''sage'')'))
+  = (SELECT test FROM pql_exec('TRAIN MODEL rep4 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20, hidden = 32, arch = ''sage'')'))
+  AS INTEGER);
+----
+1

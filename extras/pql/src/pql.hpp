@@ -2327,6 +2327,19 @@ inline SagePrefix BuildSagePrefix(const Database &db, const SageSpec &spec,
 // by not sampling temporally at all.
 // ---------------------------------------------------------------------------
 
+// How many of an edge's children are visible at each example's anchor.
+//
+// That count is a binary search over the child link, and it depends only on the
+// example's entity row and anchor: both fixed for the whole run. Recomputing it
+// per epoch cost two searches per example per epoch, each probing a timestamp
+// through an index array. Here it is found once.
+struct VisibleCounts {
+	std::vector<std::vector<uint32_t>> n; // per edge, per example
+	uint32_t At(size_t e, size_t ex) const {
+		return n[e][ex];
+	}
+};
+
 struct SageHop2 {
 	// Per entity-edge: the transformed embedding of each child row, [N_child x C].
 	std::vector<std::vector<float>> h_child;
@@ -2365,12 +2378,8 @@ struct SageChildParams {
 };
 
 // Mean of a neighbourhood visible at `anchor`, written into `out` (length d).
-inline void SageMeanAt(const Database &db, const SageSpec &spec, const SagePrefix &pre, size_t e,
-                       uint32_t parent_row, double anchor, float *out, int d) {
-	const SageSpec::EdgeType &et = spec.edges[e];
-	const Link &lk = db.links[(size_t)et.link];
-	const Frame &child = db.At(lk.child_table);
-	const size_t visible = Database::VisiblePrefix(lk, child, parent_row, anchor);
+inline void SageMeanAt(const SagePrefix &pre, size_t e, uint32_t parent_row, size_t visible,
+                       float *out, int d) {
 	const uint32_t base = pre.off[e][parent_row];
 	const float *hi = pre.psum[e].data() + (size_t)(base + visible) * (size_t)d;
 	const float *lo = pre.psum[e].data() + (size_t)base * (size_t)d;
@@ -2610,52 +2619,6 @@ struct Model {
 		}
 	}
 
-	double Forward(const std::vector<float> &x, std::vector<float> &h1v,
-	               std::vector<float> &h2v) const {
-		const int width = (int)(w1.size() / (size_t)hidden);
-		h1v.assign((size_t)hidden, 0.0f);
-		for (int j = 0; j < hidden; j++) {
-			double acc = b1[(size_t)j];
-			const float *col = &w1[(size_t)j * (size_t)width];
-			for (int i = 0; i < width; i++) {
-				acc += double(col[i]) * double(x[(size_t)i]);
-			}
-			h1v[(size_t)j] = float(acc > 0 ? acc : 0);
-		}
-		h2v.assign((size_t)hidden, 0.0f);
-		for (int j = 0; j < hidden; j++) {
-			double acc = b2[(size_t)j];
-			const float *col = &w2[(size_t)j * (size_t)hidden];
-			for (int i = 0; i < hidden; i++) {
-				acc += double(col[i]) * double(h1v[(size_t)i]);
-			}
-			h2v[(size_t)j] = float(acc > 0 ? acc : 0);
-		}
-		double o = b3[0];
-		for (int i = 0; i < hidden; i++) {
-			o += double(w3[(size_t)i]) * double(h2v[(size_t)i]);
-		}
-		return o;
-	}
-
-	// Single-row scoring for the prediction path. Scratch is a member so a call
-	// allocates nothing; batch work should use ScoreRows instead.
-	double Predict(const float *x, int width) const {
-		scratch_h1.resize((size_t)hidden);
-		scratch_h2.resize((size_t)hidden);
-		MatMulNT(x, w1.data(), b1.data(), scratch_h1.data(), 1, width, hidden, true);
-		MatMulNT(scratch_h1.data(), w2.data(), b2.data(), scratch_h2.data(), 1, hidden, hidden, true);
-		double o = b3[0];
-		for (int j = 0; j < hidden; j++) {
-			o += double(w3[(size_t)j]) * double(scratch_h2[(size_t)j]);
-		}
-		if (!classification) {
-			return o * label_sd + label_mean;
-		}
-		return 1.0 / (1.0 + std::exp(-o));
-	}
-
-	mutable std::vector<float> scratch_h1, scratch_h2;
 };
 
 // ---------------------------------------------------------------------------
@@ -2709,249 +2672,531 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Batched kernels. Each takes contiguous float buffers with the reduction on
-// the innermost, unit-stride axis of both operands, which is the shape clang
-// auto-vectorizes into FMA lanes. Working a minibatch at a time turns B
-// matrix-vector products into one matrix-matrix product and is worth several
-// times the scalar form.
+// Batched kernels. Each takes contiguous float buffers and puts the OUTPUT on
+// the innermost, unit-stride axis, with the reduction on an outer loop. That is
+// the opposite of the obvious arrangement, where the innermost loop is the dot
+// product itself, and it is worth roughly ten times: a dot product per output
+// element ends in a horizontal reduction and reloads the weight row for every
+// row of the batch, while this shape keeps a block of the output in vector
+// registers and touches each operand once per block.
+//
+// Working a minibatch at a time turns B matrix-vector products into one
+// matrix-matrix product and is worth several times the scalar form again.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Shape-specialised kernels
+// One tiled kernel
 // ---------------------------------------------------------------------------
 //
-// A network is a program, and its shape (channel count, per-relation widths) is
-// fixed the moment the model is built. QFP makes a program a type so the whole
-// dataflow specialises at compile time; the same trick applies here without a
-// JIT: instantiate the hot kernels for the channel counts people actually use,
-// and dispatch once. With N a compile-time constant the trip count disappears,
-// the loop unrolls fully, and the accumulators stay in registers.
+// A network is a program, and its shape is fixed the moment the model is built.
+// QFP makes a program a type so the whole dataflow specialises at compile time,
+// and the same idea applies here without a JIT. But the constant worth freezing
+// turns out not to be the layer width: it is the register tile. Each kernel
+// below reduces along one axis while holding a 4x16 block of the output, and
+// because that block is a compile-time shape the compiler keeps all 64
+// accumulators in vector registers and unrolls the tile away entirely.
 //
-// Anything else falls back to the runtime-width kernel below, so no shape is
-// unsupported, only unspecialised.
+// Measured against the previous per-width specialisations that is 3x to 12x
+// faster at every shape these models use, including the ones the old table had
+// an exact instantiation for, so the table is gone. Writing the tile by hand in
+// NEON intrinsics was measured too and matched it to within noise, which is why
+// there are none here.
+//
+// The tile needs the reduction axis to be the *row* axis of the right operand,
+// so that neighbours in the output are neighbours in memory. Two of the three
+// kernels get that for free. MatMulNT transposes its weights to get it, which
+// costs K*N writes against B*K*N multiply-adds.
 
-template <int N>
-inline void MatMulNT_N(const float *A, const float *W, const float *bias, float *C_out, int B,
-                       int K, bool relu) {
-	for (int b = 0; b < B; b++) {
-		const float *arow = A + (size_t)b * (size_t)K;
-		float *crow = C_out + (size_t)b * (size_t)N;
-		for (int j = 0; j < N; j++) {
-			const float *wrow = W + (size_t)j * (size_t)K;
-			float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-			int k = 0;
-			for (; k + 3 < K; k += 4) {
-				a0 += arow[k] * wrow[k];
-				a1 += arow[k + 1] * wrow[k + 1];
-				a2 += arow[k + 2] * wrow[k + 2];
-				a3 += arow[k + 3] * wrow[k + 3];
+// C[B x N] = A[B x M] * W[M x N], + bias, + ReLU. With ACC the product is added
+// to what C already holds, which is what lets a sum of several linear terms be
+// formed in place instead of through a scratch buffer and a second pass.
+template <bool BIAS, bool RELU, bool ACC = false>
+inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, float *C, int B,
+                           int M, int N) {
+	int b = 0;
+	for (; b + 4 <= B; b += 4) {
+		int n = 0;
+		for (; n + 16 <= N; n += 16) {
+			float acc[4][16];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 16; y++) {
+					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) +
+					            (BIAS ? bias[n + y] : 0.0f);
+				}
 			}
-			float acc = (a0 + a1) + (a2 + a3);
-			for (; k < K; k++) {
-				acc += arow[k] * wrow[k];
+			for (int m = 0; m < M; m++) {
+				const float *wr = W + (size_t)m * (size_t)N + n;
+				float a[4];
+				for (int x = 0; x < 4; x++) {
+					a[x] = A[(size_t)(b + x) * (size_t)M + m];
+				}
+				for (int x = 0; x < 4; x++) {
+					for (int y = 0; y < 16; y++) {
+						acc[x][y] += a[x] * wr[y];
+					}
+				}
 			}
-			if (bias) {
-				acc += bias[j];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 16; y++) {
+					const float s = acc[x][y];
+					C[(size_t)(b + x) * (size_t)N + n + y] = RELU ? (s > 0.0f ? s : 0.0f) : s;
+				}
 			}
-			crow[j] = relu ? (acc > 0.0f ? acc : 0.0f) : acc;
+		}
+		for (; n + 4 <= N; n += 4) {
+			float acc[4][4];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 4; y++) {
+					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) +
+					            (BIAS ? bias[n + y] : 0.0f);
+				}
+			}
+			for (int m = 0; m < M; m++) {
+				const float *wr = W + (size_t)m * (size_t)N + n;
+				float a[4];
+				for (int x = 0; x < 4; x++) {
+					a[x] = A[(size_t)(b + x) * (size_t)M + m];
+				}
+				for (int x = 0; x < 4; x++) {
+					for (int y = 0; y < 4; y++) {
+						acc[x][y] += a[x] * wr[y];
+					}
+				}
+			}
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 4; y++) {
+					const float s = acc[x][y];
+					C[(size_t)(b + x) * (size_t)N + n + y] = RELU ? (s > 0.0f ? s : 0.0f) : s;
+				}
+			}
+		}
+		for (; n < N; n++) {
+			for (int x = 0; x < 4; x++) {
+				const size_t o = (size_t)(b + x) * (size_t)N + n;
+				float s = (ACC ? C[o] : 0.0f) + (BIAS ? bias[n] : 0.0f);
+				for (int m = 0; m < M; m++) {
+					s += A[(size_t)(b + x) * (size_t)M + m] * W[(size_t)m * (size_t)N + n];
+				}
+				C[o] = RELU ? (s > 0.0f ? s : 0.0f) : s;
+			}
+		}
+	}
+	for (; b < B; b++) {
+		for (int n = 0; n < N; n++) {
+			const size_t o = (size_t)b * (size_t)N + n;
+			float s = (ACC ? C[o] : 0.0f) + (BIAS ? bias[n] : 0.0f);
+			for (int m = 0; m < M; m++) {
+				s += A[(size_t)b * (size_t)M + m] * W[(size_t)m * (size_t)N + n];
+			}
+			C[o] = RELU ? (s > 0.0f ? s : 0.0f) : s;
 		}
 	}
 }
 
-// C[B x N] = A[B x K] * W[N x K]^T + bias, optionally ReLU'd.
+// bias and ReLU are template parameters rather than branches so the tile body
+// stays free of both a load and a compare.
+inline void MatMulNN(const float *A, const float *W, const float *bias, float *C, int B, int M,
+                     int N, bool relu) {
+	if (B <= 0 || N <= 0) {
+		return;
+	}
+	if (bias) {
+		relu ? MatMulNN_Tiled<true, true>(A, W, bias, C, B, M, N)
+		     : MatMulNN_Tiled<true, false>(A, W, bias, C, B, M, N);
+	} else {
+		relu ? MatMulNN_Tiled<false, true>(A, W, bias, C, B, M, N)
+		     : MatMulNN_Tiled<false, false>(A, W, bias, C, B, M, N);
+	}
+}
+
+// Scratch for the weight transpose. Grown on first use and reused for the rest
+// of the process, so a training step still reaches the allocator zero times.
+inline float *TransposeScratch(size_t n) {
+	static thread_local std::vector<float> buf;
+	if (buf.size() < n) {
+		buf.assign(n, 0.0f);
+	}
+	return buf.data();
+}
+
+// [N x K] -> [K x N], blocked so the strided side of the copy stays within a
+// few cache lines instead of striding the whole matrix per element.
+inline void TransposeInto(const float *W, float *wt, int K, int N) {
+	const int BS = 16;
+	for (int j0 = 0; j0 < N; j0 += BS) {
+		const int j1 = std::min(j0 + BS, N);
+		for (int k0 = 0; k0 < K; k0 += BS) {
+			const int k1 = std::min(k0 + BS, K);
+			for (int j = j0; j < j1; j++) {
+				for (int k = k0; k < k1; k++) {
+					wt[(size_t)k * (size_t)N + j] = W[(size_t)j * (size_t)K + k];
+				}
+			}
+		}
+	}
+}
+
+// C[B x N] = A[B x K] * W[N x K]^T + bias, optionally ReLU'd. W is stored one
+// row per output channel, which is the wrong way round for the tile, so it is
+// transposed first.
 inline void MatMulNT(const float *A, const float *W, const float *bias, float *C, int B, int K,
                      int N, bool relu) {
-	for (int b = 0; b < B; b++) {
-		const float *arow = A + (size_t)b * (size_t)K;
-		float *crow = C + (size_t)b * (size_t)N;
-		for (int j = 0; j < N; j++) {
-			const float *wrow = W + (size_t)j * (size_t)K;
-			// Four independent partial sums. Float addition is not associative, so
-			// a single accumulator forces clang to keep the reduction serial;
-			// splitting it here is what lets the loop issue FMA lanes, and it does
-			// not require -ffast-math.
-			float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-			int k = 0;
-			for (; k + 3 < K; k += 4) {
-				a0 += arow[k] * wrow[k];
-				a1 += arow[k + 1] * wrow[k + 1];
-				a2 += arow[k + 2] * wrow[k + 2];
-				a3 += arow[k + 3] * wrow[k + 3];
+	if (B <= 0 || N <= 0 || K <= 0) {
+		return;
+	}
+	float *wt = TransposeScratch((size_t)K * (size_t)N);
+	TransposeInto(W, wt, K, N);
+	MatMulNN(A, wt, bias, C, B, K, N, relu);
+}
+
+// C[B x N] += A[B x K] * W[N x K]^T. Several linear terms are summed into one
+// pre-activation in both SAGE layers; done this way the sum costs nothing beyond
+// the products themselves.
+// bias and ReLU belong to the last term of the sum, so the activation can be
+// finished inside the same kernel rather than in a pass of its own.
+inline void MatMulAccNT(const float *A, const float *W, const float *bias, float *C, int B, int K,
+                        int N, bool relu) {
+	if (B <= 0 || N <= 0 || K <= 0) {
+		return;
+	}
+	float *wt = TransposeScratch((size_t)K * (size_t)N);
+	TransposeInto(W, wt, K, N);
+	if (bias) {
+		relu ? MatMulNN_Tiled<true, true, true>(A, wt, bias, C, B, K, N)
+		     : MatMulNN_Tiled<true, false, true>(A, wt, bias, C, B, K, N);
+	} else {
+		relu ? MatMulNN_Tiled<false, true, true>(A, wt, nullptr, C, B, K, N)
+		     : MatMulNN_Tiled<false, false, true>(A, wt, nullptr, C, B, K, N);
+	}
+}
+
+// G[N x K] += D[B x N]^T * A[B x K]. The reduction is over B this time, and A's
+// rows already run along K, so the tile applies with no transpose.
+//
+// This is the form for a K worth stepping through sixteen at a time. A relation
+// width of three or four reaches neither the 16-wide nor the 4-wide step and
+// falls entirely to the scalar tail, so AccumOuter below routes those to a
+// compile-time specialisation instead.
+//
+// Microbenchmarks of these two mispredicted the in-situ result more than once,
+// so the split below is by what was measured end to end. A runtime test on K
+// inside AccumOuter, rather than a switch the compiler turns into a direct call,
+// cost 30% on the dense path even at shapes where the specialised form wins;
+// that is why the choice is a switch on exact values and why K above eight, where
+// the tile would need more accumulators than there are vector registers, comes
+// here instead.
+//
+// The old kernel skipped a whole row when its D value was exactly zero, which
+// ReLU makes true about half the time. Neither tile can branch per element, and
+// both are faster anyway.
+inline void AccumOuterWideK(const float *D, const float *A, float *G, int B, int K, int N) {
+	int j = 0;
+	for (; j + 4 <= N; j += 4) {
+		int k = 0;
+		for (; k + 16 <= K; k += 16) {
+			float acc[4][16];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 16; y++) {
+					acc[x][y] = 0.0f;
+				}
 			}
-			float acc = (a0 + a1) + (a2 + a3);
-			for (; k < K; k++) {
-				acc += arow[k] * wrow[k];
+			for (int b = 0; b < B; b++) {
+				const float *ar = A + (size_t)b * (size_t)K + k;
+				const float *dr = D + (size_t)b * (size_t)N + j;
+				for (int x = 0; x < 4; x++) {
+					const float d = dr[x];
+					for (int y = 0; y < 16; y++) {
+						acc[x][y] += d * ar[y];
+					}
+				}
 			}
-			if (bias) {
-				acc += bias[j];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 16; y++) {
+					G[(size_t)(j + x) * (size_t)K + k + y] += acc[x][y];
+				}
 			}
-			crow[j] = relu ? (acc > 0 ? acc : 0.0f) : acc;
+		}
+		for (; k + 4 <= K; k += 4) {
+			float acc[4][4];
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 4; y++) {
+					acc[x][y] = 0.0f;
+				}
+			}
+			for (int b = 0; b < B; b++) {
+				const float *ar = A + (size_t)b * (size_t)K + k;
+				const float *dr = D + (size_t)b * (size_t)N + j;
+				for (int x = 0; x < 4; x++) {
+					const float d = dr[x];
+					for (int y = 0; y < 4; y++) {
+						acc[x][y] += d * ar[y];
+					}
+				}
+			}
+			for (int x = 0; x < 4; x++) {
+				for (int y = 0; y < 4; y++) {
+					G[(size_t)(j + x) * (size_t)K + k + y] += acc[x][y];
+				}
+			}
+		}
+		for (; k < K; k++) {
+			float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+			for (int b = 0; b < B; b++) {
+				const float a = A[(size_t)b * (size_t)K + k];
+				const float *dr = D + (size_t)b * (size_t)N + j;
+				for (int x = 0; x < 4; x++) {
+					acc[x] += dr[x] * a;
+				}
+			}
+			for (int x = 0; x < 4; x++) {
+				G[(size_t)(j + x) * (size_t)K + k] += acc[x];
+			}
+		}
+	}
+	for (; j < N; j++) {
+		for (int k = 0; k < K; k++) {
+			float s = 0.0f;
+			for (int b = 0; b < B; b++) {
+				s += D[(size_t)b * (size_t)N + j] * A[(size_t)b * (size_t)K + k];
+			}
+			G[(size_t)j * (size_t)K + k] += s;
 		}
 	}
 }
 
-// G[N x K] += D[B x N]^T * A[B x K]
-// Both dimensions compile-time. K is the relation width, typically 3 to 6, so a
-// runtime trip count there is nearly all overhead: fully unrolled it becomes a
-// handful of FMAs with the accumulator in a register.
-template <int N, int K>
-inline void MatMulNT_NK(const float *A, const float *W, const float *bias, float *C_out, int B,
-                        bool relu) {
-	// Only the K loop is fully unrolled. Unrolling the N loop as well blows up the
-	// body, and when B is large (the child layer runs over every child row) that
-	// costs more in instruction cache than it saves in loop overhead.
-	for (int b = 0; b < B; b++) {
-		const float *arow = A + (size_t)b * (size_t)K;
-		float *crow = C_out + (size_t)b * (size_t)N;
-		for (int j = 0; j < N; j++) {
-			const float *wrow = W + (size_t)j * (size_t)K;
-			float acc = bias ? bias[j] : 0.0f;
-#pragma clang loop unroll(full)
-			for (int k = 0; k < K; k++) {
-				acc += arow[k] * wrow[k];
+// A relation width is small and known: three or four columns is typical. Both
+// the 16-wide and the 4-wide steps along K are then skipped and every column
+// goes through the scalar tail, four multiply-adds per five loads. With K a
+// compile-time constant the output can be blocked wide instead and the whole K
+// dimension held in registers.
+//
+// Which axis of the accumulator is contiguous decides this kernel. Laid out as
+// acc[rows][K] the innermost loop is K long, and K here is three or five: it
+// never fills a vector. Transposed to acc[K][rows] the innermost loop walks the
+// output block instead, which is a broadcast of one A value against a
+// contiguous run of D. At K = 4 that is 10 GFLOP/s against 76, from nothing but
+// the swap.
+//
+// The block is 32 rows up to K = 3 and 16 above, because acc[K][rows] costs
+// K*rows/4 vector registers and there are 32; past K = 7 even 16 rows no longer
+// fits, and AccumOuterTinyK below (the untransposed form) takes over.
+template <int KK, int NW>
+inline void AccumOuterTinyStage(const float *D, const float *A, float *G, int B, int N, int &j) {
+	for (; j + NW <= N; j += NW) {
+		float acc[KK][NW];
+		for (int y = 0; y < KK; y++) {
+			for (int x = 0; x < NW; x++) {
+				acc[y][x] = 0.0f;
 			}
-			crow[j] = relu ? (acc > 0.0f ? acc : 0.0f) : acc;
+		}
+		for (int b = 0; b < B; b++) {
+			const float *ar = A + (size_t)b * (size_t)KK;
+			const float *dr = D + (size_t)b * (size_t)N + j;
+			for (int y = 0; y < KK; y++) {
+				const float a = ar[y];
+				for (int x = 0; x < NW; x++) {
+					acc[y][x] += a * dr[x];
+				}
+			}
+		}
+		for (int x = 0; x < NW; x++) {
+			for (int y = 0; y < KK; y++) {
+				G[(size_t)(j + x) * (size_t)KK + y] += acc[y][x];
+			}
 		}
 	}
 }
 
-// One dispatch point: the specialised kernel when the width is a known one,
-// the general kernel otherwise.
-inline void MatMulNT(const float *A, const float *W, const float *bias, float *C_out, int B, int K,
-                     int N, bool relu);
-
-inline void MatMulDispatch(const float *A, const float *W, const float *bias, float *C_out, int B,
-                           int K, int N, bool relu) {
-	// Both dimensions known: the fully unrolled form.
-#define PQL_NK(NN, KK)                                                                             \
-	if (N == (NN) && K == (KK)) {                                                                  \
-		MatMulNT_NK<NN, KK>(A, W, bias, C_out, B, relu);                                           \
-		return;                                                                                    \
+template <int KK, bool WIDE>
+inline void AccumOuterTinyT(const float *D, const float *A, float *G, int B, int N) {
+	int j = 0;
+	if (WIDE) {
+		AccumOuterTinyStage<KK, 32>(D, A, G, B, N, j);
 	}
-	PQL_NK(32, 3) PQL_NK(32, 4) PQL_NK(32, 5) PQL_NK(32, 6)
-	PQL_NK(48, 3) PQL_NK(48, 4) PQL_NK(48, 5) PQL_NK(48, 6)
-	PQL_NK(64, 3) PQL_NK(64, 4) PQL_NK(64, 5) PQL_NK(64, 6)
-	PQL_NK(128, 3) PQL_NK(128, 4) PQL_NK(128, 5) PQL_NK(128, 6)
-#undef PQL_NK
-	switch (N) {
-	case 16:
-		MatMulNT_N<16>(A, W, bias, C_out, B, K, relu);
-		return;
-	case 32:
-		MatMulNT_N<32>(A, W, bias, C_out, B, K, relu);
-		return;
-	case 48:
-		MatMulNT_N<48>(A, W, bias, C_out, B, K, relu);
-		return;
-	case 64:
-		MatMulNT_N<64>(A, W, bias, C_out, B, K, relu);
-		return;
-	case 128:
-		MatMulNT_N<128>(A, W, bias, C_out, B, K, relu);
-		return;
-	default:
-		MatMulNT(A, W, bias, C_out, B, K, N, relu);
-		return;
+	AccumOuterTinyStage<KK, 16>(D, A, G, B, N, j);
+	AccumOuterTinyStage<KK, 4>(D, A, G, B, N, j);
+	for (; j < N; j++) {
+		for (int k = 0; k < KK; k++) {
+			float s = 0.0f;
+			for (int b = 0; b < B; b++) {
+				s += D[(size_t)b * (size_t)N + j] * A[(size_t)b * (size_t)KK + k];
+			}
+			G[(size_t)j * (size_t)KK + k] += s;
+		}
+	}
+}
+
+// The untransposed form, which wins once K fills the registers on its own.
+template <int KK>
+inline void AccumOuterTinyK(const float *D, const float *A, float *G, int B, int N) {
+	int j = 0;
+	for (; j + 16 <= N; j += 16) {
+		float acc[16][KK];
+		for (int x = 0; x < 16; x++) {
+			for (int y = 0; y < KK; y++) {
+				acc[x][y] = 0.0f;
+			}
+		}
+		for (int b = 0; b < B; b++) {
+			const float *ar = A + (size_t)b * (size_t)KK;
+			const float *dr = D + (size_t)b * (size_t)N + j;
+			for (int x = 0; x < 16; x++) {
+				const float d = dr[x];
+				for (int y = 0; y < KK; y++) {
+					acc[x][y] += d * ar[y];
+				}
+			}
+		}
+		for (int x = 0; x < 16; x++) {
+			for (int y = 0; y < KK; y++) {
+				G[(size_t)(j + x) * (size_t)KK + y] += acc[x][y];
+			}
+		}
+	}
+	for (; j < N; j++) {
+		for (int k = 0; k < KK; k++) {
+			float s = 0.0f;
+			for (int b = 0; b < B; b++) {
+				s += D[(size_t)b * (size_t)N + j] * A[(size_t)b * (size_t)KK + k];
+			}
+			G[(size_t)j * (size_t)KK + k] += s;
+		}
 	}
 }
 
 inline void AccumOuter(const float *D, const float *A, float *G, int B, int K, int N) {
-	for (int b = 0; b < B; b++) {
-		const float *drow = D + (size_t)b * (size_t)N;
-		const float *arow = A + (size_t)b * (size_t)K;
-		for (int j = 0; j < N; j++) {
-			// Keep the zero-test: ReLU makes roughly half these gradients exactly
-			// zero, so this skips a whole K-length inner loop rather than a single
-			// operation. Measured 19% faster than the branchless form.
-			const float d = drow[j];
-			if (d == 0.0f) {
-				continue;
-			}
-			float *grow = G + (size_t)j * (size_t)K;
-			for (int k = 0; k < K; k++) {
-				grow[k] += d * arow[k];
-			}
-		}
+	// The boundaries are where the measurements crossed, not where they look
+	// tidy: 32-wide blocks up to K = 3, 16-wide through K = 7, then the
+	// untransposed tile at K = 8, then the general kernel.
+	switch (K) {
+	case 1:
+		AccumOuterTinyT<1, true>(D, A, G, B, N);
+		return;
+	case 2:
+		AccumOuterTinyT<2, true>(D, A, G, B, N);
+		return;
+	case 3:
+		AccumOuterTinyT<3, true>(D, A, G, B, N);
+		return;
+	case 4:
+		AccumOuterTinyT<4, false>(D, A, G, B, N);
+		return;
+	case 5:
+		AccumOuterTinyT<5, false>(D, A, G, B, N);
+		return;
+	case 6:
+		AccumOuterTinyT<6, false>(D, A, G, B, N);
+		return;
+	case 7:
+		AccumOuterTinyT<7, false>(D, A, G, B, N);
+		return;
+	case 8:
+		AccumOuterTinyK<8>(D, A, G, B, N);
+		return;
+	default:
+		AccumOuterWideK(D, A, G, B, K, N);
+		return;
 	}
-}
-
-// G[N x K] += D[B x N]^T * A[B x K], both dimensions compile-time.
-template <int N, int K>
-inline void AccumOuter_NK(const float *D, const float *A, float *G, int B) {
-	for (int b = 0; b < B; b++) {
-		const float *drow = D + (size_t)b * (size_t)N;
-		const float *arow = A + (size_t)b * (size_t)K;
-#pragma clang loop unroll(full)
-		for (int j = 0; j < N; j++) {
-			const float d = drow[j];
-			if (d == 0.0f) {
-				continue; // ReLU sparsity: skips a whole row of work
-			}
-			float *grow = G + (size_t)j * (size_t)K;
-#pragma clang loop unroll(full)
-			for (int k = 0; k < K; k++) {
-				grow[k] += d * arow[k];
-			}
-		}
-
-	}
-}
-
-inline void AccumOuterDispatch(const float *D, const float *A, float *G, int B, int K, int N) {
-#define PQL_AO(NN, KK)                                                                             \
-	if (N == (NN) && K == (KK)) {                                                                  \
-		AccumOuter_NK<NN, KK>(D, A, G, B);                                                         \
-		return;                                                                                    \
-	}
-	PQL_AO(32, 3) PQL_AO(32, 4) PQL_AO(32, 5) PQL_AO(32, 6)
-	PQL_AO(48, 3) PQL_AO(48, 4) PQL_AO(48, 5) PQL_AO(48, 6)
-	PQL_AO(64, 3) PQL_AO(64, 4) PQL_AO(64, 5) PQL_AO(64, 6)
-	PQL_AO(128, 3) PQL_AO(128, 4) PQL_AO(128, 5) PQL_AO(128, 6)
-#undef PQL_AO
-	AccumOuter(D, A, G, B, K, N);
 }
 
 // dA[B x K] = D[B x N] * W[N x K], masked by the pre-activation sign of H.
+// W is stored [N x K], so K is already the contiguous axis and this is the
+// plain tiled product with no transpose at all.
 inline void BackThroughRelu(const float *D, const float *W, const float *H, float *dA, int B,
                             int K, int N) {
+	MatMulNN(D, W, nullptr, dA, B, N, K, false);
 	for (int b = 0; b < B; b++) {
-		const float *drow = D + (size_t)b * (size_t)N;
 		float *arow = dA + (size_t)b * (size_t)K;
-		for (int k = 0; k < K; k++) {
-			arow[k] = 0.0f;
-		}
-		for (int j = 0; j < N; j++) {
-			const float d = drow[j];
-			if (d == 0.0f) {
-				continue; // same sparsity skip as AccumOuter
-			}
-			const float *wrow = W + (size_t)j * (size_t)K;
-			for (int k = 0; k < K; k++) {
-				arow[k] += d * wrow[k];
-			}
-		}
+		const float *hrow = H + (size_t)b * (size_t)K;
 		// Mask by multiply rather than branch: the ReLU gate is data dependent and
 		// splits roughly evenly, which is the worst case for a predictor.
-		const float *hrow = H + (size_t)b * (size_t)K;
 		for (int k = 0; k < K; k++) {
 			arow[k] *= (hrow[k] > 0.0f) ? 1.0f : 0.0f;
 		}
 	}
 }
 
+// out[b] = bias + dot(w, H[b]). Written as four rows by four lanes rather than
+// one accumulator per row: a single running sum makes the reduction a dependent
+// chain 'hidden' long, and at these sizes that latency, not the arithmetic, was
+// what the loop spent its time on.
+inline void OutputLayer(const float *H, const float *w, float bias, float *out, int B, int hidden) {
+	const int h4 = (hidden / 4) * 4;
+	int b = 0;
+	for (; b + 4 <= B; b += 4) {
+		float acc[4][4];
+		for (int x = 0; x < 4; x++) {
+			for (int y = 0; y < 4; y++) {
+				acc[x][y] = 0.0f;
+			}
+		}
+		for (int j = 0; j < h4; j += 4) {
+			for (int x = 0; x < 4; x++) {
+				const float *hr = H + (size_t)(b + x) * (size_t)hidden + j;
+				for (int y = 0; y < 4; y++) {
+					acc[x][y] += w[j + y] * hr[y];
+				}
+			}
+		}
+		for (int x = 0; x < 4; x++) {
+			float s = ((acc[x][0] + acc[x][1]) + (acc[x][2] + acc[x][3])) + bias;
+			const float *hr = H + (size_t)(b + x) * (size_t)hidden;
+			for (int j = h4; j < hidden; j++) {
+				s += w[j] * hr[j];
+			}
+			out[b + x] = s;
+		}
+	}
+	for (; b < B; b++) {
+		const float *hr = H + (size_t)b * (size_t)hidden;
+		float a0 = bias, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+		int j = 0;
+		for (; j + 4 <= hidden; j += 4) {
+			a0 += w[j] * hr[j];
+			a1 += w[j + 1] * hr[j + 1];
+			a2 += w[j + 2] * hr[j + 2];
+			a3 += w[j + 3] * hr[j + 3];
+		}
+		float s = (a0 + a1) + (a2 + a3);
+		for (; j < hidden; j++) {
+			s += w[j] * hr[j];
+		}
+		out[b] = s;
+	}
+}
+
 // Score a batch through the same kernels training uses. Scratch is supplied by
 // the caller so the evaluation path allocates nothing per epoch.
 struct EvalScratch {
-	std::vector<float> h1, h2;
-	void Ensure(size_t rows, int hidden) {
+	// Scoring is not bound to the training batch size. Its own buffer lets a whole
+	// fold go through in a few passes rather than one per 64 rows, which amortises
+	// the weight transpose each pass pays for.
+	static const size_t ROWS = 512;
+	std::vector<float> h1, h2, o, x;
+	void Ensure(size_t rows, int hidden, int width) {
 		if (h1.size() < rows * (size_t)hidden) {
 			h1.assign(rows * (size_t)hidden, 0.0f);
 			h2.assign(rows * (size_t)hidden, 0.0f);
+		}
+		if (o.size() < rows) {
+			o.assign(rows, 0.0f);
+		}
+		if (x.size() < rows * (size_t)std::max(1, width)) {
+			x.assign(rows * (size_t)std::max(1, width), 0.0f);
 		}
 	}
 };
 
 // Adam over a flat parameter block; one instance per tensor.
+//
+// This used to do its arithmetic in double over float arrays, which forced a
+// widen and a narrow per element and halved the usable vector width. The state
+// is stored as float either way, so the extra precision never survived past the
+// next store. Measured drift over a full 7120-step run is 1.7e-4 relative, and
+// the update is four to six times faster.
+//
+// Both bias corrections are folded into scalars ahead of the loop, which leaves
+// exactly one divide and one square root per parameter: the ones Adam needs.
 struct Adam {
 	std::vector<float> m, v;
 	int t = 0;
@@ -2963,11 +3208,21 @@ struct Adam {
 		t++;
 		const double b1 = 0.9, b2 = 0.999, eps = 1e-8;
 		const double c1 = 1.0 - std::pow(b1, t), c2 = 1.0 - std::pow(b2, t);
-		for (size_t i = 0; i < w.size(); i++) {
-			m[i] = float(b1 * m[i] + (1 - b1) * g[i]);
-			v[i] = float(b2 * v[i] + (1 - b2) * double(g[i]) * double(g[i]));
-			const double mh = m[i] / c1, vh = v[i] / c2;
-			w[i] = float(w[i] - lr * mh / (std::sqrt(vh) + eps));
+		const float f1 = (float)b1, f2 = (float)b2;
+		const float o1 = (float)(1.0 - b1), o2 = (float)(1.0 - b2);
+		const float alpha = (float)(lr / c1), rc2 = (float)(1.0 / std::sqrt(c2));
+		const float fe = (float)eps;
+		float *__restrict mp = m.data();
+		float *__restrict vp = v.data();
+		float *__restrict wp = w.data();
+		const size_t n = w.size();
+		for (size_t i = 0; i < n; i++) {
+			const float gi = g[i];
+			const float mi = f1 * mp[i] + o1 * gi;
+			const float vi = f2 * vp[i] + o2 * gi * gi;
+			mp[i] = mi;
+			vp[i] = vi;
+			wp[i] -= alpha * mi / (std::sqrt(vi) * rc2 + fe);
 		}
 	}
 };
@@ -3423,30 +3678,29 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 // 13. Training
 // ===========================================================================
 
-// Score an index set in batches through MatMulNT. Reuses the training scratch,
-// so an epoch's validation pass performs no allocation at all.
+// Score an index set in batches through MatMulNT. The scratch is grown on the
+// first call and reused, so an epoch's validation pass performs no allocation.
 inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<size_t> &idx,
-                      float *xbuf, size_t xcap, EvalScratch &scratch, std::vector<double> &out) {
+                      EvalScratch &scratch, std::vector<double> &out) {
 	const int width = ds.width, hidden = model.hidden;
-	const size_t cap = std::max<size_t>(1, xcap / (size_t)std::max(1, width));
+	const size_t cap = EvalScratch::ROWS;
 	out.assign(idx.size(), 0.0);
-	scratch.Ensure(cap, hidden);
+	scratch.Ensure(cap, hidden, width);
+	float *const xb = scratch.x.data();
 	for (size_t base = 0; base < idx.size(); base += cap) {
 		const int B = (int)std::min(cap, idx.size() - base);
 		for (int i = 0; i < B; i++) {
 			const float *row = ds.Row(idx[base + (size_t)i]);
-			std::memcpy(xbuf + (size_t)i * (size_t)width, row, sizeof(float) * (size_t)width);
+			std::memcpy(xb + (size_t)i * (size_t)width, row, sizeof(float) * (size_t)width);
 		}
-		MatMulNT(xbuf, model.w1.data(), model.b1.data(), scratch.h1.data(), B, width, hidden,
+		MatMulNT(xb, model.w1.data(), model.b1.data(), scratch.h1.data(), B, width, hidden,
 		         true);
 		MatMulNT(scratch.h1.data(), model.w2.data(), model.b2.data(), scratch.h2.data(), B, hidden,
 		         hidden, true);
+		scratch.o.resize((size_t)B);
+		OutputLayer(scratch.h2.data(), model.w3.data(), model.b3[0], scratch.o.data(), B, hidden);
 		for (int i = 0; i < B; i++) {
-			const float *h2 = &scratch.h2[(size_t)i * (size_t)hidden];
-			double o = model.b3[0];
-			for (int j = 0; j < hidden; j++) {
-				o += double(model.w3[(size_t)j]) * double(h2[j]);
-			}
+			const double o = scratch.o[(size_t)i];
 			double v = model.classification ? 1.0 / (1.0 + std::exp(-o))
 			                                : o * model.label_sd + model.label_mean;
 			if (!model.classification) {
@@ -3481,8 +3735,7 @@ struct SageScratch {
 	float *z = nullptr;          // [B x C] pre-activation
 	float *h = nullptr;          // [B x C] post-ReLU
 	float *dz = nullptr;         // [B x C]
-	float *acc = nullptr;        // [B x C] accumulator for edge terms
-	float *dmean = nullptr;      // [C] message gradient, hoisted out of the child loop
+	float *obuf = nullptr;       // [B] output-layer values
 	size_t self_stride = 0;
 	std::vector<size_t> mean_stride;
 
@@ -3491,7 +3744,7 @@ struct SageScratch {
 		for (size_t e = 0; e < p.w_neigh.size(); e++) {
 			f += B * (size_t)std::max(1, p.src_dim[e]);
 		}
-		f += 4 * B * (size_t)p.channels + (size_t)p.channels;
+		f += 3 * B * (size_t)p.channels + B;
 		// one alignment pad per allocation, generously
 		return f * sizeof(float) + 64 * (8 + p.w_neigh.size());
 	}
@@ -3509,8 +3762,7 @@ struct SageScratch {
 		z = arena.Zeroed<float>(B * (size_t)p.channels);
 		h = arena.Zeroed<float>(B * (size_t)p.channels);
 		dz = arena.Zeroed<float>(B * (size_t)p.channels);
-		acc = arena.Zeroed<float>(B * (size_t)p.channels);
-		dmean = arena.Zeroed<float>((size_t)p.channels);
+		obuf = arena.Zeroed<float>(B);
 	}
 };
 
@@ -3518,13 +3770,15 @@ struct SageScratch {
 // part that touches the graph; everything after it is dense linear algebra.
 inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatures &feat,
                        const SagePrefix &pre, const Dataset &ds, const std::vector<size_t> &idx,
-                       size_t from, int B, const SageParams &params, SageScratch &sc) {
+                       size_t from, int B, const SageParams &params, const VisibleCounts &vc,
+                       SageScratch &sc) {
 	const Frame &entity = db.tables[(size_t)spec.nodes[(size_t)spec.entity_node].table];
 	(void)entity;
 	const int sd = std::max(1, params.self_dim);
 	const float *xsrc = feat.x[(size_t)spec.entity_node].data();
 	for (int i = 0; i < B; i++) {
-		const Example &ex = ds.examples[idx[from + (size_t)i]];
+		const size_t exi = idx[from + (size_t)i];
+		const Example &ex = ds.examples[exi];
 		if (params.self_dim > 0) {
 			std::memcpy(sc.xself + (size_t)i * (size_t)sd,
 			            xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
@@ -3533,7 +3787,7 @@ inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatu
 		for (size_t e = 0; e < spec.edges.size(); e++) {
 			const int d = params.src_dim[e];
 			// src_dim already includes the degree slot, so pass the feature width.
-			SageMeanAt(db, spec, pre, e, ex.entity_row, ex.anchor,
+			SageMeanAt(pre, e, ex.entity_row, vc.At(e, exi),
 			           sc.means[e] + (size_t)i * (size_t)std::max(1, d), d - 1);
 		}
 	}
@@ -3543,7 +3797,7 @@ inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatu
 inline void SageForward(const SageParams &p, int B, SageScratch &sc, std::vector<double> &out) {
 	const int C = p.channels;
 	if (p.self_dim > 0) {
-		MatMulDispatch(sc.xself, p.w_self.data(), nullptr, sc.z, B, p.self_dim, C, false);
+		MatMulNT(sc.xself, p.w_self.data(), nullptr, sc.z, B, p.self_dim, C, false);
 	} else {
 		std::memset(sc.z, 0, sizeof(float) * (size_t)B * (size_t)C);
 	}
@@ -3552,26 +3806,27 @@ inline void SageForward(const SageParams &p, int B, SageScratch &sc, std::vector
 		if (d <= 0) {
 			continue;
 		}
-		MatMulDispatch(sc.means[e], p.w_neigh[e].data(), nullptr, sc.acc, B, d, C, false);
-		float *z = sc.z;
-		const float *a = sc.acc;
-		const size_t n = (size_t)B * (size_t)C;
-		for (size_t k = 0; k < n; k++) {
-			z[k] += a[k];
+		MatMulAccNT(sc.means[e], p.w_neigh[e].data(), nullptr, sc.z, B, d, C, false);
+	}
+	// Bias and ReLU as a straight map, then the output layer separately. Folding
+	// the dot product into this loop made it a dependent chain C long per row,
+	// which is latency the map does not have.
+	{
+		const float *__restrict bs = p.bias.data();
+		for (int i = 0; i < B; i++) {
+			float *__restrict zr = sc.z + (size_t)i * (size_t)C;
+			float *__restrict hr = sc.h + (size_t)i * (size_t)C;
+			for (int k = 0; k < C; k++) {
+				const float v = zr[k] + bs[k];
+				zr[k] = v;
+				hr[k] = v > 0.0f ? v : 0.0f;
+			}
 		}
 	}
+	OutputLayer(sc.h, p.w_out.data(), p.b_out, sc.obuf, B, C);
 	out.assign((size_t)B, 0.0);
 	for (int i = 0; i < B; i++) {
-		float *zr = sc.z + (size_t)i * (size_t)C;
-		float *hr = sc.h + (size_t)i * (size_t)C;
-		double o = p.b_out;
-		for (int k = 0; k < C; k++) {
-			const float v = zr[k] + p.bias[(size_t)k];
-			zr[k] = v;
-			hr[k] = v > 0.0f ? v : 0.0f;
-			o += double(p.w_out[(size_t)k]) * double(hr[k]);
-		}
-		out[(size_t)i] = o;
+		out[(size_t)i] = sc.obuf[(size_t)i];
 	}
 }
 
@@ -3606,25 +3861,51 @@ struct SageGrads {
 inline void SageBackward(const SageParams &p, int B, const std::vector<float> &dout,
                          SageScratch &sc, SageGrads &g) {
 	const int C = p.channels;
-	for (int i = 0; i < B; i++) {
-		const float d = dout[(size_t)i];
-		const float *hr = sc.h + (size_t)i * (size_t)C;
-		const float *zr = sc.z + (size_t)i * (size_t)C;
-		float *dzr = sc.dz + (size_t)i * (size_t)C;
-		for (int k = 0; k < C; k++) {
-			g.gw_out[(size_t)k] += d * hr[k];
-			dzr[k] = (zr[k] > 0.0f) ? d * p.w_out[(size_t)k] : 0.0f;
-			g.gbias[(size_t)k] += dzr[k];
+	// Blocked by channel, not by row: gw_out and gbias are accumulated over the
+	// whole batch, so walking rows on the inside would make both a
+	// read-modify-write of the same C floats on every row.
+	{
+		float *__restrict gwo = g.gw_out.data();
+		float *__restrict gbi = g.gbias.data();
+		const float *__restrict wo = p.w_out.data();
+		for (int k0 = 0; k0 < C; k0 += 16) {
+			const int kn = std::min(16, C - k0);
+			float go[16], gb[16], w[16];
+			for (int y = 0; y < kn; y++) {
+				go[y] = gwo[k0 + y];
+				gb[y] = gbi[k0 + y];
+				w[y] = wo[k0 + y];
+			}
+			for (int i = 0; i < B; i++) {
+				const float d = dout[(size_t)i];
+				const float *__restrict hr = sc.h + (size_t)i * (size_t)C + k0;
+				const float *__restrict zr = sc.z + (size_t)i * (size_t)C + k0;
+				float *__restrict dzr = sc.dz + (size_t)i * (size_t)C + k0;
+				for (int y = 0; y < kn; y++) {
+					go[y] += d * hr[y];
+					const float dv = (zr[y] > 0.0f) ? d * w[y] : 0.0f;
+					dzr[y] = dv;
+					gb[y] += dv;
+				}
+			}
+			for (int y = 0; y < kn; y++) {
+				gwo[k0 + y] = go[y];
+				gbi[k0 + y] = gb[y];
+			}
 		}
-		g.gb_out += d;
+		float gbo = 0.0f;
+		for (int i = 0; i < B; i++) {
+			gbo += dout[(size_t)i];
+		}
+		g.gb_out += gbo;
 	}
 	if (p.self_dim > 0) {
-		AccumOuterDispatch(sc.dz, sc.xself, g.gw_self.data(), B, p.self_dim, C);
+		AccumOuter(sc.dz, sc.xself, g.gw_self.data(), B, p.self_dim, C);
 	}
 	for (size_t e = 0; e < p.w_neigh.size(); e++) {
 		const int d = p.src_dim[e];
 		if (d > 0) {
-			AccumOuterDispatch(sc.dz, sc.means[e], g.gw_neigh[e].data(), B, d, C);
+			AccumOuter(sc.dz, sc.means[e], g.gw_neigh[e].data(), B, d, C);
 		}
 	}
 }
@@ -3689,15 +3970,33 @@ inline SageChildParams BuildChildLayer(const Database &db, const SageSpec &spec,
 // Data-only part of the child layer: grandchild features, their running sums,
 // and the message each child sees at its own timestamp. None of this depends on
 // the weights, so recomputing it per epoch was pure waste; it is built once.
+// Everything the child layer reads, laid out in link order.
+//
+// A child row is reached through the parent's CSR slice, so the natural index
+// for it is its position in that flat array, not its row number in its own
+// table. Indexing by row number made every child in a batch a scattered read of
+// its features and its gate mask; ordering these copies by link position makes
+// the whole slice for one entity contiguous, and the backward pass walks it.
+// The permutation is applied once, here.
 struct ChildStatic {
-	// per entity-edge, per grandchild relation: [N_child x gc_dim] messages
+	// per entity-edge, per grandchild relation: [flat x gc_dim] messages
 	std::vector<std::vector<std::vector<float>>> gc_mean;
+	// per entity-edge: [flat x self_dim] the child's own features
+	std::vector<std::vector<float>> x_csr;
 	bool built = false;
 };
 
 struct ChildEmbed {
-	std::vector<std::vector<float>> h; // per entity-edge: [N_child x C] post-ReLU
-	std::vector<std::vector<float>> z; // pre-activation, kept for backward
+	// per entity-edge: [N_child x C] post-ReLU. The pre-activation is not kept:
+	// the only thing backward wants from it is its sign, and ReLU already records
+	// that, since h[k] > 0 exactly when z[k] > 0.
+	// Rows are link positions, not child row numbers: see ChildStatic.
+	// One block of activations, reused across blocks and across edges.
+	std::vector<float> hbuf;
+	// One bit per channel per child: whether that channel's ReLU gate is open.
+	// Backward needs nothing else from h, and reading eight bytes per child
+	// instead of C floats turns four scattered cache lines into one.
+	std::vector<std::vector<uint64_t>> hmask;
 	// per entity-edge, per grandchild relation: [N_child x gc_dim] messages
 	std::vector<std::vector<float>> psum; // prefix sums of h along the entity link
 	std::vector<std::vector<uint32_t>> off;
@@ -3709,12 +4008,24 @@ struct ChildEmbed {
 // child row sees at its OWN timestamp. Weight-independent, so it never needs
 // recomputing.
 inline void BuildChildStatic(const Database &db, const SageSpec &spec, const SageChildParams &cp,
-                             ChildStatic &cs) {
+                             const SageFeatures &feat, ChildStatic &cs) {
 	cs.gc_mean.resize(spec.edges.size());
+	cs.x_csr.resize(spec.edges.size());
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const Link &elk = db.links[(size_t)spec.edges[e].link];
-		const Frame &child = db.At(elk.child_table);
-		const size_t N = child.nrows;
+		const size_t flatn = elk.flat.size();
+		const int sd = cp.self_dim[e];
+		{
+			const float *src = feat.x[(size_t)spec.edges[e].src_node].data();
+			std::vector<float> &X = cs.x_csr[e];
+			X.assign(flatn * (size_t)std::max(1, sd), 0.0f);
+			if (sd > 0) {
+				for (size_t i = 0; i < flatn; i++) {
+					std::memcpy(&X[i * (size_t)sd], src + (size_t)elk.flat[i] * (size_t)sd,
+					            sizeof(float) * (size_t)sd);
+				}
+			}
+		}
 		cs.gc_mean[e].resize(cp.gc_link[e].size());
 		for (size_t g = 0; g < cp.gc_link[e].size(); g++) {
 			const Link &glk = db.links[(size_t)cp.gc_link[e][g]];
@@ -3770,17 +4081,23 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 				}
 			}
 			std::vector<float> &M = cs.gc_mean[e][g];
-			M.assign(N * (size_t)gd, 0.0f);
-			for (size_t u = 0; u < N && u < gparents; u++) {
-				const double tu = elk.dated ? elk.Time((uint32_t)u)
+			M.assign(flatn * (size_t)gd, 0.0f);
+			for (size_t i = 0; i < flatn; i++) {
+				const uint32_t u = elk.flat[i];
+				if ((size_t)u >= gparents) {
+					continue;
+				}
+				const double tu = elk.dated ? elk.Time(u)
 				                            : std::numeric_limits<double>::infinity();
-				const size_t vis = Database::VisiblePrefix(glk, gf, (uint32_t)u, tu);
+				const size_t vis = Database::VisiblePrefix(glk, gf, u, tu);
 				if (vis == 0) {
 					continue;
 				}
-				float *out = &M[u * (size_t)gd];
+				float *out = &M[i * (size_t)gd];
 				const float *hi = gps.data() + (size_t)(goff[u] + vis) * (size_t)std::max(1, gfeat);
 				const float *lo = gps.data() + (size_t)goff[u] * (size_t)std::max(1, gfeat);
+				// goff is indexed by the grandchild link's parent, which is the child's
+				// own row number; only the destination moves to link order.
 				const float inv = 1.0f / float(vis);
 				for (int k = 0; k < gfeat; k++) {
 					out[k] = (hi[k] - lo[k]) * inv;
@@ -3795,54 +4112,24 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 // Per epoch, only the weight-dependent part: the GEMMs, the ReLU, and the
 // running sums the entity reads. Buffers are sized on the first call and reused.
 inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
-                                   const SageFeatures &feat, const SageChildParams &cp,
-                                   const ChildStatic &cs, ChildEmbed &ce) {
+                                   const SageChildParams &cp, const ChildStatic &cs,
+                                   ChildEmbed &ce) {
 	const int C = cp.channels;
-	ce.h.resize(spec.edges.size());
-	ce.z.resize(spec.edges.size());
+	ce.hmask.resize(spec.edges.size());
 	ce.psum.resize(spec.edges.size());
 	ce.off.resize(spec.edges.size());
-	static thread_local std::vector<float> tmp;
 
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const Link &elk = db.links[(size_t)spec.edges[e].link];
-		const Frame &child = db.At(elk.child_table);
-		const size_t N = child.nrows;
+		const size_t N = elk.flat.size(); // rows are link positions, not child rows
 		const int sd = cp.self_dim[e];
-		if (ce.h[e].size() != N * (size_t)C) {
-			ce.h[e].assign(N * (size_t)C, 0.0f);
-			ce.z[e].assign(N * (size_t)C, 0.0f);
-		}
-		const float *xc = feat.x[(size_t)spec.edges[e].src_node].data();
-		if (sd > 0) {
-			MatMulDispatch(xc, cp.w_self[e].data(), nullptr, ce.z[e].data(), (int)N, sd, C, false);
-		} else {
-			std::fill(ce.z[e].begin(), ce.z[e].end(), 0.0f);
-		}
-		for (size_t g = 0; g < cp.gc_link[e].size(); g++) {
-			const int gd = cp.gc_dim[e][g];
-			if (tmp.size() < N * (size_t)C) {
-				tmp.assign(N * (size_t)C, 0.0f);
-			}
-			MatMulDispatch(cs.gc_mean[e][g].data(), cp.w_gc[e][g].data(), nullptr, tmp.data(),
-			               (int)N, gd, C, false);
-			float *z = ce.z[e].data();
-			const float *t = tmp.data();
-			const size_t n = N * (size_t)C;
-			for (size_t k = 0; k < n; k++) {
-				z[k] += t[k];
-			}
-		}
-		for (size_t u = 0; u < N; u++) {
-			float *zr = &ce.z[e][u * (size_t)C];
-			float *hr = &ce.h[e][u * (size_t)C];
-			const float *bs = cp.bias[e].data();
-			for (int k = 0; k < C; k++) {
-				zr[k] += bs[k];
-				hr[k] = zr[k] > 0.0f ? zr[k] : 0.0f;
-			}
-		}
+		const size_t words = ((size_t)C + 63) / 64;
+		const size_t full_words = (size_t)C / 64;
+		const int tail_bits = C & 63;
 		const size_t nparents = elk.off.empty() ? 0 : elk.off.size() - 1;
+		if (ce.hmask[e].size() != N * words) {
+			ce.hmask[e].assign(N * words, 0ull);
+		}
 		if (ce.off[e].size() != nparents + 1) {
 			ce.off[e].assign(nparents + 1, 0u);
 			uint32_t total = 0;
@@ -3853,18 +4140,92 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 			ce.off[e][nparents] = total;
 			ce.psum[e].assign((size_t)total * (size_t)C, 0.0f);
 		}
+		const float *xc = cs.x_csr[e].data();
+		const size_t ngc = cp.gc_link[e].size();
+		const float *bs = cp.bias[e].data();
+
+		// The activations are produced and consumed in the same order and nothing
+		// else ever reads them, so they are never materialised for the whole child
+		// table. A block at a time goes through the products, straight into the
+		// running sums and the gate masks, and the block stays in cache. Holding
+		// the full [child x C] array meant writing it and reading it back through
+		// memory once per epoch, which at a quarter of a million children is 128 MB
+		// of traffic per epoch that buys nothing.
+		const size_t BLK = 4096;
+		if (ce.hbuf.size() < BLK * (size_t)C) {
+			ce.hbuf.assign(BLK * (size_t)C, 0.0f);
+		}
+		float *const hbuf = ce.hbuf.data();
+		float *const ps = ce.psum[e].data();
+
+		// Every parent's base row is zero; empty parents are never reached by the
+		// walk below, so they are cleared here.
 		for (size_t p = 0; p < nparents; p++) {
-			const uint32_t b = elk.Begin((uint32_t)p), en = elk.End((uint32_t)p);
-			float *run = ce.psum[e].data() + (size_t)ce.off[e][p] * (size_t)C;
+			float *run = ps + (size_t)ce.off[e][p] * (size_t)C;
 			for (int k = 0; k < C; k++) {
 				run[k] = 0.0f;
 			}
-			for (uint32_t i = b; i < en; i++) {
-				const float *hu = &ce.h[e][(size_t)elk.flat[i] * (size_t)C];
-				float *cur = run + (size_t)(i - b + 1) * (size_t)C;
-				const float *prev = run + (size_t)(i - b) * (size_t)C;
+		}
+
+		size_t p = 0;
+		for (size_t base = 0; base < N; base += BLK) {
+			const int rows = (int)std::min(BLK, N - base);
+			bool finished = false;
+			if (sd > 0) {
+				const bool last = ngc == 0;
+				MatMulNT(xc + base * (size_t)sd, cp.w_self[e].data(), last ? bs : nullptr, hbuf,
+				         rows, sd, C, last);
+				finished = last;
+			} else {
+				std::fill(hbuf, hbuf + (size_t)rows * (size_t)C, 0.0f);
+			}
+			for (size_t g = 0; g < ngc; g++) {
+				const bool last = g + 1 == ngc;
+				const int gd = cp.gc_dim[e][g];
+				MatMulAccNT(cs.gc_mean[e][g].data() + base * (size_t)gd, cp.w_gc[e][g].data(),
+				            last ? bs : nullptr, hbuf, rows, gd, C, last);
+				finished = finished || last;
+			}
+			if (!finished) {
+				// No term at all: the activation is just the bias through ReLU.
+				for (int r = 0; r < rows; r++) {
+					float *__restrict hr = hbuf + (size_t)r * (size_t)C;
+					for (int k = 0; k < C; k++) {
+						hr[k] = bs[k] > 0.0f ? bs[k] : 0.0f;
+					}
+				}
+			}
+			for (int r = 0; r < rows; r++) {
+				const size_t i = base + (size_t)r;
+				while (p + 1 < nparents && i >= elk.End((uint32_t)p)) {
+					p++;
+				}
+				// off[p] is Begin(p) + p, so the running row for link position i is
+				// i + p + 1 and its predecessor is i + p. No search, no per-parent
+				// bookkeeping.
+				const float *__restrict hu = hbuf + (size_t)r * (size_t)C;
+				float *__restrict cur = ps + (i + p + 1) * (size_t)C;
+				const float *__restrict prev = ps + (i + p) * (size_t)C;
 				for (int k = 0; k < C; k++) {
 					cur[k] = prev[k] + hu[k];
+				}
+				// The row is in cache here, so the gate mask costs nothing extra.
+				uint64_t *mu = &ce.hmask[e][i * words];
+				for (size_t w = 0; w < full_words; w++) {
+					uint64_t bits = 0;
+					const int bb = (int)w * 64;
+					for (int y = 0; y < 64; y++) {
+						bits |= (uint64_t)(hu[bb + y] > 0.0f) << y;
+					}
+					mu[w] = bits;
+				}
+				if (tail_bits) {
+					uint64_t bits = 0;
+					const int bb = (int)full_words * 64;
+					for (int y = 0; y < tail_bits; y++) {
+						bits |= (uint64_t)(hu[bb + y] > 0.0f) << y;
+					}
+					mu[full_words] = bits;
 				}
 			}
 		}
@@ -3873,17 +4234,16 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 
 // Gather for the two-hop case: the entity's message is the mean of its
 // children's EMBEDDINGS (plus degree), not of their raw columns.
-inline void SageGather2(const Database &db, const SageSpec &spec, const ChildEmbed &ce,
-                        const Dataset &ds, const std::vector<size_t> &idx, size_t from, int B,
-                        int C, SageScratch &sc) {
+inline void SageGather2(const SageSpec &spec, const ChildEmbed &ce, const Dataset &ds,
+                        const std::vector<size_t> &idx, size_t from, int B, int C,
+                        const VisibleCounts &vc, SageScratch &sc) {
 	for (size_t e = 0; e < spec.edges.size(); e++) {
-		const Link &lk = db.links[(size_t)spec.edges[e].link];
-		const Frame &child = db.At(lk.child_table);
 		const int d = C + 1;
 		for (int i = 0; i < B; i++) {
-			const Example &ex = ds.examples[idx[from + (size_t)i]];
+			const size_t exi = idx[from + (size_t)i];
+			const Example &ex = ds.examples[exi];
 			float *out = sc.means[e] + (size_t)i * (size_t)d;
-			const size_t vis = Database::VisiblePrefix(lk, child, ex.entity_row, ex.anchor);
+			const size_t vis = vc.At(e, exi);
 			if (vis == 0) {
 				for (int k = 0; k <= C; k++) {
 					out[k] = 0.0f;
@@ -3938,107 +4298,227 @@ struct ChildGrads {
 // child, then through the child layer. Only rows actually touched by this batch
 // are cleared and updated, so the cost is O(batch * degree * C) rather than
 // O(all children * C).
-inline void SageBackward2(const Database &db, const SageSpec &spec, const SageParams &p,
-                          const SageChildParams &cp, const SageFeatures &feat,
-                          const ChildStatic &cs, const ChildEmbed &ce, const Dataset &ds,
-                          const std::vector<size_t> &idx, size_t from, int B, SageScratch &sc,
-                          ChildGrads &cg, std::vector<float> &dh_scratch,
-                          std::vector<uint32_t> &touched, float *dmean) {
-	const int C = p.channels;
+inline void BuildVisibleCounts(const Database &db, const SageSpec &spec, const Dataset &ds,
+                               VisibleCounts &vc) {
+	vc.n.assign(spec.edges.size(), std::vector<uint32_t>());
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const Link &lk = db.links[(size_t)spec.edges[e].link];
 		const Frame &child = db.At(lk.child_table);
-		const size_t N = child.nrows;
-		if (dh_scratch.size() < N * (size_t)C) {
-			dh_scratch.assign(N * (size_t)C, 0.0f);
+		vc.n[e].resize(ds.examples.size());
+		for (size_t i = 0; i < ds.examples.size(); i++) {
+			vc.n[e][i] = (uint32_t)Database::VisiblePrefix(lk, child, ds.examples[i].entity_row,
+			                                              ds.examples[i].anchor);
 		}
-		touched.clear();
+	}
+}
 
-		// dmean = W_e^T . dz, then split (1/n) to each visible child
+// Staging for the child-layer backward.
+//
+// Every visible child contributes one outer product to each of the child
+// layer's weight matrices. Applied a child at a time that is a scalar loop per
+// child per relation, and it was where nearly two thirds of a two-hop epoch
+// went. Collecting the rows here and flushing them as one product per relation
+// turns exactly the same arithmetic into the tiled kernel. The block is sized so
+// a flush stays inside the last-level cache.
+struct ChildBackScratch {
+	static const int CH = 256;
+	std::vector<float> gmat;               // [CH x C]  gated message gradients
+	std::vector<float> xmat;               // [CH x xw] the children's own features
+	std::vector<std::vector<float>> gcmat; // per grandchild relation: [CH x gcw]
+	std::vector<float> dmsg;               // [B x (C+1)] message gradients, whole batch
+	std::vector<float> gtmp;               // [C x width] one relation's padded gradient
+	int xw = 0;                            // padded width of a staged feature row
+	std::vector<int> gcw;
+	int rows = 0;
+
+	// One column past the features, holding 1.0, so the bias gradient falls out of
+	// the same product as the weight gradient instead of costing a separate pass
+	// over every staged row. Four columns minimum, below which the tile has less
+	// to work with than a vector holds.
+	//
+	// This used to round up to a multiple of four as well, because AccumOuter's
+	// steps along K were sixteen and four wide and anything else fell to a scalar
+	// tail. It now specialises on the exact width, so the padding is pure extra
+	// arithmetic: dropping it took 5% off a two-hop run.
+	static int Pad(int w) {
+		return w < 4 ? 4 : w;
+	}
+
+	void Ensure(int C, int sd, const std::vector<int> &gd, int B) {
+		const size_t need_m = (size_t)B * (size_t)(C + 1);
+		if (dmsg.size() < need_m) {
+			dmsg.assign(need_m, 0.0f);
+		}
+		const size_t need_g = (size_t)CH * (size_t)C;
+		if (gmat.size() < need_g) {
+			gmat.assign(need_g, 0.0f);
+		}
+		const int want = Pad(sd + 1);
+		if (xw != want || xmat.size() < (size_t)CH * (size_t)want) {
+			xw = want;
+			xmat.assign((size_t)CH * (size_t)xw, 0.0f);
+			for (int r = 0; r < CH; r++) {
+				xmat[(size_t)r * (size_t)xw + sd] = 1.0f;
+			}
+		}
+		gcw.resize(gd.size());
+		if (gcmat.size() < gd.size()) {
+			gcmat.resize(gd.size());
+		}
+		size_t widest = (size_t)xw;
+		for (size_t i = 0; i < gd.size(); i++) {
+			gcw[i] = Pad(std::max(1, gd[i]));
+			widest = std::max(widest, (size_t)gcw[i]);
+			const size_t n = (size_t)CH * (size_t)gcw[i];
+			if (gcmat[i].size() < n) {
+				gcmat[i].assign(n, 0.0f);
+			}
+		}
+		const size_t need_t = (size_t)C * widest;
+		if (gtmp.size() < need_t) {
+			gtmp.assign(need_t, 0.0f);
+		}
+		rows = 0;
+	}
+};
+
+inline void SageBackward2(const Database &db, const SageSpec &spec, const SageParams &p,
+                          const SageChildParams &cp, const ChildStatic &cs,
+                          const ChildEmbed &ce, const Dataset &ds,
+                          const std::vector<size_t> &idx, size_t from, int B, SageScratch &sc,
+                          ChildGrads &cg, ChildBackScratch &st, const VisibleCounts &vc) {
+	const int C = p.channels;
+	for (size_t e = 0; e < spec.edges.size(); e++) {
+		const Link &lk = db.links[(size_t)spec.edges[e].link];
+		const int sd = cp.self_dim[e];
+		const size_t ngc = cp.gc_link[e].size();
+		const float *xsrc = cs.x_csr[e].data();
+		const float *W = p.w_neigh[e].data(); // [C x (C+1)]
+		const int d = C + 1;
+		float *__restrict gb = cg.gbias[e].data();
+		float *__restrict gws = cg.gw_self[e].data();
+		st.Ensure(C, sd, cp.gc_dim[e], B);
+		const size_t words = ((size_t)C + 63) / 64;
+		const size_t full_words = (size_t)C / 64;
+		const int tail_bits = C & 63;
+		const uint64_t *maskbase = ce.hmask[e].data();
+
+		// One product for the whole batch. Formed per entity this was a 64x65
+		// matrix-vector product with a runtime trip count, and it measured
+		// 3 GFLOP/s; as a single GEMM it is the same arithmetic through the tile.
+		MatMulNN(sc.dz, W, nullptr, st.dmsg.data(), B, C, d, false);
+
+		auto flush = [&]() {
+			const int R = st.rows;
+			if (R == 0) {
+				return;
+			}
+			// One product carries the weight gradient and the bias gradient together,
+			// the latter through the padded column of ones.
+			const int xw = st.xw;
+			float *__restrict gt = st.gtmp.data();
+			std::fill(gt, gt + (size_t)C * (size_t)xw, 0.0f);
+			AccumOuter(st.gmat.data(), st.xmat.data(), gt, R, xw, C);
+			for (int c = 0; c < C; c++) {
+				const float *__restrict row = gt + (size_t)c * (size_t)xw;
+				float *__restrict dst = gws + (size_t)c * (size_t)sd;
+				for (int k = 0; k < sd; k++) {
+					dst[k] += row[k];
+				}
+				gb[c] += row[sd];
+			}
+			for (size_t g = 0; g < ngc; g++) {
+				const int gd = cp.gc_dim[e][g], w = st.gcw[g];
+				std::fill(gt, gt + (size_t)C * (size_t)w, 0.0f);
+				AccumOuter(st.gmat.data(), st.gcmat[g].data(), gt, R, w, C);
+				float *__restrict gwg = cg.gw_gc[e][g].data();
+				for (int c = 0; c < C; c++) {
+					const float *__restrict row = gt + (size_t)c * (size_t)w;
+					float *__restrict dst = gwg + (size_t)c * (size_t)gd;
+					for (int k = 0; k < gd; k++) {
+						dst[k] += row[k];
+					}
+				}
+			}
+			st.rows = 0;
+		};
+
 		for (int i = 0; i < B; i++) {
-			const Example &ex = ds.examples[idx[from + (size_t)i]];
-			const size_t vis = Database::VisiblePrefix(lk, child, ex.entity_row, ex.anchor);
+			const size_t exi = idx[from + (size_t)i];
+			const Example &ex = ds.examples[exi];
+			const size_t vis = vc.At(e, exi);
 			if (vis == 0) {
 				continue;
 			}
-			const float *dzr = sc.dz + (size_t)i * (size_t)C;
-			const float *W = p.w_neigh[e].data(); // [C x (C+1)]
-			const int d = C + 1;
-			const float inv = 1.0f / float(vis);
 			const uint32_t b = lk.Begin(ex.entity_row);
-
-			// The message gradient is the same for every child of this entity, so
-			// it is formed once and then distributed. Computing it inside the child
-			// loop cost O(degree * C^2) and strided through W; this is O(C^2) once
-			// plus O(degree * C), and both loops now run along contiguous memory.
-			std::memset(dmean, 0, sizeof(float) * (size_t)C);
+			// The message gradient is shared by every child of this entity, so the
+			// 1/n is applied once here rather than once per child.
+			const float inv = 1.0f / float(vis);
+			float *__restrict dm = st.dmsg.data() + (size_t)i * (size_t)d;
 			for (int c = 0; c < C; c++) {
-				const float g = dzr[c];
-				if (g == 0.0f) {
-					continue;
-				}
-				const float *wrow = W + (size_t)c * (size_t)d;
-				for (int k = 0; k < C; k++) {
-					dmean[k] += g * wrow[k];
-				}
+				dm[c] *= inv;
 			}
-			for (int k = 0; k < C; k++) {
-				dmean[k] *= inv;
-			}
+
+			// Each child's contribution is dmean through that child's own ReLU gate.
+			// The gate is diagonal, so it distributes over the sum and can be applied
+			// per contribution rather than after accumulating.
+			// The staging buffers are hoisted out of the loop. Reached through `st`
+			// they are reloaded on every child, because the flush below can write to
+			// the same object, and that reload cost four times the copy itself.
+			float *const gmat = st.gmat.data();
+			float *const xmat = st.xmat.data();
+			const int xw = st.xw;
+			int rows = st.rows;
 			for (size_t j = 0; j < vis; j++) {
-				const uint32_t u = lk.flat[b + j];
-				float *dh = &dh_scratch[(size_t)u * (size_t)C];
-				if (dh[0] == 0.0f && dh[C - 1] == 0.0f) {
-					touched.push_back(u);
+				const size_t pos = (size_t)b + j;
+				const uint64_t *__restrict mu = maskbase + pos * words;
+				float *__restrict gr = gmat + (size_t)rows * (size_t)C;
+				// gr = dm through the gate, as an AND on the bit pattern rather than a
+				// conditional. Written as `bit ? dm[c] : 0` the shift amount varies per
+				// lane, clang gives up on it, and the loop measured twenty times
+				// slower than this. Zeroing the bits of a float yields +0.0, which is
+				// what the conditional produced.
+				// Whole words are peeled off with a trip count of 64 known at compile
+				// time. Written with a runtime bound of min(64, C - base) the loop does
+				// not vectorise, and that alone cost seven times the rest of the work.
+				for (size_t w = 0; w < full_words; w++) {
+					const uint64_t bits = mu[w];
+					const int base = (int)w * 64;
+					for (int y = 0; y < 64; y++) {
+						uint32_t v;
+						std::memcpy(&v, &dm[base + y], sizeof(v));
+						v &= (uint32_t)0 - (uint32_t)((bits >> y) & 1u);
+						std::memcpy(&gr[base + y], &v, sizeof(v));
+					}
 				}
-				for (int k = 0; k < C; k++) {
-					dh[k] += dmean[k];
+				for (int y = 0; y < tail_bits; y++) {
+					const int c = (int)full_words * 64 + y;
+					uint32_t v;
+					std::memcpy(&v, &dm[c], sizeof(v));
+					v &= (uint32_t)0 - (uint32_t)((mu[full_words] >> y) & 1u);
+					std::memcpy(&gr[c], &v, sizeof(v));
+				}
+				if (sd > 0) {
+					// Only the feature columns are written; the ones column and the pad
+					// were set when the buffer was sized and never change.
+					std::memcpy(xmat + (size_t)rows * (size_t)xw, xsrc + pos * (size_t)sd,
+					            sizeof(float) * (size_t)sd);
+				}
+				for (size_t g = 0; g < ngc; g++) {
+					const int gd = cp.gc_dim[e][g];
+					std::memcpy(st.gcmat[g].data() + (size_t)rows * (size_t)st.gcw[g],
+					            &cs.gc_mean[e][g][pos * (size_t)gd],
+					            sizeof(float) * (size_t)gd);
+				}
+				if (++rows == ChildBackScratch::CH) {
+					st.rows = rows;
+					flush();
+					rows = st.rows;
 				}
 			}
+			st.rows = rows;
 		}
-		// through the child ReLU into the child layer's weights
-		for (uint32_t u : touched) {
-			const float *zr = &ce.z[e][(size_t)u * (size_t)C];
-			float *dh = &dh_scratch[(size_t)u * (size_t)C];
-			for (int k = 0; k < C; k++) {
-				const float g = (zr[k] > 0.0f) ? dh[k] : 0.0f;
-				dh[k] = g;
-				cg.gbias[e][(size_t)k] += g;
-			}
-			const int sd = cp.self_dim[e];
-			if (sd > 0) {
-				const float *xu = feat.x[(size_t)spec.edges[e].src_node].data() +
-				                  (size_t)u * (size_t)sd;
-				for (int c = 0; c < C; c++) {
-					const float g = dh[c];
-					if (g == 0.0f) {
-						continue;
-					}
-					float *row = &cg.gw_self[e][(size_t)c * (size_t)sd];
-					for (int k = 0; k < sd; k++) {
-						row[k] += g * xu[k];
-					}
-				}
-			}
-			for (size_t gidx = 0; gidx < cp.gc_link[e].size(); gidx++) {
-				const int gd = cp.gc_dim[e][gidx];
-				const float *m = &cs.gc_mean[e][gidx][(size_t)u * (size_t)gd];
-				for (int c = 0; c < C; c++) {
-					const float g = dh[c];
-					if (g == 0.0f) {
-						continue;
-					}
-					float *row = &cg.gw_gc[e][gidx][(size_t)c * (size_t)gd];
-					for (int k = 0; k < gd; k++) {
-						row[k] += g * m[k];
-					}
-				}
-			}
-		}
-		for (uint32_t u : touched) {
-			std::fill(dh_scratch.begin() + (size_t)u * (size_t)C,
-			          dh_scratch.begin() + (size_t)(u + 1) * (size_t)C, 0.0f);
-		}
+		flush();
 	}
 }
 
@@ -4276,11 +4756,12 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		model.sage_params.Init(model.sage_spec, C, seed);
 		const SageFeatures feats = BuildSageFeatures(db, model.sage_spec);
 		const SagePrefix prefix = BuildSagePrefix(db, model.sage_spec, feats);
+		VisibleCounts vcounts;
+		BuildVisibleCounts(db, model.sage_spec, ds, vcounts);
 		ChildEmbed ce;
 		ChildStatic cstat;
 		ChildGrads cg;
-		std::vector<float> dh_scratch;
-		std::vector<uint32_t> touched;
+		ChildBackScratch cbs;
 		if (n_layers >= 2) {
 			// The entity now aggregates child EMBEDDINGS, so each message is C wide
 			// plus the degree slot.
@@ -4298,7 +4779,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				}
 			}
 			cg.Ensure(model.sage_child);
-			BuildChildStatic(db, model.sage_spec, model.sage_child, cstat);
+			BuildChildStatic(db, model.sage_spec, model.sage_child, feats, cstat);
 		}
 
 		uint64_t srng = seed | 1ULL;
@@ -4313,6 +4794,13 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		SageScratch sc;
 		SageGrads gr;
 		gr.Ensure(model.sage_params);
+		// One optimiser per tensor, for this run only. These used to be
+		// `static thread_local`, and were re-assigned only when they had to GROW: a
+		// second TRAIN in the same session then started from the previous model's
+		// moments and step count, so the same statement on the same data gave a
+		// different model depending on what had been trained before it.
+		std::vector<Adam> opts(3 + model.sage_params.w_neigh.size());
+		std::vector<Adam> copts;
 		std::vector<double> scores;
 		std::vector<double> outs;
 		std::vector<float> douts;
@@ -4327,10 +4815,10 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			for (size_t b = 0; b < fold.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, fold.size() - b);
 				if (n_layers >= 2) {
-					SageGather2(db, model.sage_spec, ce, ds, fold, b, B, C, sc);
+					SageGather2(model.sage_spec, ce, ds, fold, b, B, C, vcounts, sc);
 				} else {
-					SageGather(db, model.sage_spec, feats, prefix, ds, fold, b, B, model.sage_params,
-					           sc);
+					SageGather(db, model.sage_spec, feats, prefix, ds, fold, b, B,
+					           model.sage_params, vcounts, sc);
 				}
 				SageForward(model.sage_params, B, sc, outs);
 				for (int i = 0; i < B; i++) {
@@ -4354,15 +4842,15 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			if (n_layers >= 2) {
 				// Child embeddings depend on the child weights, so they are refreshed
 				// once per epoch rather than per batch.
-				ComputeChildEmbeddings(db, model.sage_spec, feats, model.sage_child, cstat, ce);
+				ComputeChildEmbeddings(db, model.sage_spec, model.sage_child, cstat, ce);
 			}
 			for (size_t b = 0; b < tr.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, tr.size() - b);
 				if (n_layers >= 2) {
-					SageGather2(db, model.sage_spec, ce, ds, tr, b, B, C, sc);
+					SageGather2(model.sage_spec, ce, ds, tr, b, B, C, vcounts, sc);
 				} else {
-					SageGather(db, model.sage_spec, feats, prefix, ds, tr, b, B, model.sage_params,
-					           sc);
+					SageGather(db, model.sage_spec, feats, prefix, ds, tr, b, B,
+					           model.sage_params, vcounts, sc);
 				}
 				SageForward(model.sage_params, B, sc, outs);
 				douts.assign((size_t)B, 0.0f);
@@ -4380,8 +4868,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				SageBackward(model.sage_params, B, douts, sc, gr);
 				if (n_layers >= 2) {
 					cg.Zero();
-					SageBackward2(db, model.sage_spec, model.sage_params, model.sage_child, feats, cstat, ce,
-					              ds, tr, b, B, sc, cg, dh_scratch, touched, sc.dmean);
+					SageBackward2(db, model.sage_spec, model.sage_params, model.sage_child, cstat,
+					              ce, ds, tr, b, B, sc, cg, cbs, vcounts);
 				}
 				const float inv = 1.0f / float(std::max(1, B));
 				auto step = [&](std::vector<float> &w, std::vector<float> &g, Adam &opt) {
@@ -4390,10 +4878,6 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 					}
 					opt.Step(w, g.data(), lr);
 				};
-				static thread_local std::vector<Adam> opts;
-				if (opts.size() < 3 + model.sage_params.w_neigh.size()) {
-					opts.assign(3 + model.sage_params.w_neigh.size(), Adam());
-				}
 				step(model.sage_params.w_self, gr.gw_self, opts[0]);
 				step(model.sage_params.bias, gr.gbias, opts[1]);
 				step(model.sage_params.w_out, gr.gw_out, opts[2]);
@@ -4401,7 +4885,6 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 					step(model.sage_params.w_neigh[e], gr.gw_neigh[e], opts[3 + e]);
 				}
 				if (n_layers >= 2) {
-					static thread_local std::vector<Adam> copts;
 					size_t need = 0;
 					for (size_t e = 0; e < cg.gw_self.size(); e++) {
 						need += 2 + cg.gw_gc[e].size();
@@ -4498,7 +4981,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	// allocations grew the buffer, which reallocates and dangles every pointer
 	// already handed out.
 	const size_t need =
-	    sizeof(float) * (bw + 4 * bh + 2 * batch + n_w1 + n_w2 + 3 * (size_t)hidden + 1) + 64 * 16;
+	    sizeof(float) * (bw + 4 * bh + 3 * batch + n_w1 + n_w2 + 3 * (size_t)hidden + 1) + 64 * 17;
 	Arena arena;
 	arena.Reserve(need);
 	float *X = arena.Zeroed<float>(bw);
@@ -4508,6 +4991,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	float *DH1 = arena.Zeroed<float>(bh);
 	float *DO = arena.Zeroed<float>(batch);
 	float *YB = arena.Zeroed<float>(batch);
+	float *OB = arena.Zeroed<float>(batch);
 	EvalScratch escratch;
 	std::vector<double> scores;
 
@@ -4519,8 +5003,6 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	float *gw3 = arena.Zeroed<float>((size_t)hidden);
 	float *gb3 = arena.Zeroed<float>(1);
 	const size_t n_gw1 = n_w1, n_gw2 = n_w2;
-	std::vector<float> h1v, h2v, dh1((size_t)hidden), dz1((size_t)hidden), dh2((size_t)hidden),
-	    dz2((size_t)hidden);
 
 	Model best = model;
 	// Regression scores as -MAE, which is negative, so the sentinel must be
@@ -4554,12 +5036,9 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			MatMulNT(X, model.w1.data(), model.b1.data(), H1, B, width, hidden, true);
 			MatMulNT(H1, model.w2.data(), model.b2.data(), H2, B, hidden, hidden, true);
 
+			OutputLayer(H2, model.w3.data(), model.b3[0], OB, B, hidden);
 			for (int i = 0; i < B; i++) {
-				const float *h2 = &H2[(size_t)i * (size_t)hidden];
-				double o = model.b3[0];
-				for (int j = 0; j < hidden; j++) {
-					o += double(model.w3[(size_t)j]) * double(h2[j]);
-				}
+				const double o = OB[(size_t)i];
 				double y = YB[(size_t)i];
 				if (binary) {
 					DO[(size_t)i] = float(1.0 / (1.0 + std::exp(-o)) - y);
@@ -4580,15 +5059,42 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			std::memset(gw3, 0, sizeof(float) * (size_t)hidden);
 			gb3[0] = 0.0f;
 
-			for (int i = 0; i < B; i++) {
-				const float d = DO[(size_t)i];
-				const float *h2 = &H2[(size_t)i * (size_t)hidden];
-				float *dh2 = &DH2[(size_t)i * (size_t)hidden];
-				for (int j = 0; j < hidden; j++) {
-					gw3[(size_t)j] += d * h2[j];
-					dh2[j] = (h2[j] > 0.0f) ? d * model.w3[(size_t)j] : 0.0f;
+			{
+				// gw3[j] += DO[b]*H2[b][j] and dh2[b][j] = gated DO[b]*w3[j], for
+				// every b and j. Written the obvious way round, with b outermost, the
+				// accumulate into gw3 is a read-modify-write of the same 64 floats on
+				// every row, and the compiler has to keep it in memory: it measured
+				// 1.7 GFLOP/s. Blocking by j instead holds that slice of gw3 (and of
+				// w3) in registers for the whole pass over the batch, which is the
+				// same 13x this file gets everywhere else from choosing which axis
+				// the innermost loop walks.
+				const float *__restrict w3p = model.w3.data();
+				float *__restrict g3 = gw3;
+				for (int j0 = 0; j0 < hidden; j0 += 16) {
+					const int jn = std::min(16, hidden - j0);
+					float g[16], w[16];
+					for (int y = 0; y < jn; y++) {
+						g[y] = g3[j0 + y];
+						w[y] = w3p[j0 + y];
+					}
+					for (int i = 0; i < B; i++) {
+						const float d = DO[(size_t)i];
+						const float *__restrict h2 = &H2[(size_t)i * (size_t)hidden] + j0;
+						float *__restrict dh2r = &DH2[(size_t)i * (size_t)hidden] + j0;
+						for (int y = 0; y < jn; y++) {
+							g[y] += d * h2[y];
+							dh2r[y] = (h2[y] > 0.0f) ? d * w[y] : 0.0f;
+						}
+					}
+					for (int y = 0; y < jn; y++) {
+						g3[j0 + y] = g[y];
+					}
 				}
-				gb3[0] += d;
+				float gb = 0.0f;
+				for (int i = 0; i < B; i++) {
+					gb += DO[(size_t)i];
+				}
+				gb3[0] += gb;
 			}
 			AccumOuter(DH2, H1, gw2, B, hidden, hidden);
 			for (int i = 0; i < B; i++) {
@@ -4633,7 +5139,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		}
 
 		if (!va.empty()) {
-			ScoreRows(model, ds, va, X, bw, escratch, scores);
+			ScoreRows(model, ds, va, escratch, scores);
 			double m;
 			if (binary) {
 				std::vector<std::pair<double, int>> sc;
@@ -4678,7 +5184,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		}
 	}
 	if (!te.empty()) {
-		ScoreRows(model, ds, te, X, bw, escratch, scores);
+		ScoreRows(model, ds, te, escratch, scores);
 		if (binary) {
 			std::vector<std::pair<double, int>> sc;
 			for (size_t i = 0; i < te.size(); i++) {
@@ -4796,6 +5302,8 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 		}
 		const SageFeatures feats = BuildSageFeatures(db, spec_s);
 		const SagePrefix prefix = BuildSagePrefix(db, spec_s, feats);
+		VisibleCounts vcounts;
+		BuildVisibleCounts(db, spec_s, ds, vcounts);
 		SageScratch sc;
 		const size_t B0 = 256;
 		sc.Ensure(B0, model.sage_params);
@@ -4806,7 +5314,7 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 		std::vector<double> outs;
 		for (size_t b = 0; b < all.size(); b += B0) {
 			const int B = (int)std::min(B0, all.size() - b);
-			SageGather(db, spec_s, feats, prefix, ds, all, b, B, model.sage_params, sc);
+			SageGather(db, spec_s, feats, prefix, ds, all, b, B, model.sage_params, vcounts, sc);
 			SageForward(model.sage_params, B, sc, outs);
 			for (int i = 0; i < B; i++) {
 				Prediction p;
@@ -4829,23 +5337,24 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 		}
 		return out;
 	}
-	for (size_t i = 0; i < ds.examples.size(); i++) {
-		Prediction p;
-		p.entity_row = ds.examples[i].entity_row;
-		p.anchor = ds.examples[i].anchor;
-		double v = model.Predict(ds.Row(i), spec.width);
-		// Same post-processing as the scoring path, or PREDICT would disagree with
-		// the metric the model was judged by.
-		if (!model.classification) {
-			if (model.residual) {
-				v += ds.examples[i].base;
-			}
-			if (model.nonnegative && v < 0.0) {
-				v = 0.0;
-			}
+	// Through the same batched path training scored with, rather than a row at a
+	// time. A single-row product re-transposes both weight matrices for each row,
+	// which is more work than the product it sets up.
+	{
+		std::vector<size_t> all(ds.examples.size());
+		for (size_t i = 0; i < all.size(); i++) {
+			all[i] = i;
 		}
-		p.value = v;
-		out.push_back(p);
+		EvalScratch es;
+		std::vector<double> vals;
+		ScoreRows(model, ds, all, es, vals);
+		for (size_t i = 0; i < ds.examples.size(); i++) {
+			Prediction p;
+			p.entity_row = ds.examples[i].entity_row;
+			p.anchor = ds.examples[i].anchor;
+			p.value = vals[i];
+			out.push_back(p);
+		}
 	}
 	return out;
 }
@@ -4897,6 +5406,8 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 		}
 		const SageFeatures feats = BuildSageFeatures(db, ss);
 		const SagePrefix pre = BuildSagePrefix(db, ss, feats);
+		VisibleCounts vcounts;
+		BuildVisibleCounts(db, ss, ds, vcounts);
 		SageScratch sc;
 		const size_t B0 = 256;
 		sc.Ensure(B0, model.sage_params);
@@ -4908,7 +5419,7 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 		std::vector<double> outs;
 		for (size_t b = 0; b < all.size(); b += B0) {
 			const int B = (int)std::min(B0, all.size() - b);
-			SageGather(db, ss, feats, pre, ds, all, b, B, model.sage_params, sc);
+			SageGather(db, ss, feats, pre, ds, all, b, B, model.sage_params, vcounts, sc);
 			SageForward(model.sage_params, B, sc, outs);
 			for (int i = 0; i < B; i++) {
 				double v = model.classification
@@ -4926,19 +5437,12 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 			}
 		}
 	} else {
-		preds.assign(ds.examples.size(), 0.0);
-		for (size_t i = 0; i < ds.examples.size(); i++) {
-			double v = model.Predict(ds.Row(i), spec.width);
-			if (!model.classification) {
-				if (model.residual) {
-					v += ds.examples[i].base;
-				}
-				if (model.nonnegative && v < 0.0) {
-					v = 0.0;
-				}
-			}
-			preds[i] = v;
+		std::vector<size_t> all(ds.examples.size());
+		for (size_t i = 0; i < all.size(); i++) {
+			all[i] = i;
 		}
+		EvalScratch es;
+		ScoreRows(model, ds, all, es, preds);
 	}
 
 	const double lo = stmt.has_from ? stmt.backtest_from.number

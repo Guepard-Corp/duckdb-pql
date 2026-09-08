@@ -322,11 +322,19 @@ The language lives in one self-contained header,
 [`extras/pql/src/pql.hpp`](extras/pql/src/pql.hpp), which never includes a
 DuckDB header.
 
-Children live in a CSR arena — one flat array per link, contiguous per-parent
-slices. Buckets already in time order skip sorting entirely; the rest are radix
-sorted. Kernels are specialised on their shape and dispatched once, so trip
-counts vanish and bodies unroll. Per-step buffers come from a single arena sized
-up front from `(batch, channels, relation widths)`.
+Children live in a CSR arena: one flat array per link, contiguous per-parent
+slices, and the child layer's own features and gate masks are permuted into that
+same order so a batch reads them in one sweep. Buckets already in time order skip
+sorting entirely; the rest are radix sorted. Per-step buffers come from a single
+arena sized up front from `(batch, channels, relation widths)`.
+
+The linear algebra is three kernels, each holding a block of the *output* in
+vector registers and reducing on an outer loop. That is the opposite of writing
+a dot product per output element, which ends in a horizontal reduction and
+reloads the weight row once per row of the batch; the difference is roughly ten
+times. Block shapes are compile-time constants, chosen per K by measurement
+rather than by rule, and a weight matrix is transposed when the reduction axis
+would otherwise be the wrong one — K*N writes against B*K*N multiply-adds.
 
 The loader consults the catalog first and reads only the tables and columns that
 can influence the model, straight from `DataChunk` buffers with no per-cell

@@ -193,6 +193,25 @@ int main() {
       Model m; a2 = TrainModel(db, st, m).test_metric; }
     printf("   1 hop = %.4f   2 hops = %.4f\n", a1, a2);
     if (a2 <= a1 + 0.03) { printf("   FAIL: the second hop did not reach the signal\n"); fails++; }
+
+    // ---- H. the same statement twice in a session gives the same model -----
+    // The SAGE optimiser state used to be static and was only reset when it had
+    // to grow, so a second TRAIN inherited the first model's Adam moments and
+    // step count. Nothing about the statement changed, but the result did.
+    printf("== H. training is reproducible within a session\n");
+    double r1 = 0, r2 = 0, r3 = 0;
+    { auto st = Parse(std::string("TRAIN MODEL r PREDICT EXISTS(orders) FOR users AT ts HORIZON 20 DAYS ") + opts2);
+      Model m; r1 = TrainModel(db, st, m).test_metric; }
+    { auto st = Parse(std::string("TRAIN MODEL other PREDICT EXISTS(orders) FOR users AT ts HORIZON 20 DAYS ") + opts1);
+      Model m; TrainModel(db, st, m); }          // a different model in between
+    { auto st = Parse(std::string("TRAIN MODEL r PREDICT EXISTS(orders) FOR users AT ts HORIZON 20 DAYS ") + opts2);
+      Model m; r2 = TrainModel(db, st, m).test_metric; }
+    { auto st = Parse(std::string("TRAIN MODEL r PREDICT EXISTS(orders) FOR users AT ts HORIZON 20 DAYS ") + opts2);
+      Model m; r3 = TrainModel(db, st, m).test_metric; }
+    printf("   %.6f / %.6f / %.6f\n", r1, r2, r3);
+    if (r1 != r2 || r2 != r3) {
+      printf("   FAIL: the same statement gave different models\n"); fails++;
+    }
   }
   printf("\n%s\n", fails ? "FAILURES" : "all model tests passed");
   return fails ? 1 : 0;
