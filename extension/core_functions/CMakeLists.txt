@@ -9,6 +9,7 @@ set_extension_version_sources(core_functions core_functions_extension.cpp)
 include_directories(include)
 add_subdirectory(aggregate)
 add_subdirectory(scalar)
+add_subdirectory(pql)
 
 set(CORE_FUNCTION_FILES ${CORE_FUNCTION_FILES} core_functions_extension.cpp
                         function_list.cpp lambda_functions.cpp)

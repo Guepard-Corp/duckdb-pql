@@ -1,0 +1,79 @@
+# name: test/sql/pql/pql_basic.test
+# description: Predictive Query Language: TRAIN, PREDICT, DROP MODEL
+# group: [pql]
+
+statement ok
+CREATE TABLE users AS
+  SELECT i AS id,
+         TIMESTAMP '2023-01-01' + INTERVAL '1 day' * ((i * 7) % 300) AS ts,
+         (i % 13) * 1.0 AS tenure
+  FROM range(600) t(i);
+
+statement ok
+CREATE TABLE events AS
+  SELECT row_number() OVER () AS id, u.id AS user_id,
+         u.ts - INTERVAL '1 day' * (k * 10 + 1) AS ts,
+         10.0 + k AS amount
+  FROM users u, range(25) r(k)
+  WHERE k < (u.id % 20);
+
+statement ok
+INSERT INTO events
+  SELECT 900000 + u.id, u.id, u.ts + INTERVAL '1 day' * 10, 5.0
+  FROM users u WHERE (u.id % 20) > 10;
+
+# a forecast target separates cleanly on this generator
+query I
+SELECT CAST(test >= 0.95 AS INTEGER) FROM pql_exec('TRAIN MODEL churn PREDICT EXISTS(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 80, hidden = 32)');
+----
+1
+
+query I
+SELECT count(*) FROM pql_models();
+----
+1
+
+# predictions come back for exactly the filtered entities
+query I
+SELECT count(*) FROM pql_exec('PREDICT EXISTS(events) FOR users WHERE id < 6 USING MODEL churn');
+----
+6
+
+# and they rank the known positives above the known negatives
+query I
+SELECT CAST(avg(CASE WHEN (id::BIGINT % 20) > 10 THEN prediction END) >
+            avg(CASE WHEN (id::BIGINT % 20) > 10 THEN NULL ELSE prediction END) AS INTEGER)
+FROM pql_exec('PREDICT EXISTS(events) FOR users USING MODEL churn');
+----
+1
+
+statement ok
+DROP MODEL churn;
+
+query I
+SELECT count(*) FROM pql_models();
+----
+0
+
+# a forecast without a horizon is rejected at parse time
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts;
+----
+<REGEX>:.*HORIZON.*
+
+# so is an aggregate that needs a column but was given none
+statement error
+TRAIN MODEL bad PREDICT SUM(events) FOR users AT ts HORIZON 5 DAYS;
+----
+<REGEX>:.*needs a column.*
+
+# predicting an attribute with a horizon is a category error
+statement error
+TRAIN MODEL bad PREDICT users.tenure FOR users HORIZON 5 DAYS;
+----
+<REGEX>:.*meaningless.*
+
+statement error
+PREDICT EXISTS(events) FOR users USING MODEL nope;
+----
+<REGEX>:.*no model named.*

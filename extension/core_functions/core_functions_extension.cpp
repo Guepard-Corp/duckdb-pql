@@ -3,8 +3,11 @@
 
 namespace duckdb {
 
+void RegisterPqlExtension(ExtensionLoader &loader);
+
 static void LoadInternal(ExtensionLoader &loader) {
 	FunctionList::RegisterExtensionFunctions(loader, CoreFunctionList::GetFunctionList());
+	RegisterPqlExtension(loader);
 }
 
 void CoreFunctionsExtension::Load(ExtensionLoader &loader) {

@@ -1,0 +1,156 @@
+# name: test/sql/pql/pql_guards.test
+# description: PQL refuses the inputs that used to produce silently meaningless models
+# group: [pql]
+
+statement ok
+CREATE TABLE users AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts,
+         (i % 11) * 1.0 AS score, 'g' || (i % 3) AS grp
+  FROM range(400) t(i);
+
+statement ok
+CREATE TABLE events AS
+  SELECT row_number() OVER () AS id, u.id AS user_id,
+         u.ts - INTERVAL '1 day' * (k + 1) AS ts, (k * 2.0) AS amount
+  FROM users u, range(12) r(k) WHERE k < (u.id % 12);
+
+# a child table with no time column cannot honour a horizon
+statement ok
+CREATE TABLE undated AS SELECT row_number() OVER () AS id, u.id AS user_id, 1.0 AS v FROM users u;
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(undated) FOR users AT ts HORIZON 30 DAYS;
+----
+<REGEX>:.*no time column.*
+
+# text columns are not prediction targets
+statement error
+TRAIN MODEL bad PREDICT users.grp FOR users;
+----
+<REGEX>:.*is text.*
+
+# option hygiene
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epocs = 10);
+----
+<REGEX>:.*unknown option.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (hidden = 60000);
+----
+<REGEX>:.*HIDDEN must be between.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 0 DAYS;
+----
+<REGEX>:.*positive.*
+
+# clauses must belong to the statement they appear in
+statement error
+TRAIN MODEL a PREDICT COUNT(events) FOR users AT ts HORIZON 5 DAYS USING MODEL b;
+----
+<REGEX>:.*USING MODEL belongs.*
+
+# a filter qualifier must name the relation it is evaluated on
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AS u AT ts HORIZON 30 DAYS WHERE zzz.score > 1;
+----
+<REGEX>:.*evaluated on.*
+
+statement ok
+TRAIN MODEL good PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20);
+
+# a prediction may not restate a different target or horizon
+statement error
+PREDICT EXISTS(events) FOR users USING MODEL good;
+----
+<REGEX>:.*predicts COUNT.*
+
+statement error
+PREDICT COUNT(events) FOR users HORIZON 365 DAYS USING MODEL good;
+----
+<REGEX>:.*trained with HORIZON.*
+
+# SPLIT accepts real dates and yields disjoint folds
+query I
+SELECT CAST(train_rows > 0 AND val_rows > 0 AND test_rows > 0 AS INTEGER)
+FROM pql_exec('TRAIN MODEL sp PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS SPLIT TEMPORAL VALIDATE FROM ''2024-04-01'' TEST FROM ''2024-06-01'' OPTIONS (epochs = 10)');
+----
+1
+
+# a split that leaves no training rows is an error, not a silent full-set fallback
+statement error
+TRAIN MODEL sp2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  SPLIT TEMPORAL VALIDATE FROM '1990-01-01' TEST FROM '1990-06-01' OPTIONS (epochs = 5);
+----
+<REGEX>:.*no training rows.*
+
+# a timestamp filter compares as a timestamp, not as epoch zero
+query I
+SELECT CAST(count(*) > 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users WHERE ts > ''2024-05-01'' USING MODEL good');
+----
+1
+
+# counts are never negative
+query I
+SELECT CAST(min(prediction) >= 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users USING MODEL good');
+----
+1
+
+# persistence is reported so a user can see what to beat
+query I
+SELECT CAST(baseline IS NOT NULL AS INTEGER)
+FROM pql_exec('TRAIN MODEL b PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 10)');
+----
+1
+
+# a COUNT target stays a regression even when its labels happen to be 0/1
+query I
+SELECT CAST(metric = 'mae' AS INTEGER)
+FROM pql_exec('TRAIN MODEL c PREDICT COUNT(events) FOR users AT ts HORIZON 1 HOUR OPTIONS (epochs = 5)');
+----
+1
+
+# duplicate entity keys cannot be attributed
+statement ok
+CREATE TABLE dupes AS SELECT (i % 50) AS id, TIMESTAMP '2023-12-15' AS ts, 1.0 AS f FROM range(100) t(i);
+
+statement ok
+CREATE TABLE dupe_kids AS SELECT row_number() OVER () AS id, d.id AS dupe_id,
+         TIMESTAMP '2023-12-01' + INTERVAL '1 day' * (d.id % 90) AS ts, 1.0 AS v FROM dupes d;
+
+statement error
+TRAIN MODEL dup PREDICT COUNT(dupe_kids) FOR dupes AT ts HORIZON 10 DAYS;
+----
+<REGEX>:.*duplicate key.*
+
+# a horizon that runs past the end of the data is reported, not silently scored
+statement error
+TRAIN MODEL cens PREDICT COUNT(events) FOR users AT ts HORIZON 3650 DAYS;
+----
+<REGEX>:.*label window ends after.*
+
+# EVERY generates the anchor grid, so a catalog table needs no hand-built panel
+query I
+SELECT CAST(train_rows > (SELECT count(*) FROM users) AS INTEGER)
+FROM pql_exec('TRAIN MODEL gen PREDICT COUNT(events) FOR users EVERY 30 DAYS HORIZON 30 DAYS OPTIONS (epochs = 10)');
+----
+1
+
+# AT and EVERY are alternatives, not companions
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts EVERY 30 DAYS HORIZON 30 DAYS;
+----
+<REGEX>:.*not both.*
+
+# EVERY only makes sense for a forecast
+statement error
+TRAIN MODEL bad PREDICT users.score FOR users EVERY 30 DAYS;
+----
+<REGEX>:.*needs an aggregate target.*
+
+# predictions from a generated grid carry their anchor
+query I
+SELECT CAST(count(*) > 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users WHERE id < 3 USING MODEL gen');
+----
+1
