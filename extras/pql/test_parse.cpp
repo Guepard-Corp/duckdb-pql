@@ -58,6 +58,17 @@ int main() {
   Err("PREDICT users.x FOR users SPLIT TEMPORAL VALIDATE FROM 1 TEST FROM 2 USING MODEL m", "SPLIT applies to TRAIN");
   Err("PREDICT COUNT(o) FOR u USING GRAPH (a) USING MODEL m", "USING GRAPH applies to TRAIN");
   Ok("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS OPTIONS (mean_cols = 4, batch = 32)", "TRAIN MODEL a");
+  Ok("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE (email)", "EXCLUDE (email)");
+  Ok("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE (email, o.note)",
+     "EXCLUDE (email, o.note)");
+  Ok("EXPLAIN MODEL churn", "EXPLAIN MODEL churn");
+  Ok("EXPLAIN MODEL churn FOR users", "EXPLAIN MODEL churn");
+  Err("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE ()", "column or table name");
+  Err("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE (a) EXCLUDE (b)",
+      "duplicate EXCLUDE");
+  Err("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE a", "expected '('");
+  Err("EXPLAIN churn", "expected MODEL");
+  Err("EXPLAIN MODEL m HORIZON 3 DAYS", "in EXPLAIN");
   std::printf("\n%d passed, %d failed\n", oks, fails);
   return fails ? 1 : 0;
 }

@@ -142,7 +142,7 @@ inline bool IsPqlKeyword(const std::string &up) {
 	                           "SUM",    "AVG",    "MIN",     "MAX",    "DAY",    "DAYS",
 	                           "WEEK",   "WEEKS",  "MONTH",   "MONTHS", "YEAR",   "YEARS",
 	                           "HOUR",   "HOURS",  "DROP",    "SHOW",   "MODELS", "EVERY",
-	                           "BACKTEST", "TO",     "EXPLAIN",
+	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE",
 	                           nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
@@ -526,6 +526,10 @@ struct Statement {
 	std::string entity_table;
 	std::string entity_alias;
 	std::unique_ptr<FilterNode> filter; // outer WHERE, restricts entities
+	// Columns the model must not look at. A leaky field, a free-text note, or
+	// anything EXPLAIN showed to be worthless: naming it here is cheaper than
+	// building a view without it.
+	std::vector<Ref> excluded;
 	Ref anchor;                         // AT <column>
 	Literal anchor_literal;             // AT '2024-01-01' (prediction only)
 	bool anchor_is_literal = false;
@@ -598,6 +602,13 @@ struct Statement {
 		s += " FOR " + entity_table;
 		if (!entity_alias.empty()) {
 			s += " AS " + entity_alias;
+		}
+		if (!excluded.empty()) {
+			s += " EXCLUDE (";
+			for (size_t i = 0; i < excluded.size(); i++) {
+				s += (i ? ", " : "") + excluded[i].ToString();
+			}
+			s += ")";
 		}
 		if (filter) {
 			s += " WHERE " + filter->ToString();
@@ -765,6 +776,7 @@ public:
 		// silently overwriting.
 		bool seen_where = false, seen_at = false, seen_h = false, seen_graph = false;
 		bool seen_split = false, seen_opts = false, seen_using = false, seen_every = false;
+		bool seen_excl = false;
 		while (Peek().kind != Tok::END && !(Peek().kind == Tok::PUNCT && Peek().text == ";")) {
 			if (PeekKw("WHERE")) {
 				Once(seen_where, "WHERE");
@@ -819,6 +831,17 @@ public:
 				ExpectKw("TEST");
 				ExpectKw("FROM");
 				st.split.test_from = ParseLiteral();
+			} else if (PeekKw("EXCLUDE")) {
+				Once(seen_excl, "EXCLUDE");
+				Next();
+				ExpectPunct("(");
+				while (true) {
+					st.excluded.push_back(ParseRef());
+					if (!AcceptPunct(",")) {
+						break;
+					}
+				}
+				ExpectPunct(")");
 			} else if (PeekKw("OPTIONS")) {
 				Once(seen_opts, "OPTIONS");
 				Next();
@@ -2781,8 +2804,57 @@ inline void SageNodeColumns(const Database &db, int table, const Link *incoming,
 	}
 }
 
-inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int anchor_col,
-                              int target_col, double train_cutoff) {
+// Does EXCLUDE name this column? A bare name means the entity's own column;
+// qualify it to reach a child table's.
+inline bool IsExcluded(const Statement &stmt, const Frame &entity, const std::string &table,
+                       const std::string &column) {
+	for (const auto &r : stmt.excluded) {
+		if (ToUpper(r.name) != ToUpper(column)) {
+			continue;
+		}
+		if (r.qualifier.empty()) {
+			if (ToUpper(table) == ToUpper(entity.name)) {
+				return true;
+			}
+			continue;
+		}
+		if (ToUpper(r.qualifier) == ToUpper(table) ||
+		    ToUpper(r.qualifier) == ToUpper(stmt.entity_alias)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// A name that matches nothing is a mistake, not a no-op. Silently ignoring a
+// misspelt EXCLUDE would leave the column in the model and say nothing.
+inline void ValidateExcluded(const Database &db, const Frame &entity, const Statement &stmt) {
+	for (const auto &r : stmt.excluded) {
+		bool found = false;
+		for (const auto &t : db.tables) {
+			if (!r.qualifier.empty() && ToUpper(r.qualifier) != ToUpper(t.name) &&
+			    ToUpper(r.qualifier) != ToUpper(stmt.entity_alias)) {
+				continue;
+			}
+			if (r.qualifier.empty() && ToUpper(t.name) != ToUpper(entity.name)) {
+				continue;
+			}
+			if (t.Find(r.name) >= 0) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			throw std::runtime_error("pql: EXCLUDE names '" + r.ToString() +
+			                         "', which is not a column of " +
+			                         (r.qualifier.empty() ? ("'" + entity.name + "'")
+			                                              : ("'" + r.qualifier + "'")));
+		}
+	}
+}
+
+inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Statement &stmt,
+                              int anchor_col, int target_col, double train_cutoff) {
 	SageSpec spec;
 	auto add_node = [&](int table, const Link *incoming) {
 		for (size_t n = 0; n < spec.nodes.size(); n++) {
@@ -2794,6 +2866,17 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int ancho
 		nt.table = table;
 		nt.table_name = db.tables[(size_t)table].name;
 		SageNodeColumns(db, table, incoming, nt.cols);
+		{
+			// EXCLUDE means the same thing whichever architecture is asked for.
+			const Frame &nf = db.tables[(size_t)table];
+			std::vector<int> keep;
+			for (int c : nt.cols) {
+				if (!IsExcluded(stmt, entity, nf.name, nf.columns[(size_t)c].name)) {
+					keep.push_back(c);
+				}
+			}
+			nt.cols.swap(keep);
+		}
 		if (table == db.Find(entity.name)) {
 			// the anchor and the target are not inputs
 			std::vector<int> keep;
@@ -2857,6 +2940,9 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int ancho
 				}
 			}
 			if (is_key) {
+				continue;
+			}
+			if (IsExcluded(stmt, entity, f.name, f.columns[ci].name)) {
 				continue;
 			}
 			FeatureSpec::CatCol cc;
@@ -3896,6 +3982,9 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 		if (excluded[i] || !entity.columns[i].IsNumeric()) {
 			continue;
 		}
+		if (IsExcluded(stmt, entity, entity.name, entity.columns[i].name)) {
+			continue;
+		}
 		// An entity row is read as it stands now, not as it stood at the anchor, so
 		// any other timestamp on it (last_seen_at, closed_at) may record something
 		// that happened after the anchor. Those are perfect leaks, so they are not
@@ -3974,6 +4063,9 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 		if (excluded[i] || entity.columns[i].type != ColType::CATEGORY) {
 			continue;
 		}
+		if (IsExcluded(stmt, entity, entity.name, entity.columns[i].name)) {
+			continue;
+		}
 		const Column *anch = anchor_col >= 0 ? &entity.columns[(size_t)anchor_col] : nullptr;
 		FeatureSpec::CatCol cc;
 		if (FitCatCol(entity, i, anch, train_cutoff, max_categories, cc)) {
@@ -4003,6 +4095,9 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			// key says nothing about behaviour.
 			const std::string up = ToUpper(child.columns[c].name);
 			if (up == "ID" || (up.size() > 3 && up.compare(up.size() - 3, 3, "_ID") == 0)) {
+				continue;
+			}
+			if (IsExcluded(stmt, entity, lk.child_table, child.columns[c].name)) {
 				continue;
 			}
 			const Column &cc = child.columns[c];
@@ -5187,6 +5282,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			}
 		}
 	}
+	ValidateExcluded(db, entity, stmt);
 	model.features =
 	    FitFeatureSpec(db, entity, stmt, anchor_col, target_col, max_mean_cols,
 	                   (int)stmt.options.Num("MAX_CATEGORIES", 16), train_cutoff);
@@ -5294,7 +5390,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	// ---- hetero GraphSAGE path -------------------------------------------
 	if (ToUpper(stmt.options.Str("ARCH", "mlp")) == "SAGE") {
 		model.sage = true;
-		model.sage_spec = BuildSageSpec(db, entity, anchor_col, target_col, train_cutoff);
+		model.sage_spec = BuildSageSpec(db, entity, stmt, anchor_col, target_col, train_cutoff);
 		if (model.sage_spec.edges.empty()) {
 			throw std::runtime_error("pql: arch='sage' needs at least one linked child table with "
 			                         "numeric columns");

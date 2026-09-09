@@ -294,3 +294,52 @@ statement error
 EXPLAIN MODEL nonexistent;
 ----
 <REGEX>:.*no model named.*
+
+# ---------------------------------------------------------------------------
+# EXCLUDE: keep a column out of the model.
+# ---------------------------------------------------------------------------
+
+# `plan` is the only thing that decides the label, so removing it must cost
+# everything: the model falls back to roughly the baseline
+query I
+SELECT CAST(test > baseline * 0.7 AS INTEGER)
+FROM pql_exec('TRAIN MODEL no_plan PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS EXCLUDE (plan) OPTIONS (epochs = 40, hidden = 32)');
+----
+1
+
+# removing columns that carry nothing leaves the model where it was, and the
+# feature count drops
+query I
+SELECT CAST(test < 0.5 AS INTEGER)
+FROM pql_exec('TRAIN MODEL no_noise PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS EXCLUDE (filler) OPTIONS (epochs = 40, hidden = 32)');
+----
+1
+
+query I
+SELECT CAST((SELECT features FROM pql_exec('SHOW MODELS') WHERE model = 'no_noise')
+          < (SELECT features FROM pql_exec('SHOW MODELS') WHERE model = 'by_plan') AS INTEGER);
+----
+1
+
+# a child table's column can be excluded by qualifying it
+statement ok
+TRAIN MODEL no_child PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS
+  EXCLUDE (visits.id) OPTIONS (epochs = 10, hidden = 16);
+
+# EXCLUDE means the same thing whichever architecture is asked for
+statement ok
+TRAIN MODEL sage_excl PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS
+  EXCLUDE (plan) OPTIONS (epochs = 10, hidden = 16, arch = 'sage');
+
+# a name that matches nothing is a mistake, not a silent no-op
+statement error
+TRAIN MODEL typo PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS
+  EXCLUDE (emial) OPTIONS (epochs = 5);
+----
+<REGEX>:.*EXCLUDE names 'emial'.*
+
+statement error
+TRAIN MODEL typo2 PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS
+  EXCLUDE (visits.nosuch) OPTIONS (epochs = 5);
+----
+<REGEX>:.*EXCLUDE names 'visits.nosuch'.*

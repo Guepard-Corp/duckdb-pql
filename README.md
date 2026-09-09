@@ -197,6 +197,7 @@ TRAIN MODEL <name>
   [ AT <column> | EVERY <n> <unit> ]        -- anchor: read one, or generate them
   [ HORIZON <n> <unit> ]                    -- how far ahead
   [ USING GRAPH (<table>, ...) ]            -- restrict which tables are used
+  [ EXCLUDE (<column>, ...) ]               -- columns the model must not see
   [ SPLIT TEMPORAL VALIDATE FROM <ts> TEST FROM <ts> ]
   [ OPTIONS (<key> = <value>, ...) ]
 
@@ -211,6 +212,28 @@ DROP MODEL <name>
 
 `PREDICT` and `FOR` come first; the optional clauses may follow in any order.
 `PREDICT` inherits `AT` and `HORIZON` from the model.
+
+### `EXCLUDE`: columns the model must not see
+
+`EXPLAIN` tells you what a model leans on. `EXCLUDE` is how you answer it.
+
+```sql
+TRAIN MODEL demand PREDICT COUNT(visits) FOR members AT joined HORIZON 30 DAYS
+  EXCLUDE (internal_note, visits.staff_flag);
+```
+
+A bare name is a column of the entity; qualify it to reach a child table's. It
+applies before anything is fitted, so an excluded column contributes no
+standardisation statistics and no category counts either, and it means the same
+thing whichever `arch` is asked for.
+
+A name that matches no column is an error rather than a no-op. A misspelt
+`EXCLUDE` that quietly left the column in the model would be the worst of both:
+you would believe it was gone.
+
+Reach for it when a column is a leak you cannot remove upstream, when it is free
+text that is really an identifier, or when `EXPLAIN` says it is worth nothing and
+you would rather not pay for the width.
 
 ### `EXPLAIN MODEL`: what it is actually using
 
