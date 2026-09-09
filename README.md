@@ -28,8 +28,14 @@ Work through this and you will know PQL. Every query below is real and runs.
 
 ## 1.1 Your first model
 
-Suppose you have customers, and some of them churned. You want to predict which
-others will.
+Everything in Part 1 runs against one small dataset. Load it and follow along:
+
+```bash
+build/reldebug/duckdb -c ".read extras/pql/examples/tutorial.sql"
+```
+
+It makes 1,500 `customers` and their `orders`. Some customers churned. You want
+to predict which others will.
 
 ```sql
 TRAIN MODEL churn PREDICT customers.churned FOR customers;
@@ -37,19 +43,19 @@ TRAIN MODEL churn PREDICT customers.churned FOR customers;
 
 That is the whole statement. PQL reads the catalog, finds that `orders` points
 at `customers` through a foreign key, and builds features from both: the
-customer's own columns, plus counts, averages and recency of their orders. Then
-it trains, holds out a slice, and reports.
+customer's own columns, plus counts, averages, recency and spacing of their
+orders. Then it trains, holds out a slice, and reports.
 
 ```
 ┌────────────┬───────────┬────────┬───────┬──────────┐
 │ train_rows │ test_rows │ metric │ test  │ features │
 ├────────────┼───────────┼────────┼───────┼──────────┤
-│        540 │       180 │ auroc  │ 0.615 │       17 │
+│        900 │       300 │ auroc  │ 0.691 │       29 │
 └────────────┴───────────┴────────┴───────┴──────────┘
 ```
 
-Seventeen features you did not have to write, from a statement that names no
-features at all. 0.615 AUROC is a modest model, which is the honest result on
+Twenty-nine features you did not have to write, from a statement that names no
+features at all. 0.691 AUROC is a modest model, which is the honest result on
 data where churn is only partly explained by order history — and it is the sort
 of number you should expect to see, not 0.99. Ask it about anyone:
 
@@ -89,12 +95,21 @@ from strictly after it.
 Say it directly and PQL builds those examples for you:
 
 ```sql
-TRAIN MODEL demand PREDICT COUNT(line_items) FOR products
-  EVERY 1 MONTH HORIZON 30 DAYS;
+TRAIN MODEL reorder PREDICT EXISTS(orders) FOR customers
+  AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 60);
 ```
 
-`EVERY 1 MONTH` generates the anchors from the data's own span. `HORIZON 30 DAYS`
-says how far ahead to look. 95 products become 570 training examples.
+`AT last_seen` says where each customer's anchor is. `HORIZON 30 DAYS` says how
+far ahead to look. When your rows carry no such moment, `EVERY 1 MONTH` builds a
+grid of anchors from the data's own span instead.
+
+```
+┌────────────┬───────────┬────────┬────────┬────────┬──────────┬──────────┐
+│ train_rows │ test_rows │ metric │  test  │ pr_auc │ baseline │ features │
+├────────────┼───────────┼────────┼────────┼────────┼──────────┼──────────┤
+│        900 │       300 │ auroc  │ 0.8899 │ 0.8466 │    0.400 │       30 │
+└────────────┴───────────┴────────┴────────┴────────┴──────────┴──────────┘
+```
 
 The target can be any aggregate over a related table:
 
@@ -110,7 +125,7 @@ And you can narrow what counts:
 ```sql
 TRAIN MODEL refunds
   PREDICT EXISTS(orders WHERE orders.status = 'refunded')
-  FOR customers EVERY 1 WEEK HORIZON 60 DAYS;
+  FOR customers AT last_seen HORIZON 60 DAYS;
 ```
 
 Same customers, different question. That inner `WHERE` is the label definition;
@@ -118,69 +133,122 @@ the outer one picks which customers take part.
 
 ## 1.4 Reading the answer honestly
 
-Every `TRAIN` prints the number you have to beat:
+Every `TRAIN` prints the number you have to beat. For a forecast of a quantity:
 
+```sql
+TRAIN MODEL spend PREDICT SUM(orders.amount) FOR customers
+  AT last_seen HORIZON 60 DAYS OPTIONS (epochs = 60);
 ```
-│ metric │  test  │ baseline │
-│  mae   │ 1.0616 │  1.1387  │
+```
+│ metric │  test   │ baseline │
+│  mae   │ 58.7366 │  94.9800 │
 ```
 
 **`baseline` is what a model with no information gets.** For a forecast that is
 persistence: just repeat what happened last window. It is a genuinely hard
 opponent and a much better yardstick than "predict the average". Above, the
-model wins by 7%.
+model wins by 38%.
 
 For classification it is the positive rate, which is what a coin scores on
 `pr_auc`. That column matters when positives are rare, because AUROC does not
-degrade there in a way anyone notices. A model on a target with a 4.6% positive
-rate scored 0.974 AUROC and 0.513 average precision in testing: genuinely eleven
-times better than chance, and not the near-perfect classifier the first number
-suggests on its own.
+degrade there in a way anyone notices. The `reorder` model above reaches 0.8466
+average precision against a 0.400 base rate. On a rarer target the two numbers
+part company sharply: one tested here scored 0.974 AUROC and 0.513 average
+precision on a 4.6% positive rate, which is eleven times chance rather than the
+near-perfect classifier the first number suggests on its own.
 
 `test` is scored once, on a later slice model selection never saw. `val` is the
 best epoch by that metric and is optimistic by construction — a selection
 statistic, not an estimate. Do not quote it.
 
-## 1.5 Backtesting
+## 1.5 What is it using?
 
-Aggregate metrics hide things. Replay the model and see it day by day:
+A number tells you how well. This tells you why:
 
 ```sql
-BACKTEST MODEL demand WHERE product_id = 133 FROM '2026-04-20';
+EXPLAIN MODEL reorder;
+```
+```
+┌──────────────────────────┬───────┬────────────┐
+│         feature          │ slots │ importance │
+├──────────────────────────┼───────┼────────────┤
+│ churned                  │     1 │     0.1375 │
+│ region (category)        │     3 │     0.0891 │
+│ orders.amount: mean 90d  │     1 │     0.0867 │
+│ orders: count 90d        │     1 │     0.0684 │
+│ orders.amount: mean 365d │     1 │     0.0667 │
+└──────────────────────────┴───────┴────────────┘
 ```
 
-```
-┌────────────┬─────────────────────┬───────────┬────────┬────────┬──────────┐
-│ product_id │       anchor        │ predicted │ actual │ error  │ baseline │
-├────────────┼─────────────────────┼───────────┼────────┼────────┼──────────┤
-│        133 │ 2026-05-17 15:45:25 │      9.58 │   10.0 │  -0.42 │     10.0 │
-│        133 │ 2026-05-13 15:45:25 │      2.95 │   13.0 │ -10.05 │      3.0 │
-└────────────┴─────────────────────┴───────────┴────────┴────────┴──────────┘
+Each group is shuffled across rows in turn, and `importance` is what the model
+loses. A feature it does not use costs nothing to destroy. If something you did
+not expect sits at the top, that is usually a leak, and `EXCLUDE` is how you
+answer it.
+
+## 1.6 Backtesting
+
+Aggregate metrics hide things. Replay the model and see it row by row:
+
+```sql
+TRAIN OR REPLACE MODEL spend PREDICT SUM(orders.amount) FOR customers
+  AT last_seen HORIZON 60 DAYS
+  SPLIT TEMPORAL VALIDATE FROM '2025-08-01' TEST FROM '2025-09-15'
+  OPTIONS (epochs = 60);
+
+BACKTEST MODEL spend FROM '2025-09-15';
 ```
 
-Now you can see the character of the model, not just its average: it tracks
-quiet days closely and underestimates spikes. Aggregate it to compare properly:
+`OR REPLACE` because `spend` already exists from 1.4. Training over a name that
+is taken is an error without it: rerunning a statement and quietly discarding
+the model that was there is not something anyone asks for.
+
+```
+┌───────┬─────────────────────┬───────────┬────────┬─────────┬──────────┐
+│  id   │       anchor        │ predicted │ actual │  error  │ baseline │
+├───────┼─────────────────────┼───────────┼────────┼─────────┼──────────┤
+│    20 │ 2025-09-18 00:00:00 │     47.36 │   43.0 │    4.36 │     43.0 │
+│    21 │ 2025-10-01 00:00:00 │     20.97 │    0.0 │   20.97 │     69.0 │
+│    22 │ 2025-10-14 00:00:00 │      8.13 │    0.0 │    8.13 │     98.0 │
+│    23 │ 2025-10-27 00:00:00 │     29.12 │  130.0 │ -100.88 │    130.0 │
+└───────┴─────────────────────┴───────────┴────────┴─────────┴──────────┘
+```
+
+Now you can see the character of the model, not just its average: close on quiet
+customers, badly under on the spikes. Aggregate it to compare properly:
 
 ```sql
 SELECT count(*) AS n,
        round(avg(abs(error)), 4)              AS model_mae,
        round(avg(abs(baseline - actual)), 4)  AS persistence_mae
-FROM pql_exec('BACKTEST MODEL demand FROM ''2026-04-20''');
+FROM pql_exec('BACKTEST MODEL spend FROM ''2025-09-15''');
+```
+```
+│   n   │ model_mae │ persistence_mae │
+│   215 │   56.5751 │         93.5860 │
 ```
 
-A backtest over the test window reproduces `TRAIN`'s `test` column exactly. Two
-independent paths agreeing to four decimals is what tells you both are right.
+Those are `TRAIN`'s own `test` and `baseline` columns, reproduced to four
+decimals by a separate path over the same rows. Two independent routes agreeing
+is what tells you both are right.
 
-## 1.6 It is all still SQL
+## 1.7 It is all still SQL
 
 ```sql
-SELECT p.product_id, round(p.prediction, 1) AS next_30d
-FROM pql_exec('PREDICT COUNT(line_items) FOR products USING MODEL demand') p
-JOIN products p2 ON p2.product_id = p.product_id
-ORDER BY p.prediction DESC LIMIT 10;
+SELECT c.region, count(*) AS n, round(avg(p.prediction), 3) AS avg_chance
+FROM pql_exec('PREDICT EXISTS(orders) FOR customers USING MODEL reorder') p
+JOIN customers c ON c.id = p.id
+GROUP BY c.region ORDER BY 3 DESC;
+```
+```
+│ region  │   n   │ avg_chance │
+│ US      │   500 │      0.433 │
+│ APAC    │   500 │      0.399 │
+│ EU      │   500 │      0.320 │
+```
 
+```sql
 SELECT * FROM pql_models();
-DROP MODEL demand;
+DROP MODEL IF EXISTS spend;
 ```
 
 ---
@@ -320,6 +388,8 @@ PREDICT COUNT(sales) FOR products WHERE as_of = '2026-04-01' USING MODEL demand;
 | `MEAN_COLS` | 3 | 0 to 64 |
 | `ARCH` | `mlp` | `mlp` or `sage` |
 | `LAYERS` | 1 | 1 or 2 (`sage` only) |
+| `MAX_CATEGORIES` | 16 | above this a text column is frequency-encoded, not one slot per value |
+| `L2` | 0 | decoupled weight decay, applied to weights and not biases |
 
 ### Result columns
 
@@ -403,7 +473,7 @@ hand.
 ## Two architectures
 
 `arch = 'mlp'` (default) runs a small dense network over the entity's columns
-plus those aggregates. Cheap: 23 parameters on the worked example.
+plus those aggregates. Cheap: 30 features on the tutorial dataset.
 
 `L2` adds decoupled weight decay, applied to weights and not to biases. It
 defaults to 0, and on the tasks measured here it made no difference either way;
@@ -429,10 +499,13 @@ scored 0.755.
 
 `OPTIONS (layers = 2)` adds a second hop, with each child embedded at its own
 timestamp. On a task where the signal sits two hops out and one hop provably
-cannot reach it, one hop scores 0.470 and two score 0.860.
+cannot reach it, one hop scores 0.495 and two score 0.850.
 
-Measured on the worked example, `sage` beat `mlp` on all five seeds (8.99 vs
-9.47 MAE, persistence 9.82) at 337 parameters against 23.
+Which one wins depends on the shape of the data, and it is worth trying both.
+On the tutorial's spend forecast the dense model is slightly ahead (58.74 MAE
+against 60.05, persistence 94.98) while carrying 30 features to `sage`'s 641
+parameters. `sage` earns its keep where structure reaches further than one hop,
+which is what the two-hop number above measures.
 
 ## Performance
 
@@ -462,8 +535,11 @@ can influence the model, straight from `DataChunk` buffers with no per-cell
 
 # Part 4 — Worked examples
 
-[`examples/shop_demo.sql`](extras/pql/examples/shop_demo.sql) is
-self-contained: it creates its own tables and trains three models.
+[`examples/tutorial.sql`](extras/pql/examples/tutorial.sql) is the dataset Part
+1 walks through: load it and every statement above runs as written.
+
+[`examples/shop_demo.sql`](extras/pql/examples/shop_demo.sql) is self-contained:
+it creates its own tables and trains three models end to end.
 
 [`examples/sunnyside_demo.sql`](extras/pql/examples/sunnyside_demo.sql) runs
 against a real point-of-sale database, with
@@ -483,7 +559,9 @@ TRAIN MODEL daily
 BACKTEST MODEL daily FROM '2026-04-20';
 ```
 
-15,010 training rows, 2,755 held out, no tables built by hand.
+On that database: 15,010 training rows, 2,755 held out, no tables built by hand.
+It needs the Postgres export above, so unlike Part 1 it is not reproducible from
+this repository alone.
 
 ---
 
@@ -493,8 +571,10 @@ Honest about what is not there yet, so you can plan around it.
 
 **Language.** Filters compare a column to a literal — no column-to-column
 comparisons, arithmetic, `BETWEEN` or `LIKE`. `FOR` takes a bare table name, not
-a subquery or a schema-qualified name. Composite foreign keys are not modelled.
-Text targets are refused rather than trained as multi-class.
+a subquery and not an explicitly schema-qualified one: a bare name resolves the
+way SQL resolves it, and genuine ambiguity across schemas is refused, but there
+is no syntax for saying which one you meant. Composite foreign keys are not
+modelled. Text targets are refused rather than trained as multi-class.
 
 **Attribute prediction has no leakage guarantee.** Every other numeric column on
 the row is a feature, including ones that are consequences of the target.
@@ -503,10 +583,12 @@ exactly when voided. A near-perfect attribute score usually means a same-row
 tautology; forecasting is the path with the structural guarantee.
 
 **Execution.** `TRAIN` runs during binding on its own connection, so it does not
-see uncommitted data and `EXPLAIN` on a `TRAIN` still trains. Work is
-single-threaded and outside the buffer manager, so `memory_limit` does not apply.
-Each statement reloads its tables. All four dissolve together by moving the work
-into a physical operator with a sink, which is the main thing left to build.
+see uncommitted data. Work is single-threaded and outside the buffer manager, so
+`memory_limit` does not apply, and each statement reloads its tables. All three
+dissolve together by moving the work into a physical operator with a sink, which
+is the main thing left to build. (DuckDB's own `EXPLAIN` cannot be put in front
+of a PQL statement at all — its parser rejects it before the extension is
+reached. `EXPLAIN MODEL` is a separate thing and is described above.)
 
 **Models** live for the session: not persisted, not transactional.
 

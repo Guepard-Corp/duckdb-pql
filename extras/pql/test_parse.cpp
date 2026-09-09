@@ -99,6 +99,17 @@ int main() {
   Err("SHOW MODELS extra", "after SHOW MODELS");
   Err("DROP MODEL IF m", "expected EXISTS");
 
+  // A date literal keeps its spelling after being resolved to microseconds, so
+  // it has to echo with its quotes. Without them `VALIDATE FROM 2025-08-01`
+  // tokenises as 2025, then a minus, and the statement a model recorded of
+  // itself could not be run again.
+  Ok("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS "
+     "SPLIT TEMPORAL VALIDATE FROM '2025-08-01' TEST FROM '2025-09-15'",
+     "VALIDATE FROM '2025-08-01'");
+  Ok("BACKTEST MODEL m FROM '2024-01-01' TO '2024-06-01'", "BACKTEST MODEL m");
+  Ok("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS "
+     "SPLIT TEMPORAL VALIDATE FROM 100 TEST FROM 200", "VALIDATE FROM 100");
+
   // Copying a statement must not lose a clause. Every field used to be
   // enumerated by hand in the copy assignment, and EXCLUDE and OR REPLACE were
   // both missing from it: they parsed, took effect, and then disappeared from

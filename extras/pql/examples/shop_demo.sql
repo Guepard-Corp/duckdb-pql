@@ -1,4 +1,4 @@
--- PQL demo: a small shop database, then five models over it.
+-- PQL demo: a small shop database, then three models over it.
 -- Run:  build/reldebug/duckdb -c ".read extras/pql/examples/shop_demo.sql"
 
 CREATE OR REPLACE TABLE customers AS

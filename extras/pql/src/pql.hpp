@@ -343,8 +343,17 @@ struct Literal {
 
 	std::string ToString() const {
 		switch (kind) {
-		case Kind::NUMBER:
-			return text;
+		case Kind::NUMBER: {
+			// A date literal is resolved to microseconds but keeps its original
+			// spelling, so `'2025-08-01'` must echo with its quotes or the statement
+			// a model records of itself will not parse: the tokenizer reads 2025,
+			// then a minus.
+			const char *begin = text.c_str();
+			char *end = nullptr;
+			std::strtod(begin, &end);
+			const bool plain = end && end != begin && *end == '\0';
+			return plain ? text : ("'" + text + "'");
+		}
 		case Kind::STRING:
 			return "'" + text + "'";
 		default:

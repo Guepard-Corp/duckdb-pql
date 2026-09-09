@@ -7,6 +7,7 @@ This directory holds the implementation and its examples.
 | path | what it is |
 |---|---|
 | [`src/pql.hpp`](src/pql.hpp) | the whole language: grammar, parser, features, model, training. One self-contained header that includes no DuckDB header. |
+| [`examples/tutorial.sql`](examples/tutorial.sql) | the dataset Part 1 of the root README walks through |
 | [`examples/shop_demo.sql`](examples/shop_demo.sql) | self-contained demo; creates its own tables and trains three models |
 | [`examples/sunnyside_demo.sql`](examples/sunnyside_demo.sql) | demo against a real point-of-sale database |
 | [`examples/sunnyside_export.sh`](examples/sunnyside_export.sh) | copies that schema out of Postgres |
