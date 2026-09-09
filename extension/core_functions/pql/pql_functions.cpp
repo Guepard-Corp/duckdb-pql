@@ -755,6 +755,18 @@ struct PqlGlobalState : public GlobalTableFunctionState {
 };
 
 static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
+	// Checked before any work, not after: refusing at the end would mean the user
+	// waited for a model that is then thrown away.
+	if (!stmt.or_replace) {
+		auto entry = GetRegistryEntry(context);
+		std::lock_guard<std::mutex> guard(entry->lock);
+		if (entry->registry.Get(stmt.model)) {
+			throw InvalidInputException(
+			    "pql: a model named '%s' already exists. Use TRAIN OR REPLACE MODEL to replace it, "
+			    "or DROP MODEL %s first",
+			    stmt.model, stmt.model);
+		}
+	}
 	pql::Database db = LoadDatabase(context, stmt);
 	pql::Model model;
 	model.name = stmt.model;
@@ -987,15 +999,17 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 
 static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 	bind.names = {Identifier("model"), Identifier("target"), Identifier("entity"), Identifier("kind"),
-	              Identifier("features")};
+	              Identifier("features"), Identifier("statement")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	              LogicalType::BIGINT};
+	              LogicalType::BIGINT,   LogicalType::VARCHAR};
 	auto entry = GetRegistryEntry(context);
 	std::lock_guard<std::mutex> guard(entry->lock);
 	for (const auto &m : entry->registry.All()) {
+		// The defining statement, echoed back in full. Copy it to retrain, or read
+		// it to see exactly what a model was given.
 		bind.rows.push_back({Value(m->name), Value(m->spec_stmt.target.ToString()), Value(m->spec_stmt.entity_table),
 		                     Value(m->classification ? "classification" : "regression"),
-		                     Value::BIGINT(m->features.width)});
+		                     Value::BIGINT(m->features.width), Value(m->spec_stmt.ToString())});
 	}
 }
 

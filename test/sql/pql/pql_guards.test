@@ -177,3 +177,43 @@ SELECT CAST(
   AS INTEGER);
 ----
 1
+
+# Training over a name that already holds a model is refused. Rerunning a
+# statement and silently discarding the model that was there is not something
+# anyone asks for.
+statement ok
+TRAIN MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+statement error
+TRAIN MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+----
+<REGEX>:.*already exists.*OR REPLACE.*
+
+statement ok
+TRAIN OR REPLACE MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# SHOW MODELS echoes the defining statement back, in full, and it re-parses
+query I
+SELECT CAST(statement LIKE 'TRAIN OR REPLACE MODEL dup%HORIZON 60 DAYS%OPTIONS%' AS INTEGER)
+FROM pql_exec('SHOW MODELS') WHERE model = 'dup';
+----
+1
+
+# the echoed statement is a statement: running it again works
+statement ok
+TRAIN OR REPLACE MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (EPOCHS = 5, HIDDEN = 16);
+
+# EXCLUDE survives into the model's record of itself
+statement ok
+TRAIN MODEL rec PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  EXCLUDE (score) OPTIONS (epochs = 5, hidden = 16);
+
+query I
+SELECT CAST(statement LIKE '%EXCLUDE (score)%' AS INTEGER)
+FROM pql_exec('SHOW MODELS') WHERE model = 'rec';
+----
+1

@@ -142,7 +142,7 @@ inline bool IsPqlKeyword(const std::string &up) {
 	                           "SUM",    "AVG",    "MIN",     "MAX",    "DAY",    "DAYS",
 	                           "WEEK",   "WEEKS",  "MONTH",   "MONTHS", "YEAR",   "YEARS",
 	                           "HOUR",   "HOURS",  "DROP",    "SHOW",   "MODELS", "EVERY",
-	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE",
+	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE",
 	                           nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
@@ -475,6 +475,25 @@ struct Interval {
 struct Options {
 	std::unordered_map<std::string, Literal> kv;
 
+	// Sorted, so a statement echoed back reads the same way twice. The map is
+	// unordered and iterating it directly would shuffle between runs.
+	std::string ToString() const {
+		if (kv.empty()) {
+			return std::string();
+		}
+		std::vector<std::string> keys;
+		keys.reserve(kv.size());
+		for (const auto &p : kv) {
+			keys.push_back(p.first);
+		}
+		std::sort(keys.begin(), keys.end());
+		std::string s = " OPTIONS (";
+		for (size_t i = 0; i < keys.size(); i++) {
+			s += (i ? ", " : "") + keys[i] + " = " + kv.at(keys[i]).ToString();
+		}
+		return s + ")";
+	}
+
 	// A silently ignored option reads as "my setting had no effect", which is the
 	// most common way to waste an afternoon.
 	static bool Known(const std::string &k) {
@@ -519,13 +538,24 @@ struct TemporalSplit {
 
 enum class StmtKind : uint8_t { TRAIN, PREDICT, BACKTEST, EXPLAIN, DROP_MODEL, SHOW_MODELS };
 
-struct Statement {
+// Everything a statement holds that copies itself.
+//
+// The one member that cannot is the outer filter, which is a unique_ptr and
+// needs a deep copy. Keeping the rest here means the hand-written copy below
+// touches exactly one field, so adding a clause cannot silently be left out of
+// it. Enumerating every member by hand is how EXCLUDE and OR REPLACE were both
+// dropped from a copied statement: the clause parsed, took effect during
+// training, and then vanished from the model's own record of itself.
+struct StatementData {
 	StmtKind kind = StmtKind::PREDICT;
+	// TRAIN OR REPLACE. Without it, training over a name that already holds a
+	// model is refused: rerunning a statement and silently discarding the model
+	// that was there is not a thing anyone asks for.
+	bool or_replace = false;
 	std::string model;      // TRAIN MODEL <model> / USING MODEL <model>
 	PredictExpr target;
 	std::string entity_table;
 	std::string entity_alias;
-	std::unique_ptr<FilterNode> filter; // outer WHERE, restricts entities
 	// Columns the model must not look at. A leaky field, a free-text note, or
 	// anything EXPLAIN showed to be worthless: naming it here is cheaper than
 	// building a view without it.
@@ -545,36 +575,22 @@ struct Statement {
 	// BACKTEST window. Empty means "everything the model can be replayed over".
 	Literal backtest_from, backtest_to;
 	bool has_from = false, has_to = false;
+};
+
+struct Statement : StatementData {
+	std::unique_ptr<FilterNode> filter; // outer WHERE, restricts entities
 
 	Statement() = default;
 	Statement(Statement &&) = default;
 	Statement &operator=(Statement &&) = default;
-	Statement(const Statement &o) {
-		*this = o;
+	Statement(const Statement &o)
+	    : StatementData(o), filter(o.filter ? o.filter->Copy() : nullptr) {
 	}
 	Statement &operator=(const Statement &o) {
-		if (this == &o) {
-			return *this;
+		if (this != &o) {
+			StatementData::operator=(o);
+			filter = o.filter ? o.filter->Copy() : nullptr;
 		}
-		kind = o.kind;
-		model = o.model;
-		target = o.target;
-		entity_table = o.entity_table;
-		entity_alias = o.entity_alias;
-		filter = o.filter ? o.filter->Copy() : nullptr;
-		anchor = o.anchor;
-		anchor_literal = o.anchor_literal;
-		anchor_is_literal = o.anchor_is_literal;
-		horizon = o.horizon;
-		every = o.every;
-		graph_tables = o.graph_tables;
-		split = o.split;
-		options = o.options;
-		saw_using_model = o.saw_using_model;
-		backtest_from = o.backtest_from;
-		backtest_to = o.backtest_to;
-		has_from = o.has_from;
-		has_to = o.has_to;
 		return *this;
 	}
 
@@ -597,7 +613,9 @@ struct Statement {
 		if (kind == StmtKind::EXPLAIN) {
 			return "EXPLAIN MODEL " + model;
 		}
-		s = (kind == StmtKind::TRAIN) ? ("TRAIN MODEL " + model + " PREDICT ") : "PREDICT ";
+		s = (kind == StmtKind::TRAIN)
+		        ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") + model + " PREDICT ")
+		        : std::string("PREDICT ");
 		s += target.ToString();
 		s += " FOR " + entity_table;
 		if (!entity_alias.empty()) {
@@ -637,6 +655,9 @@ struct Statement {
 		}
 		if (kind == StmtKind::PREDICT) {
 			s += " USING MODEL " + model;
+		}
+		if (kind == StmtKind::TRAIN) {
+			s += options.ToString();
 		}
 		return s;
 	}
@@ -750,6 +771,10 @@ public:
 			return st;
 		}
 		if (AcceptKw("TRAIN")) {
+			if (AcceptKw("OR")) {
+				ExpectKw("REPLACE");
+				st.or_replace = true;
+			}
 			ExpectKw("MODEL");
 			st.kind = StmtKind::TRAIN;
 			st.model = ExpectIdent("model name");
@@ -3883,7 +3908,7 @@ struct Dataset {
 // One definition, because anything that wants to reproduce the folds later (to
 // explain a model on rows it did not learn from, say) has to agree with training
 // exactly or it is measuring something else.
-inline void TemporalSplit(const Dataset &ds, const Statement &stmt, std::vector<size_t> &tr,
+inline void SplitByAnchor(const Dataset &ds, const Statement &stmt, std::vector<size_t> &tr,
                           std::vector<size_t> &va, std::vector<size_t> &te) {
 	tr.clear();
 	va.clear();
@@ -5321,7 +5346,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	// Temporal split. Without an explicit SPLIT, hold out the latest 20% by
 	// anchor so validation is always forward in time, never a random shuffle.
 	std::vector<size_t> tr, va, te;
-	TemporalSplit(ds, stmt, tr, va, te);
+	SplitByAnchor(ds, stmt, tr, va, te);
 	// Now that the folds exist, decide the task type from training labels alone.
 	{
 		const bool countish = stmt.target.kind == TargetKind::COUNT ||
@@ -6059,7 +6084,7 @@ inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model
 	// fitted on rewards memorised noise: a column of random numbers looked as
 	// important as a real driver until this used the test fold instead.
 	std::vector<size_t> tr, va, all;
-	TemporalSplit(ds, eff, tr, va, all);
+	SplitByAnchor(ds, eff, tr, va, all);
 	if (all.size() < 8) {
 		all.clear();
 		for (size_t i = 0; i < ds.examples.size(); i++) {

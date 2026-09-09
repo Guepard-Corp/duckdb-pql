@@ -69,6 +69,34 @@ int main() {
   Err("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE a", "expected '('");
   Err("EXPLAIN churn", "expected MODEL");
   Err("EXPLAIN MODEL m HORIZON 3 DAYS", "in EXPLAIN");
+  // Copying a statement must not lose a clause. Every field used to be
+  // enumerated by hand in the copy assignment, and EXCLUDE and OR REPLACE were
+  // both missing from it: they parsed, took effect, and then disappeared from
+  // the model's own record of what it was trained with.
+  std::printf("== statement copies keep every clause\n");
+  {
+    const char *full =
+        "TRAIN OR REPLACE MODEL m PREDICT COUNT(o WHERE o.kind = 'x') FOR u AS uu "
+        "WHERE uu.region = 'EU' EXCLUDE (email, o.note) AT ts HORIZON 30 DAYS "
+        "USING GRAPH (u, o) SPLIT TEMPORAL VALIDATE FROM 100 TEST FROM 200 "
+        "OPTIONS (epochs = 7, arch = 'sage')";
+    pql::Statement a = pql::Parse(full);
+    pql::Statement b = a;             // copy construct
+    pql::Statement c;
+    c = a;                            // copy assign
+    if (a.ToString() != b.ToString() || a.ToString() != c.ToString()) {
+      std::printf("   FAIL: a copy differs from the original\n     %s\n     %s\n     %s\n",
+                  a.ToString().c_str(), b.ToString().c_str(), c.ToString().c_str());
+      fails++;
+    } else if (!b.or_replace || b.excluded.size() != 2 || !b.filter || !b.target.filter ||
+               b.options.kv.size() != 2 || b.graph_tables.size() != 2 || !b.split.present) {
+      std::printf("   FAIL: a clause survived ToString but not the copy\n");
+      fails++;
+    } else {
+      std::printf("   %s\n", b.ToString().c_str());
+      oks++;
+    }
+  }
   std::printf("\n%d passed, %d failed\n", oks, fails);
   return fails ? 1 : 0;
 }

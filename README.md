@@ -190,7 +190,7 @@ DROP MODEL demand;
 ## Syntax
 
 ```
-TRAIN MODEL <name>
+TRAIN [OR REPLACE] MODEL <name>
   PREDICT <target>
   FOR <table> [AS <alias>]
   [ WHERE <filter> ]                        -- which entities take part
@@ -212,6 +212,25 @@ DROP MODEL <name>
 
 `PREDICT` and `FOR` come first; the optional clauses may follow in any order.
 `PREDICT` inherits `AT` and `HORIZON` from the model.
+
+### Training over a name that is taken
+
+`TRAIN MODEL churn` twice is an error the second time:
+
+```
+pql: a model named 'churn' already exists. Use TRAIN OR REPLACE MODEL to
+replace it, or DROP MODEL churn first
+```
+
+Rerunning a statement and silently discarding the model that was there is not
+something anyone asks for, and the failure is quiet: the name still resolves, so
+nothing looks wrong. `TRAIN OR REPLACE MODEL` says you meant it. The check
+happens before any work, so you are not made to wait for a model that is then
+thrown away.
+
+`SHOW MODELS` carries a `statement` column holding the full defining statement,
+including `OPTIONS` and `EXCLUDE`. Copy it to retrain, or read it to see exactly
+what a model was given.
 
 ### `EXCLUDE`: columns the model must not see
 
