@@ -440,6 +440,67 @@ int main() {
     }
   }
 
+  // ---- L. values that are not numbers ------------------------------------
+  // A NaN or an infinity used to poison everything it touched: a NaN mean, NaN
+  // features, every weight NaN within one step, and a reported metric of
+  // 0.000000, which reads as a perfect model.
+  {
+    printf("== L. NaN, infinity and overflow\n");
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    struct Case { const char *what; double poison; };
+    const Case cases[4] = {{"NaN", nan}, {"+infinity", inf}, {"-infinity", -inf},
+                           {"1e308 (sums overflow)", 1e308}};
+    for (const Case &cs : cases) {
+      const size_t NU = 400;
+      Database db;
+      Frame users; users.name = "users";
+      Column uid = MakeCol("id", ColType::INT64, NU), uts = MakeCol("ts", ColType::TIMESTAMP, NU),
+             x = MakeCol("x", ColType::DOUBLE, NU);
+      std::vector<double> e_uid, e_ts, e_amt;
+      for (size_t i = 0; i < NU; i++) {
+        uid.num[i] = double(i);
+        uts.num[i] = (1000.0 + double(i)) * DAY;
+        x.num[i] = (i % 2) ? cs.poison : 1.0;
+        e_uid.push_back(double(i));
+        e_ts.push_back((999.0 + double(i)) * DAY);
+        e_amt.push_back((i % 3) ? 1.0 : cs.poison);
+      }
+      users.columns = {uid, uts, x}; users.nrows = NU;
+      Frame ev; ev.name = "events";
+      const size_t NE = e_uid.size();
+      Column vi = MakeCol("id", ColType::INT64, NE), vu = MakeCol("user_id", ColType::INT64, NE),
+             vt = MakeCol("ts", ColType::TIMESTAMP, NE), va = MakeCol("amount", ColType::DOUBLE, NE);
+      for (size_t k = 0; k < NE; k++) {
+        vi.num[k] = double(k); vu.num[k] = e_uid[k]; vt.num[k] = e_ts[k]; va.num[k] = e_amt[k];
+      }
+      ev.columns = {vi, vu, vt, va}; ev.nrows = NE;
+      db.tables = {users, ev};
+      db.fks.push_back({"events", "user_id", "users", "id"});
+      db.BuildLinks({});
+      auto st = Parse("TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS "
+                      "OPTIONS (epochs = 5, hidden = 8)");
+      Model m; TrainReport r = TrainModel(db, st, m);
+      bool finite_w = true;
+      for (float w : m.w1) { if (!std::isfinite(w)) { finite_w = false; break; } }
+      for (float w : m.w3) { if (!std::isfinite(w)) { finite_w = false; break; } }
+      printf("   %-22s metric=%.6f weights finite=%d\n", cs.what, r.test_metric, (int)finite_w);
+      if (!finite_w || !std::isfinite(r.test_metric)) {
+        printf("   FAIL: a value that is not a number reached the model\n"); fails++;
+      }
+      auto ps = Parse("PREDICT COUNT(events) FOR users USING MODEL bad");
+      for (const auto &p : RunPredict(db, m, ps)) {
+        if (!std::isfinite(p.value)) { printf("   FAIL: PREDICT returned %f\n", p.value); fails++; break; }
+      }
+    }
+    // Nothing scored is undefined, not perfect. MAE used to answer 0 for an
+    // empty fold, which is the score of a flawless model.
+    if (!(MAE({}) != MAE({}))) {
+      printf("   FAIL: MAE of nothing should be undefined, got %.4f\n", MAE({}));
+      fails++;
+    }
+  }
+
   printf("\n%s\n", fails ? "FAILURES" : "all model tests passed");
   return fails ? 1 : 0;
 }

@@ -142,7 +142,7 @@ inline bool IsPqlKeyword(const std::string &up) {
 	                           "SUM",    "AVG",    "MIN",     "MAX",    "DAY",    "DAYS",
 	                           "WEEK",   "WEEKS",  "MONTH",   "MONTHS", "YEAR",   "YEARS",
 	                           "HOUR",   "HOURS",  "DROP",    "SHOW",   "MODELS", "EVERY",
-	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE",
+	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE", "IF",
 	                           nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
@@ -151,6 +151,12 @@ inline bool IsPqlKeyword(const std::string &up) {
 	}
 	return false;
 }
+
+struct ParseError : std::runtime_error {
+	uint32_t position;
+	ParseError(const std::string &msg, uint32_t pos) : std::runtime_error(msg), position(pos) {
+	}
+};
 
 inline std::vector<Token> Tokenize(const std::string &src) {
 	std::vector<Token> out;
@@ -173,8 +179,10 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 		t.pos = i;
 		// single-quoted string literal, '' escapes a quote
 		if (c == '\'') {
+			const uint32_t open = i;
 			i++;
 			std::string v;
+			bool closed = false;
 			while (i < n) {
 				if (src[i] == '\'') {
 					if (i + 1 < n && src[i + 1] == '\'') {
@@ -183,9 +191,16 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 						continue;
 					}
 					i++;
+					closed = true;
 					break;
 				}
 				v.push_back(src[i++]);
+			}
+			// Running off the end used to be accepted, so `region = 'US` quietly
+			// became `region = 'US'`: a missing quote changed the meaning of a
+			// statement instead of failing it.
+			if (!closed) {
+				throw ParseError("unterminated string literal; a ' is never closed", open);
 			}
 			t.kind = Tok::STRING;
 			t.text = v;
@@ -195,13 +210,28 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 		}
 		// double-quoted identifier keeps its exact spelling and never becomes a keyword
 		if (c == '"') {
+			const uint32_t open = i;
 			i++;
 			std::string v;
-			while (i < n && src[i] != '"') {
+			bool closed = false;
+			while (i < n) {
+				if (src[i] == '"') {
+					if (i + 1 < n && src[i + 1] == '"') { // "" is one literal quote, as in SQL
+						v.push_back('"');
+						i += 2;
+						continue;
+					}
+					i++;
+					closed = true;
+					break;
+				}
 				v.push_back(src[i++]);
 			}
-			if (i < n) {
-				i++;
+			if (!closed) {
+				throw ParseError("unterminated quoted identifier; a \" is never closed", open);
+			}
+			if (v.empty()) {
+				throw ParseError("empty quoted identifier", open);
 			}
 			t.kind = Tok::IDENT;
 			t.text = v;
@@ -263,13 +293,44 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 // 3. AST
 // ===========================================================================
 
+// Echo an identifier so it reads back as the same identifier.
+//
+// Statements are echoed in SHOW MODELS and kept as a model's record of itself,
+// so a name that needed quotes going in needs them coming out. A table called
+// "my table" was emitted bare, and the statement could not be run again.
+inline std::string QuoteIdent(const std::string &name) {
+	bool plain = !name.empty() && !std::isdigit((unsigned char)name[0]);
+	for (char c : name) {
+		if (!(std::isalnum((unsigned char)c) || c == '_')) {
+			plain = false;
+			break;
+		}
+	}
+	if (plain && IsPqlKeyword(ToUpper(name))) {
+		plain = false; // a column called `horizon` has to come back quoted
+	}
+	if (plain) {
+		return name;
+	}
+	std::string out = "\"";
+	for (char c : name) {
+		if (c == '"') {
+			out += "\"\"";
+		} else {
+			out.push_back(c);
+		}
+	}
+	return out + "\"";
+}
+
 // A qualified reference: [table.]column, where table may be an alias.
 struct Ref {
 	std::string qualifier; // may be empty
 	std::string name;
 
 	std::string ToString() const {
-		return qualifier.empty() ? name : qualifier + "." + name;
+		return qualifier.empty() ? QuoteIdent(name)
+		                         : QuoteIdent(qualifier) + "." + QuoteIdent(name);
 	}
 };
 
@@ -432,7 +493,9 @@ struct PredictExpr {
 			return ref.ToString();
 		}
 		std::string s = std::string(TargetKindName(kind)) + "(";
-		s += ref.name.empty() ? target_table : (target_table + "." + ref.name);
+		// `*` is the wildcard in COUNT(*), not a table anyone named.
+		const std::string tbl = target_table == "*" ? target_table : QuoteIdent(target_table);
+		s += ref.name.empty() ? tbl : (tbl + "." + QuoteIdent(ref.name));
 		if (filter) {
 			s += " WHERE " + filter->ToString();
 		}
@@ -552,6 +615,9 @@ struct StatementData {
 	// model is refused: rerunning a statement and silently discarding the model
 	// that was there is not a thing anyone asks for.
 	bool or_replace = false;
+	// DROP MODEL IF EXISTS. Without it, dropping a name that holds nothing is an
+	// error, as it is in SQL.
+	bool if_exists = false;
 	std::string model;      // TRAIN MODEL <model> / USING MODEL <model>
 	PredictExpr target;
 	std::string entity_table;
@@ -602,24 +668,24 @@ struct Statement : StatementData {
 	std::string ToString() const {
 		std::string s;
 		if (kind == StmtKind::DROP_MODEL) {
-			return "DROP MODEL " + model;
+			return std::string("DROP MODEL ") + (if_exists ? "IF EXISTS " : "") + QuoteIdent(model);
 		}
 		if (kind == StmtKind::SHOW_MODELS) {
 			return "SHOW MODELS";
 		}
 		if (kind == StmtKind::BACKTEST) {
-			return "BACKTEST MODEL " + model;
+			return "BACKTEST MODEL " + QuoteIdent(model);
 		}
 		if (kind == StmtKind::EXPLAIN) {
-			return "EXPLAIN MODEL " + model;
+			return "EXPLAIN MODEL " + QuoteIdent(model);
 		}
-		s = (kind == StmtKind::TRAIN)
-		        ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") + model + " PREDICT ")
-		        : std::string("PREDICT ");
+		s = (kind == StmtKind::TRAIN) ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") +
+		                                 QuoteIdent(model) + " PREDICT ")
+		                             : std::string("PREDICT ");
 		s += target.ToString();
-		s += " FOR " + entity_table;
+		s += " FOR " + QuoteIdent(entity_table);
 		if (!entity_alias.empty()) {
-			s += " AS " + entity_alias;
+			s += " AS " + QuoteIdent(entity_alias);
 		}
 		if (!excluded.empty()) {
 			s += " EXCLUDE (";
@@ -645,7 +711,7 @@ struct Statement : StatementData {
 		if (!graph_tables.empty()) {
 			s += " USING GRAPH (";
 			for (size_t i = 0; i < graph_tables.size(); i++) {
-				s += (i ? ", " : "") + graph_tables[i];
+				s += (i ? ", " : "") + QuoteIdent(graph_tables[i]);
 			}
 			s += ")";
 		}
@@ -654,7 +720,7 @@ struct Statement : StatementData {
 			     split.test_from.ToString();
 		}
 		if (kind == StmtKind::PREDICT) {
-			s += " USING MODEL " + model;
+			s += " USING MODEL " + QuoteIdent(model);
 		}
 		if (kind == StmtKind::TRAIN) {
 			s += options.ToString();
@@ -666,12 +732,6 @@ struct Statement : StatementData {
 // ===========================================================================
 // 4. Parser
 // ===========================================================================
-
-struct ParseError : std::runtime_error {
-	uint32_t position;
-	ParseError(const std::string &msg, uint32_t pos) : std::runtime_error(msg), position(pos) {
-	}
-};
 
 class Parser {
 public:
@@ -707,14 +767,19 @@ public:
 		if (AcceptKw("SHOW")) {
 			ExpectKw("MODELS");
 			st.kind = StmtKind::SHOW_MODELS;
-			AcceptPunct(";");
+			EndOfStatement("SHOW MODELS");
 			return st;
 		}
 		if (AcceptKw("DROP")) {
 			ExpectKw("MODEL");
 			st.kind = StmtKind::DROP_MODEL;
+			if (PeekKw("IF")) {
+				Next();
+				ExpectKw("EXISTS");
+				st.if_exists = true;
+			}
 			st.model = ExpectIdent("model name");
-			AcceptPunct(";");
+			EndOfStatement("DROP MODEL");
 			return st;
 		}
 		if (AcceptKw("EXPLAIN")) {
@@ -1277,6 +1342,15 @@ private:
 			                 Peek().pos);
 		}
 	}
+	// Nothing may follow a complete statement but a semicolon. `DROP MODEL a b c`
+	// used to drop `a` and discard the rest without a word.
+	void EndOfStatement(const char *what) {
+		AcceptPunct(";");
+		if (Peek().kind != Tok::END) {
+			throw ParseError("unexpected token '" + Peek().text + "' after " + what,
+			                 Peek().pos);
+		}
+	}
 	bool AcceptPunct(const char *p) {
 		const Token &t = Peek();
 		if (t.kind == Tok::PUNCT && t.text == p) {
@@ -1549,7 +1623,29 @@ struct Database {
 
 	// Build the parent -> children indexes for every declared foreign key,
 	// restricted to `allow` when the query pinned a graph allow-list.
+	// A NaN or an infinity is not a value, so it is treated as one that is
+	// missing. Left alone it poisons whatever it touches: a column holding one
+	// NaN gives a NaN mean, every feature built from it is NaN, every weight
+	// becomes NaN within a step, and the run still reports a metric. That is the
+	// worst shape a failure can take, so it is stopped at the door.
+	void MarkNonFiniteMissing() {
+		for (auto &t : tables) {
+			for (auto &c : t.columns) {
+				if (!c.IsNumeric()) {
+					continue;
+				}
+				for (size_t r = 0; r < c.num.size() && r < c.valid.size(); r++) {
+					if (c.valid[r] && !std::isfinite(c.num[r])) {
+						c.valid[r] = 0;
+						c.num[r] = 0.0;
+					}
+				}
+			}
+		}
+	}
+
 	void BuildLinks(const std::vector<std::string> &allow) {
+		MarkNonFiniteMissing();
 		links.clear();
 		for (size_t k = 0; k < fks.size(); k++) {
 			const ForeignKey &fk = fks[k];
@@ -2916,6 +3012,7 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 		const Column *anch = (table == db.Find(entity.name) && anchor_col >= 0)
 		                         ? &f.columns[(size_t)anchor_col]
 		                         : nullptr;
+		std::vector<int> usable;
 		for (int c : nt.cols) {
 			const Column &col = f.columns[(size_t)c];
 			double sum = 0, sq = 0;
@@ -2935,9 +3032,15 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 			}
 			const double mu = n ? sum / double(n) : 0.0;
 			const double var = n > 1 ? (sq - double(n) * mu * mu) / double(n - 1) : 0.0;
+			const double sdv = var > 1e-18 ? std::sqrt(var) : 1.0;
+			if (!std::isfinite(mu) || !std::isfinite(sdv)) {
+				continue; // see FitFeatureSpec: a column with no mean is not a feature
+			}
+			usable.push_back(c);
 			nt.mu.push_back(mu);
-			nt.sd.push_back(var > 1e-18 ? std::sqrt(var) : 1.0);
+			nt.sd.push_back(sdv);
 		}
+		nt.cols.swap(usable);
 		// Text columns on this node type, fitted over the same era as the numerics
 		// above: bounded by the entity's anchor for the entity itself, unbounded
 		// for child tables, which have no anchor of their own.
@@ -3870,7 +3973,9 @@ inline double AveragePrecision(const std::vector<std::pair<double, int>> &scored
 
 inline double MAE(const std::vector<std::pair<double, double>> &pred_true) {
 	if (pred_true.empty()) {
-		return 0.0;
+		// Undefined, not zero. Zero is the score of a perfect model, and nothing
+		// was scored at all.
+		return std::numeric_limits<double>::quiet_NaN();
 	}
 	double acc = 0;
 	for (auto &p : pred_true) {
@@ -4041,6 +4146,12 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			if (bn > 1) {
 				const double mean_b = bs / double(bn);
 				const double var_b = (bq - double(bn) * mean_b * mean_b) / double(bn - 1);
+				// Values can be finite and still sum past the end of double. A column
+				// whose own mean does not exist cannot be standardised, so it is not a
+				// feature.
+				if (!std::isfinite(mean_b) || !std::isfinite(var_b)) {
+					continue;
+				}
 				FeatureSpec::SelfCol sc_b;
 				sc_b.index = (int)i;
 				sc_b.name = c.name;
@@ -4075,6 +4186,9 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 		const double mean = n ? sum / double(n) : 0.0;
 		const double var = n > 1 ? (sumsq - double(n) * mean * mean) / double(n - 1) : 0.0;
 		const double sd = var > 0 ? std::sqrt(var) : 1.0;
+		if (!std::isfinite(mean) || !std::isfinite(sd)) {
+			continue;
+		}
 		FeatureSpec::SelfCol sc;
 		sc.index = (int)i;
 		sc.name = entity.columns[i].name;
@@ -4153,6 +4267,9 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			const double cvar =
 			    cn > 1 ? ((cq0 + cq1) - double(cn) * mu * mu) / double(cn - 1) : 0.0;
 			const double sd = cvar > 0 ? std::sqrt(cvar) : 1.0;
+			if (!std::isfinite(mu) || !std::isfinite(sd)) {
+				continue;
+			}
 			la.mean_cols.push_back((int)c);
 			la.mean_names.push_back(cc.name);
 			la.mean_mu.push_back(mu);

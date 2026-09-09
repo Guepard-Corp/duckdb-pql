@@ -217,3 +217,80 @@ SELECT CAST(statement LIKE '%EXCLUDE (score)%' AS INTEGER)
 FROM pql_exec('SHOW MODELS') WHERE model = 'rec';
 ----
 1
+
+# ---------------------------------------------------------------------------
+# DROP, and what may follow a complete statement.
+# ---------------------------------------------------------------------------
+
+statement ok
+TRAIN MODEL to_drop PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# IF EXISTS used to be read as the model name: `DROP MODEL IF EXISTS keep`
+# dropped a model called IF, reported success, and left the real one in place.
+query I
+SELECT CAST(dropped AS INTEGER) FROM pql_exec('DROP MODEL IF EXISTS to_drop');
+----
+1
+
+query I
+SELECT CAST(count(*) = 0 AS INTEGER) FROM pql_exec('SHOW MODELS') WHERE model = 'to_drop';
+----
+1
+
+query I
+SELECT CAST(dropped AS INTEGER) FROM pql_exec('DROP MODEL IF EXISTS never_existed');
+----
+0
+
+statement error
+DROP MODEL never_existed;
+----
+<REGEX>:.*no model named.*IF EXISTS.*
+
+# nothing may follow a finished statement
+statement error
+DROP MODEL to_drop and more;
+----
+<REGEX>:.*after DROP MODEL.*
+
+statement error
+SHOW MODELS junk;
+----
+<REGEX>:.*after SHOW MODELS.*
+
+# ---------------------------------------------------------------------------
+# Schemas. PQL names tables without one, so a bare name has to mean one table.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA warehouse;
+
+statement ok
+CREATE TABLE warehouse.parts AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts, (i % 5) * 1.0 AS w
+  FROM range(400) t(i);
+
+statement ok
+CREATE TABLE warehouse.moves AS
+  SELECT row_number() OVER () AS id, p.id AS parts_id, p.ts - INTERVAL '1 day' * (k + 1) AS ts
+  FROM warehouse.parts p, range(4) r(k) WHERE k < (p.id % 4);
+
+# a table that lives only in another schema is still reachable by its bare name
+statement ok
+TRAIN MODEL wh PREDICT COUNT(moves) FOR parts AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# the same name in two schemas, with neither being the current one, is refused
+# rather than resolved to whichever the catalog happened to list first
+statement ok
+CREATE SCHEMA depot;
+
+statement ok
+CREATE TABLE depot.parts AS SELECT i AS id, TIMESTAMP '2020-01-01' AS ts, 1.0 AS w FROM range(9) t(i);
+
+statement error
+TRAIN MODEL ambig PREDICT COUNT(moves) FOR parts AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+----
+<REGEX>:.*more than one schema.*

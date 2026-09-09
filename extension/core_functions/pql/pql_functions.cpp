@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <set>
 
@@ -344,18 +345,30 @@ static void ResolveTemporalLiteral(pql::Literal &lit, const char *what) {
 }
 
 struct TableSchema {
+	std::string schema; // the SQL schema it lives in, "main" unless said otherwise
 	std::string name;
 	std::vector<std::string> columns;
 	std::vector<pql::ColType> types;
+
+	// How to name it in a query. PQL itself refers to tables by their bare name,
+	// which is why two schemas holding the same one has to be resolved before
+	// anything is read.
+	std::string Qualified() const {
+		return "\"" + schema + "\".\"" + name + "\"";
+	}
 };
 
 // One catalog query: names and types for everything, no data touched.
 static std::vector<TableSchema> LoadSchema(Connection &con) {
 	std::vector<TableSchema> out;
-	auto r = con.Query("SELECT t.table_name, c.column_name, c.data_type "
+	// Grouped by schema AND name. Grouping by name alone merged two same-named
+	// tables from different schemas into one entry carrying both column lists,
+	// and the SELECT built from it named columns that were not there.
+	auto r = con.Query("SELECT t.schema_name, t.table_name, c.column_name, c.data_type "
 	                   "FROM duckdb_tables() t JOIN duckdb_columns() c "
 	                   "  ON c.table_oid = t.table_oid "
-	                   "WHERE NOT t.internal ORDER BY t.table_name, c.column_index");
+	                   "WHERE NOT t.internal "
+	                   "ORDER BY t.schema_name, t.table_name, c.column_index");
 	if (r->HasError()) {
 		return out;
 	}
@@ -365,11 +378,12 @@ static std::vector<TableSchema> LoadSchema(Connection &con) {
 			break;
 		}
 		for (idx_t i = 0; i < chunk->size(); i++) {
-			const std::string tn = chunk->GetValue(0, i).ToString();
-			const std::string cn = chunk->GetValue(1, i).ToString();
-			const std::string ty = pql::ToUpper(chunk->GetValue(2, i).ToString());
-			if (out.empty() || out.back().name != tn) {
-				out.push_back(TableSchema {tn, {}, {}});
+			const std::string sn = chunk->GetValue(0, i).ToString();
+			const std::string tn = chunk->GetValue(1, i).ToString();
+			const std::string cn = chunk->GetValue(2, i).ToString();
+			const std::string ty = pql::ToUpper(chunk->GetValue(3, i).ToString());
+			if (out.empty() || out.back().name != tn || out.back().schema != sn) {
+				out.push_back(TableSchema {sn, tn, {}, {}});
 			}
 			pql::ColType t = pql::ColType::INVALID;
 			if (ty.find("TIMESTAMP") != std::string::npos || ty.find("DATE") != std::string::npos) {
@@ -425,7 +439,7 @@ static pql::Frame LoadFrameColumns(Connection &con, const TableSchema &schema, c
 	if (select.empty()) {
 		return frame;
 	}
-	auto result = con.Query("SELECT " + select + " FROM \"" + schema.name + "\"");
+	auto result = con.Query("SELECT " + select + " FROM " + schema.Qualified());
 	if (result->HasError()) {
 		throw InvalidInputException("pql: cannot read table '%s': %s", schema.name, result->GetError());
 	}
@@ -609,7 +623,51 @@ static const TableSchema *FindSchema(const std::vector<TableSchema> &schema, con
 
 static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &stmt) {
 	Connection con(DatabaseInstance::GetDatabase(context));
-	const std::vector<TableSchema> schema = LoadSchema(con);
+	std::vector<TableSchema> schema = LoadSchema(con);
+	{
+		// PQL names tables without a schema, so a bare name has to mean one table.
+		// Prefer the session's own schema, the way an unqualified name resolves in
+		// SQL; take a unique match elsewhere; refuse when it is genuinely ambiguous
+		// rather than picking whichever the catalog listed first.
+		std::string current = "main";
+		auto cs = con.Query("SELECT current_schema()");
+		if (cs && !cs->HasError()) {
+			auto ch = cs->Fetch();
+			if (ch && ch->size() > 0) {
+				current = ch->GetValue(0, 0).ToString();
+			}
+		}
+		std::map<std::string, std::vector<size_t>> by_name;
+		for (size_t i = 0; i < schema.size(); i++) {
+			by_name[pql::ToUpper(schema[i].name)].push_back(i);
+		}
+		std::vector<TableSchema> resolved;
+		for (auto &kv : by_name) {
+			if (kv.second.size() == 1) {
+				resolved.push_back(schema[kv.second[0]]);
+				continue;
+			}
+			int pick = -1;
+			for (size_t idx : kv.second) {
+				if (pql::ToUpper(schema[idx].schema) == pql::ToUpper(current)) {
+					pick = (int)idx;
+					break;
+				}
+			}
+			if (pick >= 0) {
+				resolved.push_back(schema[(size_t)pick]);
+				continue;
+			}
+			// Only a problem if the statement actually wants this table; recorded
+			// here and reported below, once we know what it asked for.
+			TableSchema amb = schema[kv.second[0]];
+			amb.columns.clear();
+			amb.types.clear();
+			amb.schema.clear(); // empty schema marks it unresolvable
+			resolved.push_back(amb);
+		}
+		schema.swap(resolved);
+	}
 	const std::vector<pql::ForeignKey> all_fks = ForeignKeysFromSchema(con, schema);
 
 	auto same = [](const std::string &a, const std::string &b) {
@@ -695,7 +753,7 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 
 	pql::Database db;
 	for (const auto &t : schema) {
-		if (!want.count(pql::ToUpper(t.name))) {
+		if (t.schema.empty() || !want.count(pql::ToUpper(t.name))) {
 			continue;
 		}
 		// The entity's own text columns are features, so they are read. Elsewhere a
@@ -726,6 +784,15 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 			}
 		}
 		db.tables.push_back(LoadFrameColumns(con, t, keep));
+	}
+	for (const auto &t : schema) {
+		if (!t.schema.empty() || !want.count(pql::ToUpper(t.name))) {
+			continue;
+		}
+		throw InvalidInputException(
+		    "pql: '%s' exists in more than one schema and none of them is the current one. "
+		    "SET schema to the one you mean, or rename so the name is unique",
+		    t.name);
 	}
 	if (db.Find(stmt.entity_table) < 0) {
 		throw InvalidInputException("pql: entity table '%s' not found", stmt.entity_table);
@@ -1068,6 +1135,11 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 			auto entry = GetRegistryEntry(context);
 			std::lock_guard<std::mutex> guard(entry->lock);
 			dropped = entry->registry.Drop(stmt.model);
+		}
+		if (!dropped && !stmt.if_exists) {
+			throw InvalidInputException("pql: no model named '%s'; use DROP MODEL IF EXISTS to "
+			                            "ignore that",
+			                            stmt.model);
 		}
 		bind->names = {Identifier("dropped")};
 		bind->types = {LogicalType::BOOLEAN};

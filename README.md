@@ -207,8 +207,14 @@ BACKTEST MODEL <name> [ FOR <table> ] [ WHERE <filter> ] [ FROM <ts> ] [ TO <ts>
 
 EXPLAIN MODEL <name> [ FOR <table> ] [ WHERE <filter> ]
 
-DROP MODEL <name>
+DROP MODEL [IF EXISTS] <name>
 ```
+
+Tables are named without a schema, so a bare name has to mean one table. PQL
+resolves it the way an unqualified name resolves in SQL: the session's own
+schema first, then a unique match anywhere else. When the same name lives in
+several schemas and none of them is the current one, it refuses rather than
+picking whichever the catalog listed first.
 
 `PREDICT` and `FOR` come first; the optional clauses may follow in any order.
 `PREDICT` inherits `AT` and `HORIZON` from the model.

@@ -13,6 +13,8 @@ This directory holds the implementation and its examples.
 | [`examples/sunnyside_load.sql`](examples/sunnyside_load.sql) | loads the export into DuckDB |
 | [`test_parse.cpp`](test_parse.cpp) | grammar tests, compile standalone with `clang++ -std=c++17` |
 | [`test_model.cpp`](test_model.cpp) | end-to-end model tests including the leakage canary |
+| [`test_fuzz.cpp`](test_fuzz.cpp) | parser fuzzer: mutated statements and garbage, checking that anything accepted round-trips |
+| [`test_degenerate.cpp`](test_degenerate.cpp) | databases that should not exist: empty, one row, duplicate keys, NaN, infinity |
 | [`console/server.py`](console/server.py) | a small local browser console |
 
 The DuckDB binding is in
@@ -25,4 +27,12 @@ Running the standalone tests needs no DuckDB build:
 ```bash
 clang++ -std=c++17 -O2 -o /tmp/pt test_parse.cpp && /tmp/pt
 clang++ -std=c++17 -O2 -o /tmp/pm test_model.cpp && /tmp/pm
+```
+
+The fuzzer and the degenerate-data harness are worth running under sanitizers,
+which is how most of what they now guard was found:
+
+```bash
+clang++ -std=c++17 -O1 -g -I. -fsanitize=address,undefined -o /tmp/tf test_fuzz.cpp && /tmp/tf
+clang++ -std=c++17 -O1 -g -I. -fsanitize=address,undefined -o /tmp/td test_degenerate.cpp && /tmp/td
 ```

@@ -69,6 +69,36 @@ int main() {
   Err("TRAIN MODEL a PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS EXCLUDE a", "expected '('");
   Err("EXPLAIN churn", "expected MODEL");
   Err("EXPLAIN MODEL m HORIZON 3 DAYS", "in EXPLAIN");
+  // A quote that is never closed used to run to the end of the input and be
+  // accepted, so `region = 'US` quietly became `region = 'US'`: a missing quote
+  // changed what a statement meant instead of failing it.
+  std::printf("== quoting\n");
+  Err("PREDICT users.x FOR users WHERE region = 'US USING MODEL m", "unterminated string");
+  Err("BACKTEST MODEL \"m", "unterminated quoted identifier");
+  Err("PREDICT users.x FOR \"\" USING MODEL m", "empty quoted identifier");
+  Ok("PREDICT users.x FOR users WHERE note = 'it''s fine' USING MODEL m", "it's fine");
+  // An identifier that needed quotes going in needs them coming out, or the
+  // statement a model records of itself cannot be run again.
+  Ok("PREDICT \"my col\" FOR \"my table\" USING MODEL m", "FOR \"my table\"");
+  Ok("PREDICT \"my col\" FOR \"my table\" USING MODEL m", "\"my col\"");
+  // `horizon` is a PQL keyword, so it must come back quoted. `select` is not one
+  // (PQL reserves only what it dispatches on) and stays bare, which is correct:
+  // these statements are read by PQL, not by DuckDB's parser.
+  Ok("PREDICT \"horizon\" FOR users USING MODEL m", "\"horizon\"");
+  Ok("PREDICT \"select\" FOR users USING MODEL m", "PREDICT select");
+  Ok("PREDICT \"a\"\"b\" FOR users USING MODEL m", "\"a\"\"b\"");
+  Ok("TRAIN MODEL m PREDICT COUNT(*) FOR users AT t HORIZON 1 WEEK", "COUNT(*)");
+
+  // Nothing may follow a finished statement. `DROP MODEL a b c` used to drop
+  // `a` and discard the rest without a word, which is how DROP MODEL IF EXISTS
+  // came to drop a model called IF.
+  std::printf("== end of statement\n");
+  Ok("DROP MODEL IF EXISTS m", "DROP MODEL IF EXISTS m");
+  Ok("DROP MODEL m", "DROP MODEL m");
+  Err("DROP MODEL a b", "after DROP MODEL");
+  Err("SHOW MODELS extra", "after SHOW MODELS");
+  Err("DROP MODEL IF m", "expected EXISTS");
+
   // Copying a statement must not lose a clause. Every field used to be
   // enumerated by hand in the copy assignment, and EXCLUDE and OR REPLACE were
   // both missing from it: they parsed, took effect, and then disappeared from
