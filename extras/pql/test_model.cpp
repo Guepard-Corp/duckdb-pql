@@ -213,6 +213,233 @@ int main() {
       printf("   FAIL: the same statement gave different models\n"); fails++;
     }
   }
+  // ---- I. a text column is a feature, and an unseen value is handled --------
+  // The label is decided entirely by a category. Nothing numeric predicts it, so
+  // a model that cannot read text can only return the mean.
+  {
+    printf("== I. categorical features\n");
+    const size_t NU = 3000;
+    Database db;
+    Frame users; users.name = "users";
+    Column uid = MakeCol("id", ColType::INT64, NU), uts = MakeCol("ts", ColType::TIMESTAMP, NU),
+           filler = MakeCol("filler", ColType::DOUBLE, NU),
+           plan = MakeCol("plan", ColType::CATEGORY, NU);
+    const char *names[3] = {"premium", "basic", "trial"};
+    const int per_plan[3] = {18, 4, 0};
+    std::vector<double> anch(NU); std::vector<int> pidx(NU);
+    for (size_t i = 0; i < NU; i++) {
+      uid.num[i] = double(i);
+      anch[i] = (900.0 + double(i % 400)) * DAY;
+      uts.num[i] = anch[i];
+      filler.num[i] = 0.5;                       // constant: carries nothing
+      pidx[i] = int(i % 3);
+      plan.code[i] = plan.dict.Intern(names[pidx[i]]);
+    }
+    users.columns = {uid, uts, filler, plan}; users.nrows = NU;
+    std::vector<double> o_id, o_uid, o_ts;
+    size_t onext = 0;
+    for (size_t i = 0; i < NU; i++) {
+      for (int k = 0; k < per_plan[pidx[i]]; k++) {
+        o_id.push_back(double(onext++)); o_uid.push_back(double(i));
+        o_ts.push_back(anch[i] + (1.0 + double(k % 25)) * DAY);
+      }
+    }
+    Frame orders; orders.name = "orders";
+    Column oi = MakeCol("id", ColType::INT64, o_id.size()),
+           ou = MakeCol("user_id", ColType::INT64, o_id.size()),
+           ot = MakeCol("ts", ColType::TIMESTAMP, o_id.size());
+    for (size_t k = 0; k < o_id.size(); k++) { oi.num[k]=o_id[k]; ou.num[k]=o_uid[k]; ot.num[k]=o_ts[k]; }
+    orders.columns = {oi, ou, ot}; orders.nrows = o_id.size();
+    db.tables = {users, orders};
+    db.fks.push_back({"orders", "user_id", "users", "id"});
+    db.BuildLinks({});
+    auto st = Parse("TRAIN MODEL cat PREDICT COUNT(orders) FOR users AT ts HORIZON 30 DAYS "
+                    "OPTIONS (epochs = 60, hidden = 32)");
+    Model m; TrainReport rep = TrainModel(db, st, m);
+    printf("   mae = %.4f   baseline = %.4f   features = %d\n",
+           rep.test_metric, rep.baseline_metric, rep.width);
+    if (rep.test_metric > 0.5) {
+      printf("   FAIL: the category was not learned (a mean-only model scores ~%.2f)\n",
+             rep.baseline_metric);
+      fails++;
+    }
+
+    // Both GraphSAGE depths read the same entity columns. Two hops used to skip
+    // them entirely: its gather never filled the self block, so w_self took a
+    // zero gradient every step and the entity's own attributes were invisible.
+    for (int layers = 1; layers <= 2; layers++) {
+      char q[240];
+      snprintf(q, sizeof q,
+               "TRAIN MODEL sg PREDICT COUNT(orders) FOR users AT ts HORIZON 30 DAYS "
+               "OPTIONS (epochs = 60, hidden = 32, arch = 'sage', layers = %d)", layers);
+      auto sst = Parse(q);
+      Model sm; TrainReport srep = TrainModel(db, sst, sm);
+      printf("   sage layers=%d mae = %.4f (baseline %.4f)\n", layers, srep.test_metric,
+             srep.baseline_metric);
+      if (srep.test_metric > 0.5) {
+        printf("   FAIL: sage layers=%d did not read the entity's text column\n", layers);
+        fails++;
+      }
+    }
+
+    // EXPLAIN must name the column that actually drives the label, and must put
+    // the constant one at the bottom. This is the check that would have caught a
+    // feature being wired up but never reaching the model.
+    {
+      auto ex = Parse("EXPLAIN MODEL cat");
+      auto imp = RunExplain(db, m, ex);
+      if (imp.empty()) {
+        printf("   FAIL: EXPLAIN returned nothing\n"); fails++;
+      } else {
+        double filler_drop = 0; bool found = false;
+        for (const auto &f : imp) {
+          if (f.feature.rfind("filler", 0) == 0) { filler_drop = f.drop; found = true; }
+        }
+        printf("   explain: top is '%s' at %.3f; filler at %.4f\n",
+               imp[0].feature.c_str(), imp[0].drop, filler_drop);
+        if (imp[0].feature.rfind("plan", 0) != 0) {
+          printf("   FAIL: the driving column is not ranked first\n"); fails++;
+        }
+        if (!found || std::fabs(filler_drop) > 0.05) {
+          printf("   FAIL: a constant column should cost nothing to shuffle\n"); fails++;
+        }
+      }
+      // A SAGE model has no dense feature vector to permute, and says so.
+      auto sst = Parse("TRAIN MODEL sg2 PREDICT COUNT(orders) FOR users AT ts HORIZON 30 DAYS "
+                       "OPTIONS (epochs = 5, hidden = 16, arch = 'sage')");
+      Model sm; TrainModel(db, sst, sm);
+      bool refused = false;
+      try {
+        auto e2 = Parse("EXPLAIN MODEL sg2");
+        RunExplain(db, sm, e2);
+      } catch (const std::exception &) {
+        refused = true;
+      }
+      if (!refused) {
+        printf("   FAIL: explaining a sage model should refuse, not invent numbers\n"); fails++;
+      }
+    }
+
+    // A value never seen in training must land in the spare slot, not crash and
+    // not be mistaken for one of the trained categories.
+    Frame &u2 = db.tables[0];
+    Column &p2 = u2.columns[3];
+    const uint32_t fresh = p2.dict.Intern("enterprise");
+    for (size_t i = 0; i < 40; i++) { p2.code[i] = fresh; }
+    auto ps = Parse("PREDICT COUNT(orders) FOR users USING MODEL cat");
+    std::vector<Prediction> preds = RunPredict(db, m, ps);
+    double lo = 1e18, hi = -1e18;
+    for (size_t i = 0; i < preds.size() && i < 40; i++) {
+      lo = std::min(lo, preds[i].value); hi = std::max(hi, preds[i].value);
+    }
+    printf("   unseen category predicts %.3f..%.3f over %zu rows\n", lo, hi, preds.size());
+    if (!(lo == lo) || !(hi == hi) || preds.size() != NU) {
+      printf("   FAIL: an unseen category did not survive prediction\n"); fails++;
+    }
+  }
+
+  // ---- J. two things the aggregates alone cannot express ------------------
+  // Each task splits users into groups that differ in exactly one thing. If the
+  // features reach it, the mean prediction per group separates; if not, every
+  // group gets the same number, which an MAE alone would not make obvious.
+  {
+    printf("== J. seasonality and regularity\n");
+    struct Case { const char *name; int kind; };
+    const Case cases[2] = {{"anchor day-of-week", 0}, {"gap regularity", 1}};
+    for (const Case &cs : cases) {
+      std::mt19937 rng(3); std::uniform_real_distribution<double> U(0, 1);
+      const size_t NU = 3000;
+      Database db;
+      Frame users; users.name = "users";
+      Column uid = MakeCol("id", ColType::INT64, NU), uts = MakeCol("ts", ColType::TIMESTAMP, NU),
+             fil = MakeCol("filler", ColType::DOUBLE, NU);
+      std::vector<double> anch(NU); std::vector<int> grp(NU);
+      std::vector<double> e_uid, e_ts;
+      for (size_t i = 0; i < NU; i++) {
+        int nf = 0;
+        if (cs.kind == 0) {
+          const int day = (int)(U(rng) * 280.0);
+          anch[i] = (1000.0 + double(day)) * DAY;
+          for (int k = 0; k < 4; k++) {                     // identical history
+            e_uid.push_back(double(i)); e_ts.push_back(anch[i] - (5.0 + double(k) * 7.0) * DAY);
+          }
+          const int dow = day % 7;
+          grp[i] = (dow == 0 || dow == 6) ? 0 : 1;
+          nf = grp[i] ? 9 : 1;
+        } else {
+          anch[i] = (1000.0 + U(rng) * 300.0) * DAY;
+          grp[i] = (int)(U(rng) * 2);
+          // Eight events, all inside (7, 30] days back, so every window count and
+          // every recency matches. Only the spacing differs.
+          const double regular[8] = {8, 11, 14, 17, 20, 23, 26, 29};
+          const double bursty[8] = {8, 9, 10, 11, 26, 27, 28, 29};
+          for (int k = 0; k < 8; k++) {
+            e_uid.push_back(double(i));
+            e_ts.push_back(anch[i] - (grp[i] ? regular[k] : bursty[k]) * DAY);
+          }
+          nf = grp[i] ? 8 : 1;
+        }
+        for (int k = 0; k < nf; k++) {
+          e_uid.push_back(double(i)); e_ts.push_back(anch[i] + (1.0 + U(rng) * 6.0) * DAY);
+        }
+        uid.num[i] = double(i); uts.num[i] = anch[i]; fil.num[i] = 0.5;
+      }
+      users.columns = {uid, uts, fil}; users.nrows = NU;
+      Frame ev; ev.name = "events";
+      const size_t NE = e_uid.size();
+      Column vi = MakeCol("id", ColType::INT64, NE), vu = MakeCol("user_id", ColType::INT64, NE),
+             vt = MakeCol("ts", ColType::TIMESTAMP, NE);
+      for (size_t k = 0; k < NE; k++) { vi.num[k]=double(k); vu.num[k]=e_uid[k]; vt.num[k]=e_ts[k]; }
+      ev.columns = {vi, vu, vt}; ev.nrows = NE;
+      db.tables = {users, ev};
+      db.fks.push_back({"events", "user_id", "users", "id"});
+      db.BuildLinks({});
+      const char *hz = cs.kind == 0 ? "7" : "30";
+      char q[260];
+      snprintf(q, sizeof q,
+               "TRAIN MODEL j PREDICT COUNT(events) FOR users AT ts HORIZON %s DAYS "
+               "OPTIONS (epochs = 80, hidden = 64)", hz);
+      auto st = Parse(q);
+      Model m; TrainModel(db, st, m);
+      auto ps = Parse("PREDICT COUNT(events) FOR users USING MODEL j");
+      std::vector<Prediction> preds = RunPredict(db, m, ps);
+      double sum[2] = {0, 0}; int cnt[2] = {0, 0};
+      for (const auto &p : preds) { sum[grp[p.entity_row]] += p.value; cnt[grp[p.entity_row]]++; }
+      const double m0 = cnt[0] ? sum[0] / cnt[0] : 0, m1 = cnt[1] ? sum[1] / cnt[1] : 0;
+      printf("   %-20s quiet group %.2f, busy group %.2f\n", cs.name, m0, m1);
+      if (m1 - m0 < 3.0) {
+        printf("   FAIL: the two groups got the same answer, so the signal is unreachable\n");
+        fails++;
+      }
+    }
+  }
+
+  // ---- K. average precision against hand-computed values ------------------
+  {
+    printf("== K. average precision\n");
+    struct Case { std::vector<std::pair<double,int>> in; double want; const char *what; };
+    const std::vector<Case> cases = {
+      {{{0.9,1},{0.8,1},{0.7,0},{0.6,0}}, 1.0,          "perfect ranking"},
+      {{{0.9,1},{0.8,0},{0.7,1},{0.6,0}}, 5.0/6.0,      "one negative interleaved"},
+      {{{0.9,0},{0.8,0},{0.7,1},{0.6,1}}, (1.0/3+0.5)/2,"reversed ranking"},
+      {{{0.5,1},{0.5,0},{0.5,1},{0.5,0}}, 0.5,          "all tied"},
+    };
+    for (const auto &c : cases) {
+      const double got = AveragePrecision(c.in);
+      printf("   %-24s got %.4f want %.4f\n", c.what, got, c.want);
+      if (std::fabs(got - c.want) > 1e-9) {
+        printf("   FAIL\n"); fails++;
+      }
+    }
+    // Undefined when one class is missing, rather than silently zero.
+    const double none = AveragePrecision({{0.9,0},{0.8,0}});
+    const double all = AveragePrecision({{0.9,1},{0.8,1}});
+    if (!(none != none) || !(all != all)) {
+      printf("   FAIL: a single-class fold must be undefined, got %.4f / %.4f\n", none, all);
+      fails++;
+    }
+  }
+
   printf("\n%s\n", fails ? "FAILURES" : "all model tests passed");
   return fails ? 1 : 0;
 }

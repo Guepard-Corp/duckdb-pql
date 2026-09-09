@@ -142,7 +142,7 @@ inline bool IsPqlKeyword(const std::string &up) {
 	                           "SUM",    "AVG",    "MIN",     "MAX",    "DAY",    "DAYS",
 	                           "WEEK",   "WEEKS",  "MONTH",   "MONTHS", "YEAR",   "YEARS",
 	                           "HOUR",   "HOURS",  "DROP",    "SHOW",   "MODELS", "EVERY",
-	                           "BACKTEST", "TO",
+	                           "BACKTEST", "TO",     "EXPLAIN",
 	                           nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
@@ -478,9 +478,9 @@ struct Options {
 	// A silently ignored option reads as "my setting had no effect", which is the
 	// most common way to waste an afternoon.
 	static bool Known(const std::string &k) {
-		static const char *ok[] = {"EPOCHS", "HIDDEN",    "LR",     "BATCH",
-		                           "SEED",   "MEAN_COLS", "ARCH",   "LAYERS",
-		                           nullptr};
+		static const char *ok[] = {"EPOCHS",    "HIDDEN", "LR",     "BATCH",
+		                           "SEED",      "MEAN_COLS", "ARCH", "LAYERS",
+		                           "MAX_CATEGORIES", "L2",  nullptr};
 		for (int i = 0; ok[i]; i++) {
 			if (k == ok[i]) {
 				return true;
@@ -489,7 +489,7 @@ struct Options {
 		return false;
 	}
 	static std::string KnownList() {
-		return "EPOCHS, HIDDEN, LR, BATCH, SEED, MEAN_COLS, ARCH, LAYERS";
+		return "EPOCHS, HIDDEN, LR, BATCH, SEED, MEAN_COLS, ARCH, LAYERS, MAX_CATEGORIES, L2";
 	}
 
 	double Num(const std::string &k, double dflt) const {
@@ -517,7 +517,7 @@ struct TemporalSplit {
 	Literal test_from;
 };
 
-enum class StmtKind : uint8_t { TRAIN, PREDICT, BACKTEST, DROP_MODEL, SHOW_MODELS };
+enum class StmtKind : uint8_t { TRAIN, PREDICT, BACKTEST, EXPLAIN, DROP_MODEL, SHOW_MODELS };
 
 struct Statement {
 	StmtKind kind = StmtKind::PREDICT;
@@ -589,6 +589,9 @@ struct Statement {
 		}
 		if (kind == StmtKind::BACKTEST) {
 			return "BACKTEST MODEL " + model;
+		}
+		if (kind == StmtKind::EXPLAIN) {
+			return "EXPLAIN MODEL " + model;
 		}
 		s = (kind == StmtKind::TRAIN) ? ("TRAIN MODEL " + model + " PREDICT ") : "PREDICT ";
 		s += target.ToString();
@@ -679,6 +682,28 @@ public:
 			ExpectKw("MODEL");
 			st.kind = StmtKind::DROP_MODEL;
 			st.model = ExpectIdent("model name");
+			AcceptPunct(";");
+			return st;
+		}
+		if (AcceptKw("EXPLAIN")) {
+			ExpectKw("MODEL");
+			st.kind = StmtKind::EXPLAIN;
+			st.model = ExpectIdent("model name");
+			bool seen_for = false, seen_w = false;
+			while (Peek().kind != Tok::END && !(Peek().kind == Tok::PUNCT && Peek().text == ";")) {
+				if (PeekKw("FOR")) {
+					Once(seen_for, "FOR");
+					Next();
+					st.entity_table = ExpectIdent("entity table");
+				} else if (PeekKw("WHERE")) {
+					Once(seen_w, "WHERE");
+					Next();
+					st.filter = ParseFilter();
+				} else {
+					throw ParseError("unexpected token '" + Peek().text + "' in EXPLAIN",
+					                 Peek().pos);
+				}
+			}
 			AcceptPunct(";");
 			return st;
 		}
@@ -2007,6 +2032,63 @@ struct FeatureSpec {
 		std::string name;
 		double mean = 0, sd = 1;
 	};
+	// A text column, encoded so the model can use it.
+	//
+	// Categories are stored as dictionary codes, and a code is an arbitrary
+	// integer: feeding it in as a number would tell the model that 'basic' sits
+	// between 'premium' and 'trial'. So a low-cardinality column becomes one slot
+	// per value, and a high-cardinality one becomes how often its value occurs.
+	// Neither looks at the label, so neither can leak.
+	//
+	// Slots are keyed by the text, not the code. Dictionary codes are assigned in
+	// load order and the loader prunes columns per statement, so a code learned at
+	// TRAIN need not mean the same thing at PREDICT.
+	struct CatCol {
+		int index = -1;
+		std::string name;
+		bool one_hot = true;
+		// Whether the training fold held any row this encoding could not name: a
+		// NULL, or a value dropped from the kept set. Only then is a spare slot
+		// worth carrying.
+		bool has_other = false;
+		std::vector<std::string> labels; // one slot each, most frequent first
+		std::vector<double> freqs;       // training-fold share of each label
+		double freq_other = 0;           // share held by everything unlisted
+		double freq_mean = 0, freq_sd = 1;
+		// Resolved by Rebind: code -> slot, and code -> frequency. Both are direct
+		// lookups so a row costs no hashing.
+		std::vector<int> slot_by_code;
+		std::vector<float> freq_by_code;
+
+		// One slot per kept label, plus one for everything else when training saw
+		// such rows. When it did not, an unrecognised value sets no slot at all.
+		//
+		// A spare slot that never fires during training keeps whatever weights it
+		// was initialised with, because a zero input gets zero gradient. Firing it
+		// at prediction time would then inject an untrained random number: an
+		// unseen category would get an arbitrary answer rather than no answer.
+		int Width() const {
+			return one_hot ? (int)labels.size() + (has_other ? 1 : 0) : 1;
+		}
+
+		// Turn the labels into direct lookups against this frame's dictionary.
+		// Must run before any row is built, at training time as well as at
+		// prediction time: without it every row falls to the other slot and the
+		// column looks like a constant.
+		void Resolve(const Column &col) {
+			const size_t ncodes = col.dict.values.size();
+			slot_by_code.assign(ncodes, -1);
+			freq_by_code.assign(ncodes, (float)freq_other);
+			for (size_t sl = 0; sl < labels.size(); sl++) {
+				const uint32_t code = col.dict.Lookup(labels[sl]);
+				if (code == 0 || (size_t)code >= ncodes) {
+					continue; // code 0 is the reserved unknown, never a real label
+				}
+				slot_by_code[code] = (int)sl;
+				freq_by_code[code] = (float)freqs[sl];
+			}
+		}
+	};
 	struct LinkAgg {
 		int link = -1;
 		std::string child_table, child_key;
@@ -2015,7 +2097,15 @@ struct FeatureSpec {
 		std::vector<double> mean_mu, mean_sd;
 	};
 	std::vector<SelfCol> self_cols;
+	std::vector<CatCol> cat_cols;
 	std::vector<LinkAgg> link_aggs;
+	// Where the anchor falls in the week and in the year, as sine and cosine
+	// pairs. The anchor's raw value is deliberately not a feature: it is a
+	// straight line through the training era and a model that leans on it
+	// extrapolates nonsense. Its position within a cycle is different, it is known
+	// at prediction time by definition, and demand data is full of it.
+	bool anchor_cycles = false;
+	static const int kCycleSlots = 4;
 	int width = 0;
 
 	// count + recency per window, plus one mean per selected child column per window
@@ -2030,6 +2120,22 @@ struct FeatureSpec {
 				                         "present on '" + entity.name + "' any more");
 			}
 			sc.index = i;
+		}
+		for (auto &cc : cat_cols) {
+			const int i = entity.Find(cc.name);
+			if (i < 0) {
+				throw std::runtime_error("pql: column '" + cc.name + "' used by this model is not "
+				                         "present on '" + entity.name + "' any more");
+			}
+			cc.index = i;
+			const Column &col = entity.columns[(size_t)i];
+			if (col.type != ColType::CATEGORY) {
+				throw std::runtime_error("pql: column '" + cc.name + "' was text when this model "
+				                         "was trained and is not any more");
+			}
+			// Against this frame's own dictionary: a label it has never seen has no
+			// code, and those rows fall to the other slot, which is the honest answer.
+			cc.Resolve(col);
 		}
 		for (auto &la : link_aggs) {
 			int found = -1;
@@ -2057,18 +2163,153 @@ struct FeatureSpec {
 		}
 	}
 
-	// Per window: a count, a within-window recency, and one mean per selected
-	// child column. Plus one never-happened flag for the link as a whole.
+	// One label per feature group, in the order BuildFeatures emits them, with the
+	// number of slots each occupies. A one-hot block is one group: permuting its
+	// slots separately would split the column's contribution across them and make
+	// every piece look unimportant.
+	std::vector<std::pair<std::string, int>> Describe() const {
+		static const char *wname[] = {"7d", "30d", "90d", "365d", "all"};
+		std::vector<std::pair<std::string, int>> out;
+		for (const auto &sc : self_cols) {
+			out.emplace_back(sc.name, 1);
+		}
+		if (anchor_cycles) {
+			out.emplace_back("anchor: phase of week", 2);
+			out.emplace_back("anchor: phase of year", 2);
+		}
+		for (const auto &cc : cat_cols) {
+			out.emplace_back(cc.name + (cc.one_hot ? " (category)" : " (how common)"),
+			                 cc.Width());
+		}
+		for (const auto &la : link_aggs) {
+			out.emplace_back(la.child_table + ": never happened", 1);
+			for (int w = 0; w < kNumWindows; w++) {
+				const std::string suffix = std::string(" ") + wname[w];
+				out.emplace_back(la.child_table + ": count" + suffix, 1);
+				out.emplace_back(la.child_table + ": recency" + suffix, 1);
+				out.emplace_back(la.child_table + ": spacing" + suffix, 1);
+				for (const auto &mn : la.mean_names) {
+					out.emplace_back(la.child_table + "." + mn + ": mean" + suffix, 1);
+				}
+			}
+		}
+		return out;
+	}
+
+	// Per window: a count, a within-window recency, the spacing of the events, and
+	// one mean per selected child column. Plus one never-happened flag per link.
 	int PerLinkWidth(const LinkAgg &la) const {
-		return kNumWindows * (2 + (int)la.mean_cols.size()) + 1;
+		return kNumWindows * (3 + (int)la.mean_cols.size()) + 1;
 	}
 	void ComputeWidth() {
 		width = (int)self_cols.size();
+		if (anchor_cycles) {
+			width += kCycleSlots;
+		}
+		for (const auto &cc : cat_cols) {
+			width += cc.Width();
+		}
 		for (auto &la : link_aggs) {
 			width += PerLinkWidth(la);
 		}
 	}
 };
+
+
+// Fit an encoding for one text column, counting only rows from the training era.
+// `anch` is the column that decides which era a row belongs to, or null when
+// every row counts. Returns false when the column carries nothing usable.
+//
+// Shared by the dense path and by GraphSAGE so the two cannot drift apart.
+inline bool FitCatCol(const Frame &f, size_t col_index, const Column *anch, double train_cutoff,
+                      int max_categories, FeatureSpec::CatCol &out) {
+	const Column &c = f.columns[col_index];
+	if (c.type != ColType::CATEGORY) {
+		return false;
+	}
+	const bool bounded = anch && std::isfinite(train_cutoff);
+	auto in_fold = [&](size_t r) {
+		return !bounded || (anch->valid[r] && anch->num[r] <= train_cutoff);
+	};
+	std::vector<uint64_t> counts(c.dict.values.size(), 0ull);
+	uint64_t seen = 0, rows_in_fold = 0;
+	for (size_t r = 0; r < f.nrows; r++) {
+		if (!in_fold(r)) {
+			continue;
+		}
+		rows_in_fold++;
+		if (!c.valid[r]) {
+			continue;
+		}
+		const uint32_t code = c.code[r];
+		if (code < counts.size()) {
+			counts[code]++;
+			seen++;
+		}
+	}
+	if (seen == 0) {
+		return false;
+	}
+	std::vector<uint32_t> order;
+	for (uint32_t code = 1; code < (uint32_t)counts.size(); code++) {
+		if (counts[code] > 0) {
+			order.push_back(code);
+		}
+	}
+	if (order.size() < 2) {
+		return false; // one value everywhere is a constant, not a feature
+	}
+	// Nearly one value per row is an identifier or free text, not a category: an
+	// email column would otherwise become a frequency feature holding the same
+	// number in every row.
+	if ((int)order.size() > max_categories && order.size() * 4 > (size_t)seen) {
+		return false;
+	}
+	// Most frequent first, ties broken by label so the layout is deterministic.
+	std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+		if (counts[a] != counts[b]) {
+			return counts[a] > counts[b];
+		}
+		return c.dict.values[a] < c.dict.values[b];
+	});
+	out = FeatureSpec::CatCol();
+	out.index = (int)col_index;
+	out.name = c.name;
+	const double inv_seen = 1.0 / double(seen);
+	uint64_t named = 0;
+	for (uint32_t code : order) {
+		out.labels.push_back(c.dict.values[code]);
+		out.freqs.push_back(double(counts[code]) * inv_seen);
+		named += counts[code];
+	}
+	out.one_hot = (int)order.size() <= max_categories;
+	// Did any training row fall outside the kept labels? With one-hot every seen
+	// value gets a slot, so this is exactly "were there NULLs".
+	out.has_other = named < rows_in_fold;
+	if (!out.one_hot) {
+		// Too many values to give each a slot. How often a value occurs is a weaker
+		// feature than the value itself, but it is a real one and it costs one slot
+		// instead of thousands.
+		double fs = 0, fq = 0;
+		uint64_t fn = 0;
+		for (size_t r = 0; r < f.nrows; r++) {
+			if (!c.valid[r] || !in_fold(r)) {
+				continue;
+			}
+			const uint32_t code = c.code[r];
+			const double freq = code < counts.size() ? double(counts[code]) * inv_seen : 0.0;
+			fs += freq;
+			fq += freq * freq;
+			fn++;
+		}
+		out.freq_mean = fn ? fs / double(fn) : 0.0;
+		const double var =
+		    fn > 1 ? (fq - double(fn) * out.freq_mean * out.freq_mean) / double(fn - 1) : 0.0;
+		out.freq_sd = var > 1e-18 ? std::sqrt(var) : 1.0;
+	}
+	out.Resolve(c);
+	return true;
+}
 
 // Prefix-sum arena over each link's time-sorted children.
 //
@@ -2082,6 +2323,9 @@ struct AggCache {
 		std::vector<uint32_t> off;               // per parent: base into the prefix arrays
 		std::vector<std::vector<float>> psum;    // [mean col][off + i] running value sum
 		std::vector<std::vector<uint32_t>> pcnt; // [mean col][off + i] running valid count
+		// Running sum of squared gaps between consecutive children, in days, so the
+		// spread of the gaps inside any window is two lookups like everything else.
+		std::vector<float> pgap2;
 	};
 	std::vector<LinkCache> links; // parallel to FeatureSpec::link_aggs
 };
@@ -2102,6 +2346,23 @@ inline AggCache BuildAggCache(const Database &db, const FeatureSpec &spec) {
 			total += lk.Count((uint32_t)p) + 1u; // +1 for the leading zero
 		}
 		lc.off[nparents] = total;
+		lc.pgap2.assign(total, 0.0f);
+		if (lk.dated) {
+			for (size_t p = 0; p < nparents; p++) {
+				const uint32_t b = lk.Begin((uint32_t)p), e = lk.End((uint32_t)p);
+				const uint32_t base = lc.off[p];
+				double run = 0.0;
+				for (uint32_t i = b; i < e; i++) {
+					const uint32_t j = i - b;
+					if (j >= 1) {
+						const double g =
+						    (lk.Time(lk.flat[i]) - lk.Time(lk.flat[i - 1])) / kMicrosPerDay;
+						run += g * g;
+					}
+					lc.pgap2[base + j + 1] = (float)run;
+				}
+			}
+		}
 		lc.psum.assign(la.mean_cols.size(), {});
 		lc.pcnt.assign(la.mean_cols.size(), {});
 		for (size_t c = 0; c < la.mean_cols.size(); c++) {
@@ -2142,6 +2403,40 @@ inline void BuildFeatures(const Database &db, const Frame &entity, const Feature
 	for (const auto &sc : spec.self_cols) {
 		const Column &c = entity.columns[(size_t)sc.index];
 		out[k++] = c.valid[row] ? float((c.num[row] - sc.mean) / sc.sd) : 0.0f;
+	}
+	if (spec.anchor_cycles) {
+		// Days since the epoch, which began on a Thursday. Which weekday maps to
+		// which angle does not matter, only that it is the same every time.
+		if (std::isfinite(anchor)) {
+			const double days = std::floor(anchor / kMicrosPerDay);
+			const double dow = std::fmod(std::fmod(days, 7.0) + 7.0, 7.0);
+			const double doy = std::fmod(std::fmod(days, 365.25) + 365.25, 365.25);
+			const double tw = 6.283185307179586;
+			out[k + 0] = float(std::sin(tw * dow / 7.0));
+			out[k + 1] = float(std::cos(tw * dow / 7.0));
+			out[k + 2] = float(std::sin(tw * doy / 365.25));
+			out[k + 3] = float(std::cos(tw * doy / 365.25));
+		}
+		k += (size_t)FeatureSpec::kCycleSlots;
+	}
+	for (const auto &cc : spec.cat_cols) {
+		const Column &c = entity.columns[(size_t)cc.index];
+		const uint32_t code = c.valid[row] ? c.code[row] : 0u;
+		const bool known = code < cc.slot_by_code.size();
+		if (cc.one_hot) {
+			const int slot = (known && c.valid[row]) ? cc.slot_by_code[code] : -1;
+			if (slot >= 0) {
+				out[k + (size_t)slot] = 1.0f;
+			} else if (cc.has_other) {
+				out[k + cc.labels.size()] = 1.0f;
+			}
+			// Otherwise the block stays zero: the encoding has nothing to say.
+			k += (size_t)cc.Width();
+		} else {
+			const double f = (known && c.valid[row]) ? (double)cc.freq_by_code[code]
+			                                         : cc.freq_other;
+			out[k++] = float((f - cc.freq_mean) / cc.freq_sd);
+		}
 	}
 	for (size_t li = 0; li < spec.link_aggs.size(); li++) {
 		const FeatureSpec::LinkAgg &la = spec.link_aggs[li];
@@ -2186,6 +2481,28 @@ inline void BuildFeatures(const Database &db, const Frame &entity, const Feature
 			// in 90" expressible.
 			out[k++] = (n > 0 && since >= 0) ? float(std::log1p(since) * 0.25) : 0.0f;
 			const uint32_t base = lc.off[row];
+			// How evenly the events are spaced, as the coefficient of variation of
+			// the gaps between them. Divided by the mean gap, so it says nothing
+			// about the rate, which the count already carries: a user who returns
+			// every nine days and one who arrives in two bursts have the same count,
+			// the same recency and the same window totals, and only this separates
+			// them.
+			float cv = 0.0f;
+			if (timed && n >= 2) {
+				const double span = (lk.Time(lk.flat[bslice + visible - 1]) -
+				                     lk.Time(lk.flat[bslice + start])) /
+				                    kMicrosPerDay;
+				const double ng = double(n - 1);
+				const double mean_gap = span / ng; // the gaps telescope
+				const double sumsq =
+				    double(lc.pgap2[base + visible]) - double(lc.pgap2[base + start + 1]);
+				if (mean_gap > 1e-9) {
+					const double var = sumsq / ng - mean_gap * mean_gap;
+					const double c = std::sqrt(var > 0 ? var : 0.0) / mean_gap;
+					cv = float(c > 4.0 ? 4.0 : c);
+				}
+			}
+			out[k++] = cv;
 			for (size_t mi = 0; mi < la.mean_cols.size(); mi++) {
 				const float sum = lc.psum[mi][base + visible] - lc.psum[mi][base + start];
 				const uint32_t m = lc.pcnt[mi][base + visible] - lc.pcnt[mi][base + start];
@@ -2229,8 +2546,16 @@ inline void MatMulNT(const float *A, const float *W, const float *bias, float *C
 struct SageSpec {
 	struct NodeType {
 		int table = -1;
+		// Names alongside the indices. Table and column positions are per
+		// statement, because the loader reads only what a statement can use, so a
+		// stored index means nothing in a later one.
+		std::string table_name;
+		std::vector<std::string> col_names;
 		std::vector<int> cols;      // numeric columns encoding this node type
 		std::vector<double> mu, sd; // standardisation, fitted on the train fold
+		// Text columns, encoded exactly as the dense path encodes them. They come
+		// after the numeric block, so `dim` is the two together.
+		std::vector<FeatureSpec::CatCol> cats;
 		int dim = 0;
 	};
 	struct EdgeType {
@@ -2267,14 +2592,36 @@ inline SageFeatures BuildSageFeatures(const Database &db, const SageSpec &spec) 
 		const SageSpec::NodeType &nt = spec.nodes[n];
 		const Frame &fr = db.tables[(size_t)nt.table];
 		f.x[n].assign(fr.nrows * (size_t)nt.dim, 0.0f);
+		const int stride = nt.dim;
 		for (size_t c = 0; c < nt.cols.size(); c++) {
 			const Column &col = fr.columns[(size_t)nt.cols[c]];
 			const double mu = nt.mu[c], sd = nt.sd[c];
 			float *dst = f.x[n].data() + c;
-			const int stride = nt.dim;
 			for (size_t r = 0; r < fr.nrows; r++) {
 				dst[r * (size_t)stride] = col.valid[r] ? float((col.num[r] - mu) / sd) : 0.0f;
 			}
+		}
+		size_t base = nt.cols.size();
+		for (const auto &cc : nt.cats) {
+			const Column &col = fr.columns[(size_t)cc.index];
+			float *dst = f.x[n].data() + base;
+			for (size_t r = 0; r < fr.nrows; r++) {
+				const uint32_t code = col.valid[r] ? col.code[r] : 0u;
+				const bool known = code < cc.slot_by_code.size();
+				if (cc.one_hot) {
+					const int slot = (known && col.valid[r]) ? cc.slot_by_code[code] : -1;
+					if (slot >= 0) {
+						dst[r * (size_t)stride + (size_t)slot] = 1.0f;
+					} else if (cc.has_other) {
+						dst[r * (size_t)stride + cc.labels.size()] = 1.0f;
+					}
+				} else {
+					const double fq = (known && col.valid[r]) ? (double)cc.freq_by_code[code]
+					                                          : cc.freq_other;
+					dst[r * (size_t)stride] = float((fq - cc.freq_mean) / cc.freq_sd);
+				}
+			}
+			base += (size_t)cc.Width();
 		}
 	}
 	return f;
@@ -2445,6 +2792,7 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int ancho
 		}
 		SageSpec::NodeType nt;
 		nt.table = table;
+		nt.table_name = db.tables[(size_t)table].name;
 		SageNodeColumns(db, table, incoming, nt.cols);
 		if (table == db.Find(entity.name)) {
 			// the anchor and the target are not inputs
@@ -2482,7 +2830,47 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int ancho
 			nt.mu.push_back(mu);
 			nt.sd.push_back(var > 1e-18 ? std::sqrt(var) : 1.0);
 		}
+		// Text columns on this node type, fitted over the same era as the numerics
+		// above: bounded by the entity's anchor for the entity itself, unbounded
+		// for child tables, which have no anchor of their own.
+		for (size_t ci = 0; ci < f.columns.size(); ci++) {
+			if (f.columns[ci].type != ColType::CATEGORY) {
+				continue;
+			}
+			if (incoming && ((int)ci == incoming->child_key_col ||
+			                 (int)ci == incoming->child_time_col)) {
+				continue;
+			}
+			if (table == db.Find(entity.name) &&
+			    ((int)ci == anchor_col || (int)ci == target_col)) {
+				continue;
+			}
+			bool is_key = false;
+			for (const auto &fk : db.fks) {
+				const bool child_side = ToUpper(fk.child_table) == ToUpper(f.name) &&
+				                        ToUpper(fk.child_column) == ToUpper(f.columns[ci].name);
+				const bool parent_side = ToUpper(fk.parent_table) == ToUpper(f.name) &&
+				                         ToUpper(fk.parent_column) == ToUpper(f.columns[ci].name);
+				if (child_side || parent_side) {
+					is_key = true;
+					break;
+				}
+			}
+			if (is_key) {
+				continue;
+			}
+			FeatureSpec::CatCol cc;
+			if (FitCatCol(f, ci, anch, train_cutoff, 16, cc)) {
+				nt.cats.push_back(cc);
+			}
+		}
+		for (int c : nt.cols) {
+			nt.col_names.push_back(f.columns[(size_t)c].name);
+		}
 		nt.dim = (int)nt.cols.size();
+		for (const auto &cc : nt.cats) {
+			nt.dim += cc.Width();
+		}
 		spec.nodes.push_back(nt);
 		return (int)spec.nodes.size() - 1;
 	};
@@ -2507,6 +2895,57 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, int ancho
 		}
 	}
 	return spec;
+}
+
+// Re-resolve a stored spec against the tables of a later statement.
+//
+// Everything in a SageSpec that points at the database is an index, and indices
+// are per statement: the loader reads only the tables and columns a statement
+// can use, so column three of `orders` at TRAIN need not be column three at
+// PREDICT. Names are what survive, so names are what this resolves from.
+inline void RebindSageSpec(const Database &db, const Frame &entity, SageSpec &spec) {
+	for (auto &nt : spec.nodes) {
+		const int t = db.Find(nt.table_name);
+		if (t < 0) {
+			throw std::runtime_error("pql: table '" + nt.table_name +
+			                         "' used by this model is not available");
+		}
+		nt.table = t;
+		const Frame &f = db.tables[(size_t)t];
+		for (size_t c = 0; c < nt.col_names.size(); c++) {
+			const int i = f.Find(nt.col_names[c]);
+			if (i < 0) {
+				throw std::runtime_error("pql: column '" + nt.table_name + "." + nt.col_names[c] +
+				                         "' used by this model is missing");
+			}
+			nt.cols[c] = i;
+		}
+		for (auto &cc : nt.cats) {
+			const int i = f.Find(cc.name);
+			if (i < 0 || f.columns[(size_t)i].type != ColType::CATEGORY) {
+				throw std::runtime_error("pql: text column '" + nt.table_name + "." + cc.name +
+				                         "' used by this model is missing or is not text any more");
+			}
+			cc.index = i;
+			cc.Resolve(f.columns[(size_t)i]);
+		}
+	}
+	for (auto &et : spec.edges) {
+		const std::string ct = spec.nodes[(size_t)et.src_node].table_name;
+		int found = -1;
+		for (size_t l = 0; l < db.links.size(); l++) {
+			if (ToUpper(db.links[l].child_table) == ToUpper(ct) &&
+			    ToUpper(db.links[l].parent_table) == ToUpper(entity.name)) {
+				found = (int)l;
+				break;
+			}
+		}
+		if (found < 0) {
+			throw std::runtime_error("pql: the link from '" + ct +
+			                         "' used by this model is not available");
+		}
+		et.link = found;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3200,7 +3639,11 @@ struct EvalScratch {
 struct Adam {
 	std::vector<float> m, v;
 	int t = 0;
-	void Step(std::vector<float> &w, const float *g, double lr) {
+	// `wd` is decoupled weight decay: it pulls weights toward zero directly
+	// rather than through the gradient, so the adaptive step size does not scale
+	// it away. Biases are stepped with wd = 0; shrinking an intercept just biases
+	// the model without constraining it.
+	void Step(std::vector<float> &w, const float *g, double lr, double wd = 0.0) {
 		if (m.size() != w.size()) {
 			m.assign(w.size(), 0.0f);
 			v.assign(w.size(), 0.0f);
@@ -3212,17 +3655,29 @@ struct Adam {
 		const float o1 = (float)(1.0 - b1), o2 = (float)(1.0 - b2);
 		const float alpha = (float)(lr / c1), rc2 = (float)(1.0 / std::sqrt(c2));
 		const float fe = (float)eps;
+		const float decay = (float)(lr * wd);
 		float *__restrict mp = m.data();
 		float *__restrict vp = v.data();
 		float *__restrict wp = w.data();
 		const size_t n = w.size();
+		if (decay == 0.0f) {
+			for (size_t i = 0; i < n; i++) {
+				const float gi = g[i];
+				const float mi = f1 * mp[i] + o1 * gi;
+				const float vi = f2 * vp[i] + o2 * gi * gi;
+				mp[i] = mi;
+				vp[i] = vi;
+				wp[i] -= alpha * mi / (std::sqrt(vi) * rc2 + fe);
+			}
+			return;
+		}
 		for (size_t i = 0; i < n; i++) {
 			const float gi = g[i];
 			const float mi = f1 * mp[i] + o1 * gi;
 			const float vi = f2 * vp[i] + o2 * gi * gi;
 			mp[i] = mi;
 			vp[i] = vi;
-			wp[i] -= alpha * mi / (std::sqrt(vi) * rc2 + fe);
+			wp[i] -= alpha * mi / (std::sqrt(vi) * rc2 + fe) + decay * wp[i];
 		}
 	}
 };
@@ -3261,6 +3716,47 @@ inline double AUROC(const std::vector<std::pair<double, int>> &scored) {
 	return (rank_sum - double(npos) * double(npos + 1) / 2.0) / (double(npos) * double(nneg));
 }
 
+// Average precision: the area under the precision-recall curve.
+//
+// AUROC answers "does a positive usually outrank a negative", which stays
+// flattering when positives are rare: a model can rank well and still be useless
+// at any threshold anyone would deploy. Average precision is what degrades
+// visibly there, and the number to beat is the positive rate itself, which is
+// what a coin achieves.
+inline double AveragePrecision(const std::vector<std::pair<double, int>> &scored) {
+	std::vector<std::pair<double, int>> v(scored);
+	// Descending by score. Ties share a threshold, so they are consumed together
+	// or the result would depend on the order they happen to arrive in.
+	std::sort(v.begin(), v.end(), [](const std::pair<double, int> &a,
+	                                 const std::pair<double, int> &b) { return a.first > b.first; });
+	int64_t npos = 0;
+	for (const auto &p : v) {
+		npos += p.second ? 1 : 0;
+	}
+	if (npos == 0 || (size_t)npos == v.size()) {
+		return std::numeric_limits<double>::quiet_NaN(); // undefined, not zero
+	}
+	double sum = 0.0;
+	int64_t tp = 0, seen = 0;
+	size_t i = 0;
+	while (i < v.size()) {
+		size_t j = i;
+		int64_t block_pos = 0;
+		while (j < v.size() && v[j].first == v[i].first) {
+			block_pos += v[j].second ? 1 : 0;
+			j++;
+		}
+		tp += block_pos;
+		seen += (int64_t)(j - i);
+		if (block_pos) {
+			// Every positive in the tie gets the precision at the end of the block.
+			sum += double(block_pos) * (double(tp) / double(seen));
+		}
+		i = j;
+	}
+	return sum / double(npos);
+}
+
 inline double MAE(const std::vector<std::pair<double, double>> &pred_true) {
 	if (pred_true.empty()) {
 		return 0.0;
@@ -3294,6 +3790,52 @@ struct Dataset {
 	}
 };
 
+// The 60/20/20 split by anchor, or the boundaries an explicit SPLIT names.
+// Always forward in time, never a shuffle, so validation and test sit after
+// everything the model was fitted on.
+//
+// One definition, because anything that wants to reproduce the folds later (to
+// explain a model on rows it did not learn from, say) has to agree with training
+// exactly or it is measuring something else.
+inline void TemporalSplit(const Dataset &ds, const Statement &stmt, std::vector<size_t> &tr,
+                          std::vector<size_t> &va, std::vector<size_t> &te) {
+	tr.clear();
+	va.clear();
+	te.clear();
+	std::vector<size_t> order(ds.examples.size());
+	for (size_t i = 0; i < order.size(); i++) {
+		order[i] = i;
+	}
+	std::sort(order.begin(), order.end(),
+	          [&](size_t a, size_t b) { return ds.examples[a].anchor < ds.examples[b].anchor; });
+	if (stmt.split.present) {
+		const double v = stmt.split.validate_from.number, t = stmt.split.test_from.number;
+		for (size_t i : order) {
+			const double a = ds.examples[i].anchor;
+			if (a < v) {
+				tr.push_back(i);
+			} else if (a < t) {
+				va.push_back(i);
+			} else {
+				te.push_back(i);
+			}
+		}
+		return;
+	}
+	const size_t n = order.size();
+	const size_t c1 = n > 10 ? (n * 6) / 10 : n;
+	const size_t c2 = n > 10 ? (n * 8) / 10 : n;
+	for (size_t i = 0; i < n; i++) {
+		if (i < c1) {
+			tr.push_back(order[i]);
+		} else if (i < c2) {
+			va.push_back(order[i]);
+		} else {
+			te.push_back(order[i]);
+		}
+	}
+}
+
 // Resolve the anchor column: explicit AT wins, otherwise the entity's own time
 // column. Attribute prediction with no time anywhere is legitimate and yields a
 // single non-temporal snapshot.
@@ -3319,10 +3861,16 @@ inline int ResolveAnchorColumn(const Frame &entity, const Statement &stmt) {
 // statistics. Fitting mean/sd over every row, including the folds the model will
 // be scored on, is transductive: harmless-looking, but it leaks the shape of the
 // test distribution into training.
-inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const Statement &,
+inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const Statement &stmt,
                                   int anchor_col, int target_col, int max_mean_cols,
+                                  int max_categories = 16,
                                   double train_cutoff = std::numeric_limits<double>::infinity()) {
 	FeatureSpec spec;
+	// Only when the anchor is a real instant. An attribute model with no clock
+	// anywhere has nothing to take a phase of.
+	spec.anchor_cycles =
+	    stmt.every.present ||
+	    (anchor_col >= 0 && entity.columns[(size_t)anchor_col].type == ColType::TIMESTAMP);
 	std::vector<bool> excluded(entity.columns.size(), false);
 	if (anchor_col >= 0) {
 		excluded[(size_t)anchor_col] = true;
@@ -3419,6 +3967,18 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 		sc.mean = mean;
 		sc.sd = sd > 1e-9 ? sd : 1.0;
 		spec.self_cols.push_back(sc);
+	}
+	// Text columns, counted over the training fold only like every other
+	// statistic here, so the encoding never sees a validation or test row.
+	for (size_t i = 0; i < entity.columns.size(); i++) {
+		if (excluded[i] || entity.columns[i].type != ColType::CATEGORY) {
+			continue;
+		}
+		const Column *anch = anchor_col >= 0 ? &entity.columns[(size_t)anchor_col] : nullptr;
+		FeatureSpec::CatCol cc;
+		if (FitCatCol(entity, i, anch, train_cutoff, max_categories, cc)) {
+			spec.cat_cols.push_back(cc);
+		}
 	}
 	for (size_t l = 0; l < db.links.size(); l++) {
 		const Link &lk = db.links[l];
@@ -4234,9 +4794,24 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 
 // Gather for the two-hop case: the entity's message is the mean of its
 // children's EMBEDDINGS (plus degree), not of their raw columns.
-inline void SageGather2(const SageSpec &spec, const ChildEmbed &ce, const Dataset &ds,
-                        const std::vector<size_t> &idx, size_t from, int B, int C,
-                        const VisibleCounts &vc, SageScratch &sc) {
+inline void SageGather2(const SageSpec &spec, const SageFeatures &feat, const ChildEmbed &ce,
+                        const Dataset &ds, const std::vector<size_t> &idx, size_t from, int B,
+                        int C, const SageParams &params, const VisibleCounts &vc,
+                        SageScratch &sc) {
+	// The entity's own columns, exactly as the one-hop gather collects them. This
+	// used to be left out here, so xself stayed at the zeros the arena handed
+	// back: two-hop models saw none of the entity's own attributes, and w_self
+	// took a zero gradient every step and never moved off its initialisation.
+	if (params.self_dim > 0) {
+		const int sd = std::max(1, params.self_dim);
+		const float *xsrc = feat.x[(size_t)spec.entity_node].data();
+		for (int i = 0; i < B; i++) {
+			const Example &ex = ds.examples[idx[from + (size_t)i]];
+			std::memcpy(sc.xself + (size_t)i * (size_t)sd,
+			            xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
+			            sizeof(float) * (size_t)params.self_dim);
+		}
+	}
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const int d = C + 1;
 		for (int i = 0; i < B; i++) {
@@ -4527,8 +5102,11 @@ struct TrainReport {
 	size_t n_positives = 0; // classification only; 0 here explains a NaN metric
 	size_t n_censored = 0;  // dropped: label window ran past the data
 	size_t n_no_anchor = 0; // dropped: the anchor column was NULL
-	double baseline_metric = 0; // persistence, so a user can see what to beat
+	// What a model with no information gets, so the metric beside it means
+	// something: persistence for a forecast, the positive rate for a classifier.
+	double baseline_metric = 0;
 	double val_metric = 0, test_metric = 0;
+	double pr_auc = std::numeric_limits<double>::quiet_NaN(); // classification only
 	std::string metric_name = "auroc";
 	int epochs_run = 0;
 	int width = 0;
@@ -4610,7 +5188,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		}
 	}
 	model.features =
-	    FitFeatureSpec(db, entity, stmt, anchor_col, target_col, max_mean_cols, train_cutoff);
+	    FitFeatureSpec(db, entity, stmt, anchor_col, target_col, max_mean_cols,
+	                   (int)stmt.options.Num("MAX_CATEGORIES", 16), train_cutoff);
 	const AggCache cache = BuildAggCache(db, model.features);
 	Dataset ds = CollectExamples(db, stmt, model.features, cache, anchor_col, true);
 	if (ds.examples.empty()) {
@@ -4645,39 +5224,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 
 	// Temporal split. Without an explicit SPLIT, hold out the latest 20% by
 	// anchor so validation is always forward in time, never a random shuffle.
-	std::vector<size_t> order(ds.examples.size());
-	for (size_t i = 0; i < order.size(); i++) {
-		order[i] = i;
-	}
-	std::sort(order.begin(), order.end(),
-	          [&](size_t a, size_t b) { return ds.examples[a].anchor < ds.examples[b].anchor; });
 	std::vector<size_t> tr, va, te;
-	if (stmt.split.present) {
-		const double v = stmt.split.validate_from.number, t = stmt.split.test_from.number;
-		for (size_t i : order) {
-			const double a = ds.examples[i].anchor;
-			if (a < v) {
-				tr.push_back(i);
-			} else if (a < t) {
-				va.push_back(i);
-			} else {
-				te.push_back(i);
-			}
-		}
-	} else {
-		const size_t n = order.size();
-		const size_t c1 = n > 10 ? (n * 6) / 10 : n;
-		const size_t c2 = n > 10 ? (n * 8) / 10 : n;
-		for (size_t i = 0; i < n; i++) {
-			if (i < c1) {
-				tr.push_back(order[i]);
-			} else if (i < c2) {
-				va.push_back(order[i]);
-			} else {
-				te.push_back(order[i]);
-			}
-		}
-	}
+	TemporalSplit(ds, stmt, tr, va, te);
 	// Now that the folds exist, decide the task type from training labels alone.
 	{
 		const bool countish = stmt.target.kind == TargetKind::COUNT ||
@@ -4738,6 +5286,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	const int hidden = (int)stmt.options.Num("HIDDEN", 64);
 	const int epochs = (int)stmt.options.Num("EPOCHS", 60);
 	const double lr = stmt.options.Num("LR", 0.01);
+	const double wd = stmt.options.Num("L2", 0.0);
 	const uint64_t seed = (uint64_t)stmt.options.Num("SEED", 42);
 	const int width = model.features.width;
 	model.Init(width, hidden, seed);
@@ -4815,7 +5364,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			for (size_t b = 0; b < fold.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, fold.size() - b);
 				if (n_layers >= 2) {
-					SageGather2(model.sage_spec, ce, ds, fold, b, B, C, vcounts, sc);
+					SageGather2(model.sage_spec, feats, ce, ds, fold, b, B, C, model.sage_params,
+					            vcounts, sc);
 				} else {
 					SageGather(db, model.sage_spec, feats, prefix, ds, fold, b, B,
 					           model.sage_params, vcounts, sc);
@@ -4847,7 +5397,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			for (size_t b = 0; b < tr.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, tr.size() - b);
 				if (n_layers >= 2) {
-					SageGather2(model.sage_spec, ce, ds, tr, b, B, C, vcounts, sc);
+					SageGather2(model.sage_spec, feats, ce, ds, tr, b, B, C, model.sage_params,
+					            vcounts, sc);
 				} else {
 					SageGather(db, model.sage_spec, feats, prefix, ds, tr, b, B,
 					           model.sage_params, vcounts, sc);
@@ -4872,17 +5423,18 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 					              ce, ds, tr, b, B, sc, cg, cbs, vcounts);
 				}
 				const float inv = 1.0f / float(std::max(1, B));
-				auto step = [&](std::vector<float> &w, std::vector<float> &g, Adam &opt) {
+				auto step = [&](std::vector<float> &w, std::vector<float> &g, Adam &opt,
+				                double decay) {
 					for (auto &v : g) {
 						v *= inv;
 					}
-					opt.Step(w, g.data(), lr);
+					opt.Step(w, g.data(), lr, decay);
 				};
-				step(model.sage_params.w_self, gr.gw_self, opts[0]);
-				step(model.sage_params.bias, gr.gbias, opts[1]);
-				step(model.sage_params.w_out, gr.gw_out, opts[2]);
+				step(model.sage_params.w_self, gr.gw_self, opts[0], wd);
+				step(model.sage_params.bias, gr.gbias, opts[1], 0.0);
+				step(model.sage_params.w_out, gr.gw_out, opts[2], wd);
 				for (size_t e = 0; e < gr.gw_neigh.size(); e++) {
-					step(model.sage_params.w_neigh[e], gr.gw_neigh[e], opts[3 + e]);
+					step(model.sage_params.w_neigh[e], gr.gw_neigh[e], opts[3 + e], wd);
 				}
 				if (n_layers >= 2) {
 					size_t need = 0;
@@ -4894,10 +5446,10 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 					}
 					size_t oi = 0;
 					for (size_t e = 0; e < cg.gw_self.size(); e++) {
-						step(model.sage_child.w_self[e], cg.gw_self[e], copts[oi++]);
-						step(model.sage_child.bias[e], cg.gbias[e], copts[oi++]);
+						step(model.sage_child.w_self[e], cg.gw_self[e], copts[oi++], wd);
+						step(model.sage_child.bias[e], cg.gbias[e], copts[oi++], 0.0);
 						for (size_t g = 0; g < cg.gw_gc[e].size(); g++) {
-							step(model.sage_child.w_gc[e][g], cg.gw_gc[e][g], copts[oi++]);
+							step(model.sage_child.w_gc[e][g], cg.gw_gc[e][g], copts[oi++], wd);
 						}
 					}
 				}
@@ -4952,10 +5504,15 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			score(te, scores);
 			if (binary) {
 				std::vector<std::pair<double, int>> sc2;
+				int64_t pos = 0;
 				for (size_t i = 0; i < te.size(); i++) {
-					sc2.emplace_back(scores[i], ds.examples[te[i]].label > 0.5 ? 1 : 0);
+					const int y = ds.examples[te[i]].label > 0.5 ? 1 : 0;
+					sc2.emplace_back(scores[i], y);
+					pos += y;
 				}
 				rep.test_metric = AUROC(sc2);
+				rep.pr_auc = AveragePrecision(sc2);
+				rep.baseline_metric = te.empty() ? 0.0 : double(pos) / double(te.size());
 			} else {
 				std::vector<std::pair<double, double>> pt;
 				double be = 0;
@@ -5126,11 +5683,11 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			}
 			gb3[0] *= scale;
 
-			a1.Step(model.w1, gw1, lr);
+			a1.Step(model.w1, gw1, lr, wd);
 			ab1.Step(model.b1, gb1, lr);
-			a2.Step(model.w2, gw2, lr);
+			a2.Step(model.w2, gw2, lr, wd);
 			ab2.Step(model.b2, gb2, lr);
-			a3.Step(model.w3, gw3, lr);
+			a3.Step(model.w3, gw3, lr, wd);
 			ab3.Step(model.b3, gb3, lr);
 		}
 		rep.epochs_run = ep + 1;
@@ -5187,10 +5744,15 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		ScoreRows(model, ds, te, escratch, scores);
 		if (binary) {
 			std::vector<std::pair<double, int>> sc;
+			int64_t pos = 0;
 			for (size_t i = 0; i < te.size(); i++) {
-				sc.emplace_back(scores[i], ds.examples[te[i]].label > 0.5 ? 1 : 0);
+				const int y = ds.examples[te[i]].label > 0.5 ? 1 : 0;
+				sc.emplace_back(scores[i], y);
+				pos += y;
 			}
 			rep.test_metric = AUROC(sc);
+			rep.pr_auc = AveragePrecision(sc);
+			rep.baseline_metric = te.empty() ? 0.0 : double(pos) / double(te.size());
 		} else {
 			std::vector<std::pair<double, double>> pt;
 			double base_err = 0;
@@ -5283,23 +5845,7 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 	out.reserve(ds.examples.size());
 	if (model.sage) {
 		SageSpec spec_s = model.sage_spec;
-		// Re-resolve the links: indices are per-statement, as with the dense path.
-		for (auto &et : spec_s.edges) {
-			const std::string ct = db.tables[(size_t)spec_s.nodes[(size_t)et.src_node].table].name;
-			int found = -1;
-			for (size_t l = 0; l < db.links.size(); l++) {
-				if (ToUpper(db.links[l].child_table) == ToUpper(ct) &&
-				    ToUpper(db.links[l].parent_table) == ToUpper(entity.name)) {
-					found = (int)l;
-					break;
-				}
-			}
-			if (found < 0) {
-				throw std::runtime_error("pql: the link from '" + ct + "' used by this model is "
-				                         "not available");
-			}
-			et.link = found;
-		}
+		RebindSageSpec(db, entity, spec_s);
 		const SageFeatures feats = BuildSageFeatures(db, spec_s);
 		const SagePrefix prefix = BuildSagePrefix(db, spec_s, feats);
 		VisibleCounts vcounts;
@@ -5372,6 +5918,142 @@ struct BacktestRow {
 // label that actually materialised. This is the same machinery training uses,
 // with labels kept rather than discarded, so a backtest cannot silently diverge
 // from how the model was scored.
+// How much the model leans on each feature.
+//
+// Permutation importance: shuffle one feature group across rows, leaving every
+// other feature and the labels exactly where they were, and see how much worse
+// the model scores. A feature it does not use costs nothing to destroy. This is
+// measured, not read off the weights, so it accounts for what the network
+// actually does with a feature rather than how large its first-layer weights
+// happen to be.
+//
+// Scored over every replayable row, which includes rows the model trained on, so
+// these are "what does it use", not "how well does it generalise". `test` and
+// BACKTEST answer the second question.
+struct FeatureImportance {
+	std::string feature;
+	int slots = 0;
+	double drop = 0; // metric lost when this group is shuffled; higher means more used
+};
+
+inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model &model,
+                                                 const Statement &stmt) {
+	if (model.sage) {
+		throw std::runtime_error("pql: EXPLAIN reads the dense feature vector, and this model was "
+		                         "trained with arch='sage', whose inputs are gathered from the "
+		                         "graph per batch. Train with the default arch to explain it.");
+	}
+	Statement eff = model.spec_stmt;
+	eff.kind = StmtKind::BACKTEST;
+	if (!stmt.entity_table.empty()) {
+		eff.entity_table = stmt.entity_table;
+	}
+	if (stmt.filter) {
+		eff.filter = stmt.filter->Copy();
+	}
+	const Frame &entity = db.At(eff.entity_table);
+	ValidateFilterScope(eff.filter.get(), entity, eff.entity_alias, "WHERE");
+	const int anchor_col = ResolveAnchorColumn(entity, eff);
+
+	FeatureSpec spec = model.features;
+	spec.Rebind(db, entity);
+	const AggCache cache = BuildAggCache(db, spec);
+	Dataset ds = CollectExamples(db, eff, spec, cache, anchor_col, /*need_labels=*/true);
+	// The same fold training held out. Shuffling a feature on rows the model was
+	// fitted on rewards memorised noise: a column of random numbers looked as
+	// important as a real driver until this used the test fold instead.
+	std::vector<size_t> tr, va, all;
+	TemporalSplit(ds, eff, tr, va, all);
+	if (all.size() < 8) {
+		all.clear();
+		for (size_t i = 0; i < ds.examples.size(); i++) {
+			all.push_back(i);
+		}
+	}
+	const size_t n = all.size();
+	if (n < 8) {
+		throw std::runtime_error("pql: too few rows to explain this model");
+	}
+	EvalScratch es;
+	std::vector<double> preds;
+	auto measure = [&]() {
+		ScoreRows(model, ds, all, es, preds);
+		if (model.classification) {
+			std::vector<std::pair<double, int>> sc;
+			sc.reserve(n);
+			for (size_t i = 0; i < n; i++) {
+				sc.emplace_back(preds[i], ds.examples[all[i]].label > 0.5 ? 1 : 0);
+			}
+			return AUROC(sc);
+		}
+		std::vector<std::pair<double, double>> pt;
+		pt.reserve(n);
+		for (size_t i = 0; i < n; i++) {
+			pt.emplace_back(preds[i], ds.examples[all[i]].label);
+		}
+		return MAE(pt);
+	};
+	const double base = measure();
+
+	// One shuffle, reused for every group, so the groups are compared against the
+	// same disturbance rather than against different random draws.
+	std::vector<size_t> perm(n);
+	for (size_t i = 0; i < n; i++) {
+		perm[i] = i;
+	}
+	uint64_t rng = 0x9E3779B97F4A7C15ull;
+	for (size_t i = n; i > 1; i--) {
+		rng ^= rng << 13;
+		rng ^= rng >> 7;
+		rng ^= rng << 17;
+		std::swap(perm[i - 1], perm[rng % i]);
+	}
+
+	const int width = ds.width;
+	std::vector<FeatureImportance> out;
+	std::vector<float> saved, shuffled;
+	size_t k = 0;
+	for (const auto &g : spec.Describe()) {
+		const int w = g.second;
+		if (k + (size_t)w > (size_t)width) {
+			break; // the description and the layout disagree; say nothing rather than lie
+		}
+		saved.assign(n * (size_t)w, 0.0f);
+		shuffled.assign(n * (size_t)w, 0.0f);
+		for (size_t i = 0; i < n; i++) {
+			std::memcpy(&saved[i * (size_t)w], &ds.x[all[i] * (size_t)width + k],
+			            sizeof(float) * (size_t)w);
+		}
+		for (size_t i = 0; i < n; i++) {
+			std::memcpy(&shuffled[i * (size_t)w], &saved[perm[i] * (size_t)w],
+			            sizeof(float) * (size_t)w);
+		}
+		for (size_t i = 0; i < n; i++) {
+			std::memcpy(&ds.x[all[i] * (size_t)width + k], &shuffled[i * (size_t)w],
+			            sizeof(float) * (size_t)w);
+		}
+		const double m = measure();
+		for (size_t i = 0; i < n; i++) {
+			std::memcpy(&ds.x[all[i] * (size_t)width + k], &saved[i * (size_t)w],
+			            sizeof(float) * (size_t)w);
+		}
+		FeatureImportance fi;
+		fi.feature = g.first;
+		fi.slots = w;
+		// AUROC is better when larger, MAE when smaller.
+		fi.drop = model.classification ? base - m : m - base;
+		out.push_back(fi);
+		k += (size_t)w;
+	}
+	std::sort(out.begin(), out.end(), [](const FeatureImportance &a, const FeatureImportance &b) {
+		if (a.drop != b.drop) {
+			return a.drop > b.drop;
+		}
+		return a.feature < b.feature;
+	});
+	return out;
+}
+
 inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &model,
                                             const Statement &stmt) {
 	Statement eff = model.spec_stmt;
@@ -5394,16 +6076,7 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 	std::vector<double> preds;
 	if (model.sage) {
 		SageSpec ss = model.sage_spec;
-		for (auto &et : ss.edges) {
-			const std::string ct = db.tables[(size_t)ss.nodes[(size_t)et.src_node].table].name;
-			for (size_t l = 0; l < db.links.size(); l++) {
-				if (ToUpper(db.links[l].child_table) == ToUpper(ct) &&
-				    ToUpper(db.links[l].parent_table) == ToUpper(entity.name)) {
-					et.link = (int)l;
-					break;
-				}
-			}
-		}
+		RebindSageSpec(db, entity, ss);
 		const SageFeatures feats = BuildSageFeatures(db, ss);
 		const SagePrefix pre = BuildSagePrefix(db, ss, feats);
 		VisibleCounts vcounts;

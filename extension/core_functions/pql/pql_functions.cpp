@@ -691,11 +691,16 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 		filter_cols.insert(pql::ToUpper(stmt.target.ref.name));
 	}
 
+	const std::string entity_up = pql::ToUpper(stmt.entity_table);
+
 	pql::Database db;
 	for (const auto &t : schema) {
 		if (!want.count(pql::ToUpper(t.name))) {
 			continue;
 		}
+		// The entity's own text columns are features, so they are read. Elsewhere a
+		// text column is still only read when a filter or a key names it.
+		const bool is_entity = pql::ToUpper(t.name) == entity_up;
 		std::vector<size_t> keep;
 		for (size_t c = 0; c < t.columns.size(); c++) {
 			const pql::ColType ty = t.types[c];
@@ -703,9 +708,9 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 				continue;
 			}
 			const std::string up = pql::ToUpper(t.columns[c]);
-			bool needed = ty != pql::ColType::CATEGORY; // numerics and times are features
+			bool needed = ty != pql::ColType::CATEGORY || is_entity;
 			if (!needed && filter_cols.count(up)) {
-				needed = true; // a text column only matters if something names it
+				needed = true;
 			}
 			if (!needed) {
 				for (const auto &fk : all_fks) {
@@ -761,12 +766,12 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 	}
 	bind.names = {Identifier("model"),     Identifier("target"),    Identifier("train_rows"), Identifier("val_rows"),
 	              Identifier("test_rows"), Identifier("positives"), Identifier("metric"),     Identifier("val"),
-	              Identifier("test"),      Identifier("baseline"),  Identifier("censored"),   Identifier("no_anchor"),
-	              Identifier("features"),  Identifier("epochs")};
+	              Identifier("test"),      Identifier("pr_auc"),    Identifier("baseline"),   Identifier("censored"),
+	              Identifier("no_anchor"), Identifier("features"),  Identifier("epochs")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
 	              LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::DOUBLE,
-	              LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,  LogicalType::BIGINT,
-	              LogicalType::BIGINT,  LogicalType::BIGINT};
+	              LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
+	              LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};
 	// An undefined metric (single-class fold) surfaces as NULL, not as a number.
 	auto metric_value = [](double v) {
 		return std::isnan(v) ? Value(LogicalType::DOUBLE) : Value::DOUBLE(v);
@@ -774,7 +779,7 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 	bind.rows.push_back({Value(stmt.model), Value(stmt.target.ToString()), Value::BIGINT((int64_t)rep.n_train),
 	                     Value::BIGINT((int64_t)rep.n_val), Value::BIGINT((int64_t)rep.n_test),
 	                     Value::BIGINT((int64_t)rep.n_positives), Value(rep.metric_name), metric_value(rep.val_metric),
-	                     metric_value(rep.test_metric),
+	                     metric_value(rep.test_metric), metric_value(rep.pr_auc),
 	                     rep.baseline_metric > 0 ? Value::DOUBLE(rep.baseline_metric) : Value(LogicalType::DOUBLE),
 	                     Value::BIGINT((int64_t)rep.n_censored), Value::BIGINT((int64_t)rep.n_no_anchor),
 	                     Value::BIGINT(rep.width), Value::BIGINT(rep.epochs_run)});
@@ -889,6 +894,31 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 }
 
 // Replay a model and show, per row, what it predicted and what happened.
+static void RunExplainStmt(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
+	std::shared_ptr<const pql::Model> model;
+	{
+		auto entry = GetRegistryEntry(context);
+		std::lock_guard<std::mutex> guard(entry->lock);
+		model = entry->registry.Get(stmt.model);
+	}
+	if (!model) {
+		throw InvalidInputException("pql: no model named '%s'; TRAIN it first", stmt.model);
+	}
+	pql::Statement effective = stmt;
+	if (effective.entity_table.empty()) {
+		effective.entity_table = model->spec_stmt.entity_table;
+	}
+	pql::Database db = LoadDatabase(context, effective);
+	auto imp = pql::RunExplain(db, *model, effective);
+	bind.names = {Identifier("feature"), Identifier("slots"), Identifier("importance")};
+	bind.types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::DOUBLE};
+	for (const auto &f : imp) {
+		bind.rows.push_back({Value(f.feature), Value::BIGINT((int64_t)f.slots),
+		                     std::isnan(f.drop) ? Value(LogicalType::DOUBLE)
+		                                        : Value::DOUBLE(f.drop)});
+	}
+}
+
 static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
 	std::shared_ptr<const pql::Model> model;
 	{
@@ -1012,6 +1042,9 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 	case pql::StmtKind::BACKTEST:
 		RunBacktestStmt(context, stmt, *bind);
 		break;
+	case pql::StmtKind::EXPLAIN:
+		RunExplainStmt(context, stmt, *bind);
+		break;
 	case pql::StmtKind::SHOW_MODELS:
 		RunShowModels(context, *bind);
 		break;
@@ -1104,7 +1137,10 @@ static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const 
 	}
 	const std::string first = pql::ToUpper(tokens[0].text);
 	const std::string second = tokens.size() > 1 ? pql::ToUpper(tokens[1].text) : "";
+	// EXPLAIN is matched only with MODEL after it, so DuckDB's own EXPLAIN keeps
+	// working on every other statement.
 	const bool ours = first == "TRAIN" || first == "PREDICT" || (first == "BACKTEST" && second == "MODEL") ||
+	                  (first == "EXPLAIN" && second == "MODEL") ||
 	                  (first == "DROP" && second == "MODEL") || (first == "SHOW" && second == "MODELS");
 	if (!ours) {
 		return ParserExtensionParseResult();
