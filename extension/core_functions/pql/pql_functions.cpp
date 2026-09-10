@@ -390,15 +390,26 @@ static std::vector<TableSchema> LoadSchema(Connection &con) {
 				out.push_back(TableSchema {sn, tn, {}, {}});
 			}
 			pql::ColType t = pql::ColType::INVALID;
-			if (ty.find("TIMESTAMP") != std::string::npos || ty.find("DATE") != std::string::npos) {
+			// Composite types first. Matching on a substring alone read BIGINT[] and
+			// STRUCT(a INTEGER, ...) and INTERVAL as integers, because all three
+			// contain "INT", and the cast that followed failed and took the whole
+			// table with it: one list column anywhere made PQL unusable on it.
+			const bool composite =
+			    ty.find('[') != std::string::npos || ty.rfind("STRUCT", 0) == 0 ||
+			    ty.rfind("MAP", 0) == 0 || ty.rfind("UNION", 0) == 0 || ty.rfind("LIST", 0) == 0 ||
+			    ty.rfind("ARRAY", 0) == 0 || ty.rfind("INTERVAL", 0) == 0;
+			if (composite) {
+				t = pql::ColType::INVALID; // not a quantity and not a label; skipped
+			} else if (ty.find("TIMESTAMP") != std::string::npos ||
+			           ty.rfind("DATE", 0) == 0) {
 				t = pql::ColType::TIMESTAMP;
 			} else if (ty.find("BOOLEAN") != std::string::npos) {
 				t = pql::ColType::BOOL;
-			} else if (ty.find("INT") != std::string::npos) {
-				t = pql::ColType::INT64;
 			} else if (ty.find("DOUBLE") != std::string::npos || ty.find("FLOAT") != std::string::npos ||
 			           ty.find("DECIMAL") != std::string::npos || ty.find("REAL") != std::string::npos) {
 				t = pql::ColType::DOUBLE;
+			} else if (ty.find("INT") != std::string::npos) {
+				t = pql::ColType::INT64;
 			} else if (ty.find("VARCHAR") != std::string::npos || ty.find("CHAR") != std::string::npos ||
 			           ty.find("TEXT") != std::string::npos) {
 				t = pql::ColType::CATEGORY;

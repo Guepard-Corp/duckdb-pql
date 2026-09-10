@@ -593,6 +593,13 @@ reached. `EXPLAIN MODEL` is a separate thing and is described above.)
 
 **Models** live for the session: not persisted, not transactional.
 
+**Reproducibility is per build.** The same statement on the same data gives the
+same model every time within one binary, which is tested. It is not bit-identical
+across compilers or optimisation levels: the kernels let the compiler reassociate
+float addition, and `-O0` and `-O2` differ around the ninth significant digit.
+Nothing is fitted to that precision, but do not diff metrics across builds and
+expect zeros.
+
 **Time zones.** `TIMESTAMP WITH TIME ZONE` reads through the session zone, so a
 model trained in one session and used in another with a different zone has
 shifted anchors.

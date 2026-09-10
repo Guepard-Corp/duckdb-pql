@@ -372,3 +372,39 @@ statement error
 TRAIN MODEL nolink PREDICT COUNT(unrelated) FOR addresses AT seen_on HORIZON 30 DAYS;
 ----
 <REGEX>:.*no foreign key connects 'unrelated' to 'addresses'.*
+
+# ---------------------------------------------------------------------------
+# Column types the loader was not expecting.
+# ---------------------------------------------------------------------------
+
+# BIGINT[], STRUCT(a INTEGER, ...) and INTERVAL all contain "INT", and matching
+# the type name by substring read them as integers. The cast that followed
+# failed and took the whole table with it, so one list column anywhere made PQL
+# unusable on that table.
+statement ok
+CREATE TABLE widgets AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts,
+         (i % 2) = 0 AS flag, ((i % 97) * 1.5)::DECIMAL(18,4) AS price,
+         (i::HUGEINT * 1000000) AS big, (i % 100)::TINYINT AS small,
+         'ab'::BLOB AS raw, [1, 2, i] AS tags, {'a': i, 'b': 'z'} AS meta,
+         INTERVAL '1 hour' AS window_len,
+         ['red', 'green', 'blue'][1 + (i % 3)] AS colour
+  FROM range(1500) t(i);
+
+statement ok
+CREATE TABLE widget_hits AS
+  SELECT row_number() OVER () AS id, w.id AS widgets_id,
+         w.ts - INTERVAL '1 day' * (k + 1) AS seen
+  FROM widgets w, range(5) r(k) WHERE k < (w.id % 5);
+
+statement ok
+TRAIN MODEL wtypes PREDICT COUNT(widget_hits) FOR widgets AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# the scalar columns became features; the list, struct, interval, blob did not
+query T
+SELECT string_agg(feature, ', ' ORDER BY feature)
+FROM pql_exec('EXPLAIN MODEL wtypes')
+WHERE feature NOT LIKE 'widget_hits%' AND feature NOT LIKE 'anchor%';
+----
+big, colour (category), flag, price, small
