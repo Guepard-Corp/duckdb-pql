@@ -1006,10 +1006,11 @@ private:
 				throw ParseError("ARCH must be 'mlp' or 'sage'", 0);
 			}
 		}
-		static const Bound bounds[] = {{"EPOCHS", 1, 100000},  {"HIDDEN", 1, 1024},
-		                               {"LAYERS", 1, 2},
-		                               {"LR", 1e-6, 1.0},      {"BATCH", 1, 65536},
-		                               {"MEAN_COLS", 0, 64},   {nullptr, 0, 0}};
+		static const Bound bounds[] = {{"EPOCHS", 1, 100000},      {"HIDDEN", 1, 1024},
+		                               {"LAYERS", 1, 2},           {"LR", 1e-6, 1.0},
+		                               {"BATCH", 1, 65536},        {"MEAN_COLS", 0, 64},
+		                               {"MAX_CATEGORIES", 0, 4096}, {"L2", 0.0, 1.0},
+		                               {nullptr, 0, 0}};
 		for (int i = 0; bounds[i].key; i++) {
 			if (!st.options.Has(bounds[i].key)) {
 				continue;
@@ -1161,6 +1162,20 @@ private:
 
 	Literal ParseLiteral() {
 		Literal l;
+		// A sign in front of a number. Without this, `WHERE balance < -100` was a
+		// syntax error, and no schema holding a negative quantity could be
+		// filtered at all.
+		if (Peek().kind == Tok::PUNCT && (Peek().text == "-" || Peek().text == "+") &&
+		    Peek(1).kind == Tok::NUMBER) {
+			const bool neg = Peek().text == "-";
+			Next();
+			const Token &num = Peek();
+			l.kind = Literal::Kind::NUMBER;
+			l.number = neg ? -num.number : num.number;
+			l.text = (neg ? "-" : "") + num.text;
+			Next();
+			return l;
+		}
 		const Token &t = Peek();
 		if (t.kind == Tok::NUMBER) {
 			l.kind = Literal::Kind::NUMBER;
@@ -3279,6 +3294,27 @@ struct Model {
 		for (auto &v : w3) {
 			v = float((rnd() * 2 - 1) * s2);
 		}
+	}
+
+	// Roughly how much memory this model holds, for the cache accounting DuckDB
+	// asks for. Weights only: the training data is never retained.
+	size_t ApproxBytes() const {
+		size_t f = w1.size() + b1.size() + w2.size() + b2.size() + w3.size() + b3.size();
+		if (sage) {
+			f += sage_params.ParamCount() + sage_child.ParamCount();
+		}
+		size_t bytes = f * sizeof(float);
+		// The feature spec is small but not free: a text column keeps one label
+		// per category, and a high-cardinality one keeps thousands.
+		for (const auto &cc : features.cat_cols) {
+			bytes += cc.labels.size() * 24;
+			for (const auto &l : cc.labels) {
+				bytes += l.size();
+			}
+			bytes += (cc.slot_by_code.size() + cc.freq_by_code.size()) * 4;
+		}
+		bytes += features.self_cols.size() * 48 + features.link_aggs.size() * 96;
+		return bytes;
 	}
 
 };

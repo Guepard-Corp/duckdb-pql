@@ -369,11 +369,12 @@ short, so no label is cut off by the end of the data.
 ### Filters
 
 `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IN (...)`, `NOT IN (...)`,
-`IS [NOT] NULL`, combined with `AND`, `OR`, `NOT` and parentheses. Quoted dates
-work wherever a timestamp belongs:
+`IS [NOT] NULL`, combined with `AND`, `OR`, `NOT` and parentheses. Numbers may
+carry a sign. Quoted dates work wherever a timestamp belongs:
 
 ```sql
 PREDICT COUNT(sales) FOR products WHERE as_of = '2026-04-01' USING MODEL demand;
+PREDICT COUNT(txns) FOR accounts WHERE balance < -100 USING MODEL churn;
 ```
 
 ### Options
@@ -388,8 +389,8 @@ PREDICT COUNT(sales) FOR products WHERE as_of = '2026-04-01' USING MODEL demand;
 | `MEAN_COLS` | 3 | 0 to 64 |
 | `ARCH` | `mlp` | `mlp` or `sage` |
 | `LAYERS` | 1 | 1 or 2 (`sage` only) |
-| `MAX_CATEGORIES` | 16 | above this a text column is frequency-encoded, not one slot per value |
-| `L2` | 0 | decoupled weight decay, applied to weights and not biases |
+| `MAX_CATEGORIES` | 16 | 0 to 4096 — above it a text column is frequency-encoded rather than given a slot per value |
+| `L2` | 0 | 0 to 1 — decoupled weight decay, on weights and not biases |
 
 ### Result columns
 

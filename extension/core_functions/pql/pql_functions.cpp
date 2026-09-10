@@ -37,14 +37,18 @@ struct PqlRegistryEntry : public ObjectCacheEntry {
 		return ObjectType();
 	}
 	optional_idx GetEstimatedCacheMemory() const override {
-		// Weights only; the training data is not retained.
+		// Under the lock: DuckDB asks for this from its own thread, and walking the
+		// registry while a TRAIN inserts into it can rehash the map underneath the
+		// iterator. The count also used to miss every graph parameter and the
+		// category labels, so a sage model reported as very nearly nothing.
+		std::lock_guard<std::mutex> guard(lock);
 		idx_t bytes = 0;
 		for (const auto &m : registry.All()) {
-			bytes += (m->w1.size() + m->w2.size() + m->w3.size()) * sizeof(float);
+			bytes += (idx_t)m->ApproxBytes();
 		}
 		return bytes;
 	}
-	std::mutex lock;
+	mutable std::mutex lock;
 	pql::Registry registry;
 };
 

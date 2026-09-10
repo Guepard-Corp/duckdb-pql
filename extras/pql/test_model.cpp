@@ -501,6 +501,79 @@ int main() {
     }
   }
 
+  // ---- M. the boundary at the anchor itself -------------------------------
+  // Features and the persistence baseline read (-inf, t]; the label reads
+  // (t, t + horizon]. An event landing exactly on t therefore belongs to the
+  // past, and to both if either comparison were <= instead of <. This is one
+  // character away from handing the model part of its own answer.
+  {
+    printf("== M. the anchor boundary\n");
+    const double A = 1000.0 * DAY;
+    Database db;
+    Frame users; users.name = "users";
+    // A second entity, anchored much earlier, exists only so the child table
+    // reaches past user 0's horizon. Without it user 0 is censored, correctly:
+    // its label window would run off the end of the data.
+    Column uid = MakeCol("id", ColType::INT64, 2), uts = MakeCol("ts", ColType::TIMESTAMP, 2),
+           ux = MakeCol("x", ColType::DOUBLE, 2);
+    uid.num[0] = 0; uts.num[0] = A;             ux.num[0] = 1.0;
+    uid.num[1] = 1; uts.num[1] = A - 200 * DAY; ux.num[1] = 2.0;
+    users.columns = {uid, uts, ux}; users.nrows = 2;
+    // user 0: one before the anchor, one exactly on it, one after
+    const double when[4] = {A - DAY, A, A + DAY, A + 90 * DAY};
+    const double owner[4] = {0, 0, 0, 1};
+    Frame ev; ev.name = "events";
+    Column ei = MakeCol("id", ColType::INT64, 4), eu = MakeCol("user_id", ColType::INT64, 4),
+           et = MakeCol("ts", ColType::TIMESTAMP, 4);
+    for (int k = 0; k < 4; k++) { ei.num[k] = k; eu.num[k] = owner[k]; et.num[k] = when[k]; }
+    ev.columns = {ei, eu, et}; ev.nrows = 4;
+    db.tables = {users, ev};
+    db.fks.push_back({"events", "user_id", "users", "id"});
+    db.BuildLinks({});
+    auto st = Parse("TRAIN MODEL b PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS");
+    FeatureSpec spec = FitFeatureSpec(db, db.At("users"), st, db.At("users").Find("ts"), -1, 3);
+    AggCache cache = BuildAggCache(db, spec);
+    Dataset ds = CollectExamples(db, st, spec, cache, db.At("users").Find("ts"), true);
+    const Example *found = nullptr;
+    for (const auto &e : ds.examples) { if (e.entity_row == 0) { found = &e; } }
+    if (!found) {
+      printf("   FAIL: user 0 produced no example (of %zu)\n", ds.examples.size()); fails++;
+    } else {
+      const Example &e = *found;
+      printf("   label=%.0f (want 1, only the event after)  base=%.0f (want 2, the other two)\n",
+             e.label, e.base);
+      if (e.label != 1.0) {
+        printf("   FAIL: an event on the anchor must not be in the label\n"); fails++;
+      }
+      if (e.base != 2.0) {
+        printf("   FAIL: an event on the anchor belongs to the past\n"); fails++;
+      }
+    }
+  }
+
+  // ---- N. AUROC against hand-computed values ------------------------------
+  {
+    printf("== N. AUROC\n");
+    struct Case { std::vector<std::pair<double,int>> in; double want; const char *what; };
+    const std::vector<Case> cases = {
+      {{{0.9,1},{0.8,1},{0.7,0},{0.6,0}}, 1.0,  "positives rank above every negative"},
+      {{{0.9,0},{0.8,0},{0.7,1},{0.6,1}}, 0.0,  "and the exact reverse"},
+      {{{0.9,1},{0.8,0},{0.7,1},{0.6,0}}, 0.75, "one negative interleaved"},
+      {{{0.5,1},{0.5,0},{0.5,1},{0.5,0}}, 0.5,  "everything tied is chance"},
+      {{{0.9,1},{0.9,0},{0.1,1},{0.1,0}}, 0.5,  "tied within each half"},
+    };
+    for (const auto &c : cases) {
+      const double got = AUROC(c.in);
+      printf("   %-36s got %.4f want %.4f\n", c.what, got, c.want);
+      if (std::fabs(got - c.want) > 1e-9) { printf("   FAIL\n"); fails++; }
+    }
+    // One class present is undefined, not chance: returning 0.5 made every epoch
+    // tie, so model selection never fired and training kept epoch 1.
+    if (!(AUROC({{0.9,1},{0.8,1}}) != AUROC({{0.9,1},{0.8,1}}))) {
+      printf("   FAIL: a single-class fold must be undefined\n"); fails++;
+    }
+  }
+
   printf("\n%s\n", fails ? "FAILURES" : "all model tests passed");
   return fails ? 1 : 0;
 }

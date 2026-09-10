@@ -294,3 +294,43 @@ TRAIN MODEL ambig PREDICT COUNT(moves) FOR parts AT ts HORIZON 30 DAYS
   OPTIONS (epochs = 5, hidden = 16);
 ----
 <REGEX>:.*more than one schema.*
+
+# ---------------------------------------------------------------------------
+# Negative quantities. `WHERE balance < -100` used to be a syntax error, so no
+# schema holding one could be filtered at all.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE accounts AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS opened,
+         (i % 21) - 10.0 AS balance
+  FROM range(2000) t(i);
+
+statement ok
+CREATE TABLE txns AS
+  SELECT row_number() OVER () AS id, a.id AS accounts_id,
+         a.opened - INTERVAL '1 day' * (k + 1) AS at, 1.0 AS amt
+  FROM accounts a, range(6) r(k) WHERE k < (a.id % 6);
+
+statement ok
+TRAIN MODEL neg PREDICT COUNT(txns) FOR accounts AT opened WHERE balance < -5
+  HORIZON 30 DAYS OPTIONS (epochs = 5, hidden = 16);
+
+# the filter picks the same rows PQL and SQL would each pick alone
+query I
+SELECT CAST((SELECT count(*) FROM pql_exec('PREDICT COUNT(txns) FOR accounts WHERE balance IN (-10, -9) USING MODEL neg'))
+          = (SELECT count(*) FROM accounts WHERE balance IN (-10, -9)) AS INTEGER);
+----
+1
+
+# the options added most recently are bounded like the rest
+statement error
+TRAIN MODEL b PREDICT COUNT(txns) FOR accounts AT opened HORIZON 30 DAYS
+  OPTIONS (max_categories = 99999);
+----
+<REGEX>:.*MAX_CATEGORIES must be between.*
+
+statement error
+TRAIN MODEL b PREDICT COUNT(txns) FOR accounts AT opened HORIZON 30 DAYS OPTIONS (l2 = 1000);
+----
+<REGEX>:.*L2 must be between.*

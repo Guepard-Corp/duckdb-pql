@@ -89,6 +89,23 @@ int main() {
   Ok("PREDICT \"a\"\"b\" FOR users USING MODEL m", "\"a\"\"b\"");
   Ok("TRAIN MODEL m PREDICT COUNT(*) FOR users AT t HORIZON 1 WEEK", "COUNT(*)");
 
+  // A sign in front of a number. Without it `WHERE balance < -100` was a syntax
+  // error, and no schema holding a negative quantity could be filtered at all.
+  std::printf("== signed numbers\n");
+  Ok("PREDICT u.x FOR u WHERE balance < -100 USING MODEL m", "< -100");
+  Ok("PREDICT u.x FOR u WHERE balance IN (-1, -2) USING MODEL m", "IN (-1, -2)");
+  Ok("PREDICT u.x FOR u WHERE balance = -0.5 USING MODEL m", "= -0.5");
+  Ok("PREDICT u.x FOR u WHERE balance > +7 USING MODEL m", "> 7");
+  Ok("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS "
+     "SPLIT TEMPORAL VALIDATE FROM -100 TEST FROM -50", "VALIDATE FROM -100");
+  // The two options added most recently had no bounds at all.
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS OPTIONS (max_categories = 99999)",
+      "MAX_CATEGORIES must be between");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS OPTIONS (l2 = 1000)",
+      "L2 must be between");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT t HORIZON 5 DAYS OPTIONS (l2 = -1)",
+      "L2 must be between");
+
   // Nothing may follow a finished statement. `DROP MODEL a b c` used to drop
   // `a` and discard the rest without a word, which is how DROP MODEL IF EXISTS
   // came to drop a model called IF.
