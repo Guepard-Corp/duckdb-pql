@@ -334,3 +334,41 @@ statement error
 TRAIN MODEL b PREDICT COUNT(txns) FOR accounts AT opened HORIZON 30 DAYS OPTIONS (l2 = 1000);
 ----
 <REGEX>:.*L2 must be between.*
+
+# ---------------------------------------------------------------------------
+# Foreign keys inferred from names, and what happens when the name is wrong.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE addresses AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS seen_on
+  FROM range(600) t(i);
+
+statement ok
+CREATE TABLE deliveries AS
+  SELECT row_number() OVER () AS id, a.id AS address_id,
+         a.seen_on - INTERVAL '1 day' * (k + 1) AS at_time
+  FROM addresses a, range(4) r(k) WHERE k < (a.id % 4);
+
+# addresses -> address needs the -es dropped whole. The single trailing -s rule
+# produced "addresse" and linked nothing, the same way it once produced
+# "categorie" for -ies plurals.
+statement ok
+TRAIN MODEL plural PREDICT COUNT(deliveries) FOR addresses AT seen_on HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# a name that matches no table says so, rather than blaming the foreign keys of
+# a table that was never there
+statement error
+TRAIN MODEL typo PREDICT COUNT(delivries) FOR addresses AT seen_on HORIZON 30 DAYS;
+----
+<REGEX>:.*no table 'delivries' to aggregate over.*
+
+# a real table with no path to the entity still reports the relationship
+statement ok
+CREATE TABLE unrelated AS SELECT i AS id, TIMESTAMP '2024-01-01' AS at_time FROM range(20) t(i);
+
+statement error
+TRAIN MODEL nolink PREDICT COUNT(unrelated) FOR addresses AT seen_on HORIZON 30 DAYS;
+----
+<REGEX>:.*no foreign key connects 'unrelated' to 'addresses'.*

@@ -4349,6 +4349,13 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 			}
 		}
 		if (target_link < 0) {
+			// Say which of the two things went wrong. A typo in the table name used
+			// to be reported as a missing relationship, sending people to look at
+			// their foreign keys for a table that was never there.
+			if (db.Find(stmt.target.target_table) < 0) {
+				throw std::runtime_error("pql: there is no table '" + stmt.target.target_table +
+				                         "' to aggregate over");
+			}
 			throw std::runtime_error("pql: no foreign key connects '" + stmt.target.target_table +
 			                         "' to '" + entity.name +
 			                         "', so its rows cannot be attributed to an entity");

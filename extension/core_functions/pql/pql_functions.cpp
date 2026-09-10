@@ -556,15 +556,31 @@ static std::vector<pql::ForeignKey> ForeignKeysFromSchema(Connection &con, const
 				if (pql::ToUpper(other.name) == pql::ToUpper(t.name)) {
 					continue;
 				}
-				std::string ot = pql::ToUpper(other.name), sing = ot;
-				// categories -> category, not "categorie". Stripping one 's' missed
-				// every -ies plural, so such schemas got no relationships at all.
-				if (sing.size() > 3 && sing.compare(sing.size() - 3, 3, "IES") == 0) {
-					sing = sing.substr(0, sing.size() - 3) + "Y";
-				} else if (sing.size() > 1 && sing.back() == 'S') {
-					sing.pop_back();
+				const std::string ot = pql::ToUpper(other.name);
+				// Every spelling the table's name might have been singularised to,
+				// tried together rather than picking one rule. categories -> category
+				// needs -ies -> -y; boxes -> box and addresses -> address need -es
+				// dropped whole, which the single trailing -s rule turned into "boxe"
+				// and "addresse" and so linked nothing.
+				std::vector<std::string> cands;
+				cands.push_back(ot);
+				if (ot.size() > 3 && ot.compare(ot.size() - 3, 3, "IES") == 0) {
+					cands.push_back(ot.substr(0, ot.size() - 3) + "Y");
 				}
-				if (ot != stem && sing != stem) {
+				if (ot.size() > 2 && ot.compare(ot.size() - 2, 2, "ES") == 0) {
+					cands.push_back(ot.substr(0, ot.size() - 2));
+				}
+				if (ot.size() > 1 && ot.back() == 'S') {
+					cands.push_back(ot.substr(0, ot.size() - 1));
+				}
+				bool matches = false;
+				for (const auto &c : cands) {
+					if (c == stem) {
+						matches = true;
+						break;
+					}
+				}
+				if (!matches) {
 					continue;
 				}
 				// The parent key is usually spelled the same as the referencing
