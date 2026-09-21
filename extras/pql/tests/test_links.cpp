@@ -10,9 +10,9 @@
 // empty parent and child tables, integer keys at the edge of int64, and
 // non-integral double keys.
 //
-//   clang++ -std=c++17 -O2 -I extras/pql -o /tmp/l extras/pql/test_links.cpp && /tmp/l [seeds]
-//   clang++ -std=c++17 -O1 -g -fsanitize=address,undefined -I extras/pql -o /tmp/l extras/pql/test_links.cpp
-#include "src/pql.hpp"
+//   make -C extras/pql test_links            (build/test_links [seeds] to pick the seed count)
+//   make -C extras/pql sanitize
+#include "pql.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

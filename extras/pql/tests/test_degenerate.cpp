@@ -9,8 +9,8 @@
 // perfect model.
 //
 // Run it under sanitizers:
-//   clang++ -std=c++17 -O1 -g -I. -fsanitize=address,undefined -o /tmp/d test_degenerate.cpp
-#include "src/pql.hpp"
+//   make -C extras/pql sanitize   (or: make -C extras/pql test_degenerate)
+#include "pql.hpp"
 #include <cmath>
 #include <cstdio>
 #include <string>

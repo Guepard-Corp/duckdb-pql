@@ -4,6 +4,10 @@ A fork of [DuckDB](README_DUCKDB.md) that adds **PQL**: predictive queries as
 first-class SQL. You train models on the tables you already have, and ask them
 questions the same way you ask anything else.
 
+This branch is the in-tree fork PQL was developed in. The same language ships
+as a DuckDB community extension from this repository's `main` branch, which is
+what `INSTALL pql FROM community` gives you.
+
 ```sql
 TRAIN MODEL churn PREDICT EXISTS(orders) FOR customers
   EVERY 1 WEEK HORIZON 30 DAYS;
@@ -511,7 +515,7 @@ which is what the two-hop number above measures.
 ## Performance
 
 The language lives in one self-contained header,
-[`extras/pql/src/pql.hpp`](extras/pql/src/pql.hpp), which never includes a
+[`extension/core_functions/pql/pql.hpp`](extension/core_functions/pql/pql.hpp), which never includes a
 DuckDB header.
 
 Children live in a CSR arena: one flat array per link, contiguous per-parent

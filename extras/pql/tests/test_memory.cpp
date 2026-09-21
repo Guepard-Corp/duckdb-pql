@@ -1,7 +1,7 @@
 // Memory discipline tests: nothing on a hot path reaches the allocator, the
 // arena is sized exactly, and a trained model keeps none of its data.
 //
-//   clang++ -std=c++17 -O2 -o /tmp/tm test_memory.cpp && /tmp/tm
+//   make -C extras/pql test_memory
 //
 // The allocation counts come from a global operator new, so this file must not
 // be linked with anything that also replaces it.
@@ -30,7 +30,7 @@ void operator delete[](void *p) noexcept { operator delete(p); }
 void operator delete(void *p, std::size_t) noexcept { operator delete(p); }
 void operator delete[](void *p, std::size_t) noexcept { operator delete(p); }
 
-#include "src/pql.hpp"
+#include "pql.hpp"
 #include <random>
 using namespace pql;
 static const double DAY = 86400.0 * 1e6;

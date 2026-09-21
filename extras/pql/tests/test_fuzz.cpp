@@ -8,11 +8,11 @@
 //   3. A rejection carries a position inside the input.
 //
 // Run it under sanitizers:
-//   clang++ -std=c++17 -O1 -g -I. -fsanitize=address,undefined -o /tmp/f test_fuzz.cpp
+//   make -C extras/pql sanitize   (or: make -C extras/pql test_fuzz)
 //
 // This is how the unterminated-quote bug was found: `region = 'US` ran to the
 // end of the input and was accepted as `region = 'US'`.
-#include "src/pql.hpp"
+#include "pql.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <random>

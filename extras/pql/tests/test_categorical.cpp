@@ -4,8 +4,8 @@
 // is not, comparison is case-sensitive, and a vocabulary past 65535 codes is
 // still addressed exactly.
 //
-//   clang++ -std=c++17 -O2 -I extras/pql -o /tmp/c extras/pql/test_categorical.cpp && /tmp/c
-#include "src/pql.hpp"
+//   make -C extras/pql test_categorical
+#include "pql.hpp"
 #include <cmath>
 #include <cstdio>
 #include <string>

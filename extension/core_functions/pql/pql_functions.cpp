@@ -10,7 +10,7 @@
 #include "duckdb/storage/object_cache.hpp"
 
 // pql.hpp is DuckDB-agnostic and declares its own namespace; keep this TU isolated.
-#include "../../../extras/pql/src/pql.hpp"
+#include "pql.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -397,18 +397,16 @@ static std::vector<TableSchema> LoadSchema(Connection &con) {
 			// STRUCT(a INTEGER, ...) and INTERVAL as integers, because all three
 			// contain "INT", and the cast that followed failed and took the whole
 			// table with it: one list column anywhere made PQL unusable on it.
-			const bool composite =
-			    ty.find('[') != std::string::npos || ty.rfind("STRUCT", 0) == 0 ||
-			    ty.rfind("MAP", 0) == 0 || ty.rfind("UNION", 0) == 0 || ty.rfind("LIST", 0) == 0 ||
-			    ty.rfind("ARRAY", 0) == 0 || ty.rfind("INTERVAL", 0) == 0;
+			const bool composite = ty.find('[') != std::string::npos || ty.rfind("STRUCT", 0) == 0 ||
+			                       ty.rfind("MAP", 0) == 0 || ty.rfind("UNION", 0) == 0 || ty.rfind("LIST", 0) == 0 ||
+			                       ty.rfind("ARRAY", 0) == 0 || ty.rfind("INTERVAL", 0) == 0;
 			if (composite) {
 				t = pql::ColType::INVALID; // not a quantity and not a label; skipped
 			} else if (ty.rfind("ENUM", 0) == 0 || ty == "UUID") {
 				// An enum is matched before anything reads its value list, which can
 				// contain any word ("point" is an INT); a UUID is a text key.
 				t = pql::ColType::CATEGORY;
-			} else if (ty.find("TIMESTAMP") != std::string::npos ||
-			           ty.rfind("DATE", 0) == 0) {
+			} else if (ty.find("TIMESTAMP") != std::string::npos || ty.rfind("DATE", 0) == 0) {
 				t = pql::ColType::TIMESTAMP;
 			} else if (ty.find("BOOLEAN") != std::string::npos) {
 				t = pql::ColType::BOOL;
@@ -864,10 +862,9 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 		if (!t.schema.empty() || !want.count(pql::ToUpper(t.name))) {
 			continue;
 		}
-		throw InvalidInputException(
-		    "pql: '%s' exists in more than one schema and none of them is the current one. "
-		    "SET schema to the one you mean, or rename so the name is unique",
-		    t.name);
+		throw InvalidInputException("pql: '%s' exists in more than one schema and none of them is the current one. "
+		                            "SET schema to the one you mean, or rename so the name is unique",
+		                            t.name);
 	}
 	if (db.Find(stmt.entity_table) < 0) {
 		throw InvalidInputException("pql: entity table '%s' not found", stmt.entity_table);
@@ -1012,12 +1009,12 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 		return std::isnan(v) ? Value(LogicalType::DOUBLE) : Value::DOUBLE(v);
 	};
 	bind.Emit({Value(stmt.model), Value(stmt.target.ToString()), Value::BIGINT((int64_t)rep.n_train),
-	                     Value::BIGINT((int64_t)rep.n_val), Value::BIGINT((int64_t)rep.n_test),
-	                     Value::BIGINT((int64_t)rep.n_positives), Value(rep.metric_name), metric_value(rep.val_metric),
-	                     metric_value(rep.test_metric), metric_value(rep.pr_auc),
-	                     rep.baseline_metric > 0 ? Value::DOUBLE(rep.baseline_metric) : Value(LogicalType::DOUBLE),
-	                     Value::BIGINT((int64_t)rep.n_censored), Value::BIGINT((int64_t)rep.n_no_anchor),
-	                     Value::BIGINT(rep.width), Value::BIGINT(rep.epochs_run)});
+	           Value::BIGINT((int64_t)rep.n_val), Value::BIGINT((int64_t)rep.n_test),
+	           Value::BIGINT((int64_t)rep.n_positives), Value(rep.metric_name), metric_value(rep.val_metric),
+	           metric_value(rep.test_metric), metric_value(rep.pr_auc),
+	           rep.baseline_metric > 0 ? Value::DOUBLE(rep.baseline_metric) : Value(LogicalType::DOUBLE),
+	           Value::BIGINT((int64_t)rep.n_censored), Value::BIGINT((int64_t)rep.n_no_anchor),
+	           Value::BIGINT(rep.width), Value::BIGINT(rep.epochs_run)});
 }
 
 static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
@@ -1090,7 +1087,7 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	}
 	for (const auto &p : preds) {
 		const Value key_value = key_col < 0 ? Value::BIGINT((int64_t)p.entity_row)
-		                                   : KeyValue(entity.columns[(size_t)key_col], p.entity_row);
+		                                    : KeyValue(entity.columns[(size_t)key_col], p.entity_row);
 		if (with_anchor) {
 			bind.Emit({key_value, Value::TIMESTAMP(timestamp_t((int64_t)p.anchor)), Value::DOUBLE(p.value)});
 		} else {
@@ -1121,8 +1118,7 @@ static void RunExplainStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	bind.Begin(context);
 	for (const auto &f : imp) {
 		bind.Emit({Value(f.feature), Value::BIGINT((int64_t)f.slots),
-		                     std::isnan(f.drop) ? Value(LogicalType::DOUBLE)
-		                                        : Value::DOUBLE(f.drop)});
+		           std::isnan(f.drop) ? Value(LogicalType::DOUBLE) : Value::DOUBLE(f.drop)});
 	}
 }
 
@@ -1172,18 +1168,17 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	bind.Begin(context);
 	for (const auto &r : rows) {
 		const Value key_value = key_col < 0 ? Value::BIGINT((int64_t)r.entity_row)
-		                                   : KeyValue(entity.columns[(size_t)key_col], r.entity_row);
+		                                    : KeyValue(entity.columns[(size_t)key_col], r.entity_row);
 		bind.Emit({key_value, Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)), Value::DOUBLE(r.predicted),
-		                     Value::DOUBLE(r.actual), Value::DOUBLE(r.predicted - r.actual),
-		                     Value::DOUBLE(r.baseline)});
+		           Value::DOUBLE(r.actual), Value::DOUBLE(r.predicted - r.actual), Value::DOUBLE(r.baseline)});
 	}
 }
 
 static void RunShowModels(ClientContext &context, PqlBindData &bind) {
-	bind.names = {Identifier("model"), Identifier("target"), Identifier("entity"), Identifier("kind"),
-	              Identifier("features"), Identifier("statement")};
-	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	              LogicalType::BIGINT,   LogicalType::VARCHAR};
+	bind.names = {Identifier("model"), Identifier("target"),   Identifier("entity"),
+	              Identifier("kind"),  Identifier("features"), Identifier("statement")};
+	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	              LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR};
 	bind.Begin(context);
 	auto entry = GetRegistryEntry(context);
 	std::lock_guard<std::mutex> guard(entry->lock);
@@ -1191,8 +1186,8 @@ static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 		// The defining statement, echoed back in full. Copy it to retrain, or read
 		// it to see exactly what a model was given.
 		bind.Emit({Value(m->name), Value(m->spec_stmt.target.ToString()), Value(m->spec_stmt.entity_table),
-		                     Value(m->classification ? "classification" : "regression"),
-		                     Value::BIGINT(m->features.width), Value(m->spec_stmt.ToString())});
+		           Value(m->classification ? "classification" : "regression"), Value::BIGINT(m->features.width),
+		           Value(m->spec_stmt.ToString())});
 	}
 }
 
@@ -1350,8 +1345,8 @@ static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const 
 	// EXPLAIN is matched only with MODEL after it, so DuckDB's own EXPLAIN keeps
 	// working on every other statement.
 	const bool ours = first == "TRAIN" || first == "PREDICT" || (first == "BACKTEST" && second == "MODEL") ||
-	                  (first == "EXPLAIN" && second == "MODEL") ||
-	                  (first == "DROP" && second == "MODEL") || (first == "SHOW" && second == "MODELS");
+	                  (first == "EXPLAIN" && second == "MODEL") || (first == "DROP" && second == "MODEL") ||
+	                  (first == "SHOW" && second == "MODELS");
 	if (!ours) {
 		return ParserExtensionParseResult();
 	}

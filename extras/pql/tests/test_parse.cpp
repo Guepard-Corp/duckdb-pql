@@ -1,4 +1,4 @@
-#include "src/pql.hpp"
+#include "pql.hpp"
 #include <cstdio>
 static int fails = 0, oks = 0;
 static void Ok(const char *sql, const char *expect_substr = nullptr) {

@@ -1,10 +1,10 @@
 // pql.hpp — Predictive Query Language: a single-file extension of SQL with
-// training and prediction statements, in the style of extras/qfp/src/qfp.hpp.
+// training and prediction statements.
 //
 // The file is deliberately self-contained and DuckDB-agnostic: it never
-// includes a DuckDB header. The binding in
-// extension/core_functions/pql/pql_functions.cpp reads raw typed pointers out
-// of DataChunk buffers (FlatVector::GetData) and fills the column arrays below.
+// includes a DuckDB header. The binding beside it, pql_functions.cpp, reads
+// raw typed pointers out of DataChunk buffers (FlatVector::GetData) and fills
+// the column arrays below.
 //
 // On copying, precisely: no Value is materialised per cell, and tables and
 // columns that cannot influence the model are never read at all. The columns
@@ -117,10 +117,10 @@ enum class Tok : uint8_t { END = 0, IDENT, NUMBER, STRING, PUNCT, KEYWORD };
 
 struct Token {
 	Tok kind = Tok::END;
-	std::string text;   // identifiers keep original case
-	std::string upper;  // uppercased, for keyword comparison
+	std::string text;  // identifiers keep original case
+	std::string upper; // uppercased, for keyword comparison
 	double number = 0;
-	uint32_t pos = 0;   // byte offset in the source, for error messages
+	uint32_t pos = 0; // byte offset in the source, for error messages
 };
 
 inline std::string ToUpper(const std::string &s) {
@@ -135,15 +135,12 @@ inline std::string ToUpper(const std::string &s) {
 // an identifier stays an identifier, so a column called `horizon` is still
 // addressable as "horizon" when quoted.
 inline bool IsPqlKeyword(const std::string &up) {
-	static const char *kw[] = {"TRAIN",  "MODEL",  "PREDICT", "FOR",    "WHERE",  "AT",
-	                           "HORIZON", "USING", "GRAPH",   "SPLIT",  "TEMPORAL", "VALIDATE",
-	                           "TEST",   "FROM",   "OPTIONS", "AS",     "AND",    "OR",
-	                           "NOT",    "IN",     "IS",      "NULL",   "COUNT",  "EXISTS",
-	                           "SUM",    "AVG",    "MIN",     "MAX",    "DAY",    "DAYS",
-	                           "WEEK",   "WEEKS",  "MONTH",   "MONTHS", "YEAR",   "YEARS",
-	                           "HOUR",   "HOURS",  "DROP",    "SHOW",   "MODELS", "EVERY",
-	                           "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE", "IF",
-	                           nullptr};
+	static const char *kw[] = {
+	    "TRAIN",    "MODEL",    "PREDICT",  "FOR",    "WHERE",   "AT",      "HORIZON", "USING", "GRAPH", "SPLIT",
+	    "TEMPORAL", "VALIDATE", "TEST",     "FROM",   "OPTIONS", "AS",      "AND",     "OR",    "NOT",   "IN",
+	    "IS",       "NULL",     "COUNT",    "EXISTS", "SUM",     "AVG",     "MIN",     "MAX",   "DAY",   "DAYS",
+	    "WEEK",     "WEEKS",    "MONTH",    "MONTHS", "YEAR",    "YEARS",   "HOUR",    "HOURS", "DROP",  "SHOW",
+	    "MODELS",   "EVERY",    "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE", "IF",    nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
 			return true;
@@ -348,8 +345,7 @@ struct Ref {
 	std::string name;
 
 	std::string ToString() const {
-		return qualifier.empty() ? QuoteIdent(name)
-		                         : QuoteIdent(qualifier) + "." + QuoteIdent(name);
+		return qualifier.empty() ? QuoteIdent(name) : QuoteIdent(qualifier) + "." + QuoteIdent(name);
 	}
 };
 
@@ -598,9 +594,8 @@ struct Options {
 	// A silently ignored option reads as "my setting had no effect", which is the
 	// most common way to waste an afternoon.
 	static bool Known(const std::string &k) {
-		static const char *ok[] = {"EPOCHS",    "HIDDEN", "LR",     "BATCH",
-		                           "SEED",      "MEAN_COLS", "ARCH", "LAYERS",
-		                           "MAX_CATEGORIES", "L2",  nullptr};
+		static const char *ok[] = {"EPOCHS", "HIDDEN",         "LR", "BATCH", "SEED", "MEAN_COLS", "ARCH",
+		                           "LAYERS", "MAX_CATEGORIES", "L2", nullptr};
 		for (int i = 0; ok[i]; i++) {
 			if (k == ok[i]) {
 				return true;
@@ -656,7 +651,7 @@ struct StatementData {
 	// DROP MODEL IF EXISTS. Without it, dropping a name that holds nothing is an
 	// error, as it is in SQL.
 	bool if_exists = false;
-	std::string model;      // TRAIN MODEL <model> / USING MODEL <model>
+	std::string model; // TRAIN MODEL <model> / USING MODEL <model>
 	PredictExpr target;
 	std::string entity_table;
 	std::string entity_alias;
@@ -664,8 +659,8 @@ struct StatementData {
 	// anything EXPLAIN showed to be worthless: naming it here is cheaper than
 	// building a view without it.
 	std::vector<Ref> excluded;
-	Ref anchor;                         // AT <column>
-	Literal anchor_literal;             // AT '2024-01-01' (prediction only)
+	Ref anchor;             // AT <column>
+	Literal anchor_literal; // AT '2024-01-01' (prediction only)
 	bool anchor_is_literal = false;
 	Interval horizon;
 	// EVERY <interval>: build the anchors instead of requiring a column. One
@@ -687,8 +682,7 @@ struct Statement : StatementData {
 	Statement() = default;
 	Statement(Statement &&) = default;
 	Statement &operator=(Statement &&) = default;
-	Statement(const Statement &o)
-	    : StatementData(o), filter(o.filter ? o.filter->Copy() : nullptr) {
+	Statement(const Statement &o) : StatementData(o), filter(o.filter ? o.filter->Copy() : nullptr) {
 	}
 	Statement &operator=(const Statement &o) {
 		if (this != &o) {
@@ -717,9 +711,9 @@ struct Statement : StatementData {
 		if (kind == StmtKind::EXPLAIN) {
 			return "EXPLAIN MODEL " + QuoteIdent(model);
 		}
-		s = (kind == StmtKind::TRAIN) ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") +
-		                                 QuoteIdent(model) + " PREDICT ")
-		                             : std::string("PREDICT ");
+		s = (kind == StmtKind::TRAIN)
+		        ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") + QuoteIdent(model) + " PREDICT ")
+		        : std::string("PREDICT ");
 		s += target.ToString();
 		s += " FOR " + QuoteIdent(entity_table);
 		if (!entity_alias.empty()) {
@@ -835,8 +829,7 @@ public:
 					Next();
 					st.filter = ParseFilter();
 				} else {
-					throw ParseError("unexpected token '" + Peek().text + "' in EXPLAIN",
-					                 Peek().pos);
+					throw ParseError("unexpected token '" + Peek().text + "' in EXPLAIN", Peek().pos);
 				}
 			}
 			AcceptPunct(";");
@@ -1035,11 +1028,9 @@ private:
 				throw ParseError("ARCH must be 'mlp' or 'sage'", 0);
 			}
 		}
-		static const Bound bounds[] = {{"EPOCHS", 1, 100000},      {"HIDDEN", 1, 1024},
-		                               {"LAYERS", 1, 2},           {"LR", 1e-6, 1.0},
-		                               {"BATCH", 1, 65536},        {"MEAN_COLS", 0, 64},
-		                               {"MAX_CATEGORIES", 0, 4096}, {"L2", 0.0, 1.0},
-		                               {nullptr, 0, 0}};
+		static const Bound bounds[] = {{"EPOCHS", 1, 100000},       {"HIDDEN", 1, 1024}, {"LAYERS", 1, 2},
+		                               {"LR", 1e-6, 1.0},           {"BATCH", 1, 65536}, {"MEAN_COLS", 0, 64},
+		                               {"MAX_CATEGORIES", 0, 4096}, {"L2", 0.0, 1.0},    {nullptr, 0, 0}};
 		for (int i = 0; bounds[i].key; i++) {
 			if (!st.options.Has(bounds[i].key)) {
 				continue;
@@ -1058,9 +1049,8 @@ private:
 					}
 					return t;
 				};
-				throw ParseError(std::string(bounds[i].key) + " must be between " +
-				                     tidy(bounds[i].lo) + " and " + tidy(bounds[i].hi) +
-				                     " (got " + tidy(v) + ")",
+				throw ParseError(std::string(bounds[i].key) + " must be between " + tidy(bounds[i].lo) + " and " +
+				                     tidy(bounds[i].hi) + " (got " + tidy(v) + ")",
 				                 0);
 			}
 		}
@@ -1102,18 +1092,17 @@ private:
 		if (st.kind == StmtKind::TRAIN && st.anchor_is_literal) {
 			throw ParseError("TRAIN needs AT <column> (a per-row anchor), not a single timestamp", 0);
 		}
-		if (st.target.kind != TargetKind::COUNT && st.target.kind != TargetKind::EXISTS &&
-		    forecast && st.target.ref.name.empty()) {
-			throw ParseError(std::string(TargetKindName(st.target.kind)) +
-			                     " needs a column, e.g. " + TargetKindName(st.target.kind) +
-			                     "(orders.amount)",
+		if (st.target.kind != TargetKind::COUNT && st.target.kind != TargetKind::EXISTS && forecast &&
+		    st.target.ref.name.empty()) {
+			throw ParseError(std::string(TargetKindName(st.target.kind)) + " needs a column, e.g. " +
+			                     TargetKindName(st.target.kind) + "(orders.amount)",
 			                 0);
 		}
 	}
 
 	static bool IsClauseStart(const std::string &up) {
-		return up == "WHERE" || up == "AT" || up == "HORIZON" || up == "USING" || up == "SPLIT" ||
-		       up == "OPTIONS" || up == "EVERY" || up == "FROM" || up == "TO";
+		return up == "WHERE" || up == "AT" || up == "HORIZON" || up == "USING" || up == "SPLIT" || up == "OPTIONS" ||
+		       up == "EVERY" || up == "FROM" || up == "TO";
 	}
 
 	void Once(bool &flag, const char *what) {
@@ -1194,8 +1183,7 @@ private:
 		// A sign in front of a number. Without this, `WHERE balance < -100` was a
 		// syntax error, and no schema holding a negative quantity could be
 		// filtered at all.
-		if (Peek().kind == Tok::PUNCT && (Peek().text == "-" || Peek().text == "+") &&
-		    Peek(1).kind == Tok::NUMBER) {
+		if (Peek().kind == Tok::PUNCT && (Peek().text == "-" || Peek().text == "+") && Peek(1).kind == Tok::NUMBER) {
 			const bool neg = Peek().text == "-";
 			Next();
 			const Token &num = Peek();
@@ -1227,9 +1215,8 @@ private:
 		// A bare identifier in literal position is almost always a forgotten
 		// quote; say so rather than emitting "unexpected token".
 		if (t.kind == Tok::IDENT) {
-			throw ParseError("expected a literal but found identifier '" + t.text +
-			                     "'; string literals use single quotes",
-			                 t.pos);
+			throw ParseError(
+			    "expected a literal but found identifier '" + t.text + "'; string literals use single quotes", t.pos);
 		}
 		throw ParseError("expected a literal", t.pos);
 	}
@@ -1243,8 +1230,7 @@ private:
 		// Bounded before the cast: a 20-digit amount is undefined to convert and
 		// came out negative, slipping past the positivity check.
 		if (!(t.number >= 0.0) || t.number > 1.0e9 || t.number != std::floor(t.number)) {
-			throw ParseError("interval amount must be a whole number of units, at most 1000000000",
-			                 t.pos);
+			throw ParseError("interval amount must be a whole number of units, at most 1000000000", t.pos);
 		}
 		iv.amount = (int64_t)t.number;
 		Next();
@@ -1260,14 +1246,18 @@ private:
 			up.pop_back();
 		}
 		if (up != "DAY" && up != "WEEK" && up != "MONTH" && up != "YEAR" && up != "HOUR") {
-			throw ParseError("unknown horizon unit '" + u.text +
-			                     "'; expected DAYS, WEEKS, MONTHS, YEARS or HOURS",
+			throw ParseError("unknown horizon unit '" + u.text + "'; expected DAYS, WEEKS, MONTHS, YEARS or HOURS",
 			                 u.pos);
 		}
 		iv.unit = up;
 		iv.present = true;
 		// Micros() multiplies in int64; keep the total inside it with a wide margin.
-		if (double(iv.amount) * (up == "HOUR" ? 3600.0e6 : up == "DAY" ? 86400.0e6 : up == "WEEK" ? 7 * 86400.0e6 : up == "MONTH" ? 30.436875 * 86400.0e6 : 365.2425 * 86400.0e6) > 1.0e17) {
+		if (double(iv.amount) * (up == "HOUR"    ? 3600.0e6
+		                         : up == "DAY"   ? 86400.0e6
+		                         : up == "WEEK"  ? 7 * 86400.0e6
+		                         : up == "MONTH" ? 30.436875 * 86400.0e6
+		                                         : 365.2425 * 86400.0e6) >
+		    1.0e17) {
 			throw ParseError("interval is too long; at most about 3000 years", t.pos);
 		}
 		Next();
@@ -1416,8 +1406,7 @@ private:
 	}
 	void ExpectKw(const char *kw) {
 		if (!AcceptKw(kw)) {
-			throw ParseError(std::string("expected ") + kw + " but found '" + Peek().text + "'",
-			                 Peek().pos);
+			throw ParseError(std::string("expected ") + kw + " but found '" + Peek().text + "'", Peek().pos);
 		}
 	}
 	// Nothing may follow a complete statement but a semicolon. `DROP MODEL a b c`
@@ -1425,8 +1414,7 @@ private:
 	void EndOfStatement(const char *what) {
 		AcceptPunct(";");
 		if (Peek().kind != Tok::END) {
-			throw ParseError("unexpected token '" + Peek().text + "' after " + what,
-			                 Peek().pos);
+			throw ParseError("unexpected token '" + Peek().text + "' after " + what, Peek().pos);
 		}
 	}
 	bool PeekPunct(const char *p) const {
@@ -1442,8 +1430,7 @@ private:
 	}
 	void ExpectPunct(const char *p) {
 		if (!AcceptPunct(p)) {
-			throw ParseError(std::string("expected '") + p + "' but found '" + Peek().text + "'",
-			                 Peek().pos);
+			throw ParseError(std::string("expected '") + p + "' but found '" + Peek().text + "'", Peek().pos);
 		}
 	}
 	std::string ExpectIdent(const char *what) {
@@ -1480,8 +1467,8 @@ inline Statement Parse(const std::string &src) {
 // happens once at load rather than per row per epoch.
 
 struct Dictionary {
-	std::vector<std::string> values;                      // code -> text, 0 = unknown/null
-	std::unordered_map<std::string, uint32_t> index;      // text -> code
+	std::vector<std::string> values;                 // code -> text, 0 = unknown/null
+	std::unordered_map<std::string, uint32_t> index; // text -> code
 
 	Dictionary() {
 		values.push_back(""); // code 0 reserved for unknown
@@ -1520,8 +1507,7 @@ struct Column {
 		return valid.size();
 	}
 	bool IsNumeric() const {
-		return type == ColType::INT64 || type == ColType::DOUBLE || type == ColType::BOOL ||
-		       type == ColType::TIMESTAMP;
+		return type == ColType::INT64 || type == ColType::DOUBLE || type == ColType::BOOL || type == ColType::TIMESTAMP;
 	}
 };
 
@@ -1533,8 +1519,7 @@ struct Frame {
 	int Find(const std::string &col) const {
 		for (size_t i = 0; i < columns.size(); i++) {
 			// Column references are matched case-insensitively, as in SQL.
-			if (columns[i].name.size() == col.size() &&
-			    ToUpper(columns[i].name) == ToUpper(col)) {
+			if (columns[i].name.size() == col.size() && ToUpper(columns[i].name) == ToUpper(col)) {
 				return (int)i;
 			}
 		}
@@ -1547,7 +1532,6 @@ struct Frame {
 		}
 		return columns[(size_t)i];
 	}
-
 };
 
 // ===========================================================================
@@ -1830,8 +1814,7 @@ struct Database {
 					const Column &gpk = gp.columns[(size_t)pk2];
 					const Column &gtc = gp.columns[(size_t)gt];
 					const Column &cc2 = child.columns[(size_t)ck2];
-					const bool str_key =
-					    gpk.type == ColType::CATEGORY && cc2.type == ColType::CATEGORY;
+					const bool str_key = gpk.type == ColType::CATEGORY && cc2.type == ColType::CATEGORY;
 					std::unordered_map<std::string, double> by_str;
 					std::unordered_map<int64_t, double> by_num;
 					for (size_t r = 0; r < gp.nrows; r++) {
@@ -1897,8 +1880,7 @@ struct Database {
 				if (!pk.valid[r]) {
 					continue;
 				}
-				const int64_t key =
-				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
+				const int64_t key = pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
 				kmin = std::min(kmin, key);
 				kmax = std::max(kmax, key);
 			}
@@ -1920,8 +1902,7 @@ struct Database {
 				if (!pk.valid[r]) {
 					continue;
 				}
-				const int64_t key =
-				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
+				const int64_t key = pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
 				if (use_direct) {
 					uint32_t &slot = direct[(size_t)(key - kmin)];
 					if (slot != UINT32_MAX) {
@@ -1957,8 +1938,7 @@ struct Database {
 			// Text keys must be matched on the string. Every column owns its own
 			// dictionary, so the same value has different codes on the two sides and
 			// comparing codes silently resolves nothing.
-			const bool string_key =
-			    pk.type == ColType::CATEGORY && ck.type == ColType::CATEGORY;
+			const bool string_key = pk.type == ColType::CATEGORY && ck.type == ColType::CATEGORY;
 			// One side text and the other numeric would compare a dictionary code to
 			// a value and invent matches. Refuse the link instead.
 			if ((pk.type == ColType::CATEGORY) != (ck.type == ColType::CATEGORY)) {
@@ -2002,8 +1982,7 @@ struct Database {
 					}
 					pr = it->second;
 				} else {
-					const int64_t key =
-					    ck.type == ColType::CATEGORY ? (int64_t)ck.code[r] : NumericKey(ck.num[r]);
+					const int64_t key = ck.type == ColType::CATEGORY ? (int64_t)ck.code[r] : NumericKey(ck.num[r]);
 					if (!lookup(key, pr)) {
 						continue;
 					}
@@ -2074,8 +2053,7 @@ struct Database {
 // Check every qualifier in a filter tree against the relation it will actually
 // be evaluated on. A qualifier naming something else was previously accepted and
 // silently applied to whichever frame the walk happened to receive.
-inline void ValidateFilterScope(const FilterNode *f, const Frame &frame, const std::string &alias,
-                                const char *where) {
+inline void ValidateFilterScope(const FilterNode *f, const Frame &frame, const std::string &alias, const char *where) {
 	if (!f) {
 		return;
 	}
@@ -2088,14 +2066,14 @@ inline void ValidateFilterScope(const FilterNode *f, const Frame &frame, const s
 	if (!f->ref.qualifier.empty()) {
 		const std::string q = ToUpper(f->ref.qualifier);
 		if (q != ToUpper(frame.name) && (alias.empty() || q != ToUpper(alias))) {
-			throw std::runtime_error("pql: the " + std::string(where) + " filter refers to '" +
-			                         f->ref.ToString() + "', but it is evaluated on '" + frame.name +
-			                         "'" + (alias.empty() ? "" : " (aliased " + alias + ")"));
+			throw std::runtime_error("pql: the " + std::string(where) + " filter refers to '" + f->ref.ToString() +
+			                         "', but it is evaluated on '" + frame.name + "'" +
+			                         (alias.empty() ? "" : " (aliased " + alias + ")"));
 		}
 	}
 	if (frame.Find(f->ref.name) < 0) {
-		throw std::runtime_error("pql: the " + std::string(where) + " filter refers to column '" +
-		                         f->ref.name + "', which does not exist on '" + frame.name + "'");
+		throw std::runtime_error("pql: the " + std::string(where) + " filter refers to column '" + f->ref.name +
+		                         "', which does not exist on '" + frame.name + "'");
 	}
 }
 
@@ -2202,7 +2180,7 @@ inline bool EvalFilter(const FilterNode *f, const Frame &frame, size_t row) {
 
 struct Example {
 	uint32_t entity_row = 0;
-	double anchor = 0;     // micros
+	double anchor = 0; // micros
 	double label = 0;
 	// The same aggregate over the horizon immediately BEFORE the anchor. This is
 	// the persistence prediction, and the model learns the residual over it: a
@@ -2212,10 +2190,9 @@ struct Example {
 	bool has_label = false;
 };
 
-inline double AggregateWindow(const Database &, const Link &lk, const Frame &child,
-                              uint32_t entity_row, double lo_exclusive, double hi_inclusive,
-                              TargetKind kind, int value_col, const FilterNode *filter,
-                              bool &any) {
+inline double AggregateWindow(const Database &, const Link &lk, const Frame &child, uint32_t entity_row,
+                              double lo_exclusive, double hi_inclusive, TargetKind kind, int value_col,
+                              const FilterNode *filter, bool &any) {
 	const uint32_t bslice = lk.Begin(entity_row), eslice = lk.End(entity_row);
 	const bool timed = lk.dated;
 	double acc = 0;
@@ -2258,8 +2235,7 @@ inline double AggregateWindow(const Database &, const Link &lk, const Frame &chi
 			const double v = vc.num[r];
 			acc += v;
 			n_values++;
-			if (!have_best || (kind == TargetKind::MIN && v < best) ||
-			    (kind == TargetKind::MAX && v > best)) {
+			if (!have_best || (kind == TargetKind::MIN && v < best) || (kind == TargetKind::MAX && v > best)) {
 				best = v;
 				have_best = true;
 			}
@@ -2384,21 +2360,26 @@ struct FeatureSpec {
 		for (auto &sc : self_cols) {
 			const int i = entity.Find(sc.name);
 			if (i < 0) {
-				throw std::runtime_error("pql: column '" + sc.name + "' used by this model is not "
-				                         "present on '" + entity.name + "' any more");
+				throw std::runtime_error("pql: column '" + sc.name +
+				                         "' used by this model is not "
+				                         "present on '" +
+				                         entity.name + "' any more");
 			}
 			sc.index = i;
 		}
 		for (auto &cc : cat_cols) {
 			const int i = entity.Find(cc.name);
 			if (i < 0) {
-				throw std::runtime_error("pql: column '" + cc.name + "' used by this model is not "
-				                         "present on '" + entity.name + "' any more");
+				throw std::runtime_error("pql: column '" + cc.name +
+				                         "' used by this model is not "
+				                         "present on '" +
+				                         entity.name + "' any more");
 			}
 			cc.index = i;
 			const Column &col = entity.columns[(size_t)i];
 			if (col.type != ColType::CATEGORY) {
-				throw std::runtime_error("pql: column '" + cc.name + "' was text when this model "
+				throw std::runtime_error("pql: column '" + cc.name +
+				                         "' was text when this model "
 				                         "was trained and is not any more");
 			}
 			// Against this frame's own dictionary: a label it has never seen has no
@@ -2416,25 +2397,24 @@ struct FeatureSpec {
 					continue;
 				}
 				const Frame &child = db.At(lk.child_table);
-				const std::string key = lk.child_key_col >= 0
-				                            ? child.columns[(size_t)lk.child_key_col].name
-				                            : std::string();
+				const std::string key =
+				    lk.child_key_col >= 0 ? child.columns[(size_t)lk.child_key_col].name : std::string();
 				if (la.child_key.empty() || ToUpper(key) == ToUpper(la.child_key)) {
 					found = (int)l;
 					break;
 				}
 			}
 			if (found < 0) {
-				throw std::runtime_error("pql: the link from '" + la.child_table + "' to '" +
-				                         entity.name + "' used by this model is not available");
+				throw std::runtime_error("pql: the link from '" + la.child_table + "' to '" + entity.name +
+				                         "' used by this model is not available");
 			}
 			la.link = found;
 			const Frame &child = db.At(la.child_table);
 			for (size_t m = 0; m < la.mean_names.size(); m++) {
 				const int c = child.Find(la.mean_names[m]);
 				if (c < 0) {
-					throw std::runtime_error("pql: column '" + la.child_table + "." +
-					                         la.mean_names[m] + "' used by this model is missing");
+					throw std::runtime_error("pql: column '" + la.child_table + "." + la.mean_names[m] +
+					                         "' used by this model is missing");
 				}
 				la.mean_cols[m] = c;
 			}
@@ -2456,8 +2436,7 @@ struct FeatureSpec {
 			out.emplace_back("anchor: phase of year", 2);
 		}
 		for (const auto &cc : cat_cols) {
-			out.emplace_back(cc.name + (cc.one_hot ? " (category)" : " (how common)"),
-			                 cc.Width());
+			out.emplace_back(cc.name + (cc.one_hot ? " (category)" : " (how common)"), cc.Width());
 		}
 		for (const auto &la : link_aggs) {
 			out.emplace_back(la.child_table + ": never happened", 1);
@@ -2493,14 +2472,13 @@ struct FeatureSpec {
 	}
 };
 
-
 // Fit an encoding for one text column, counting only rows from the training era.
 // `anch` is the column that decides which era a row belongs to, or null when
 // every row counts. Returns false when the column carries nothing usable.
 //
 // Shared by the dense path and by GraphSAGE so the two cannot drift apart.
-inline bool FitCatCol(const Frame &f, size_t col_index, const Column *anch, double train_cutoff,
-                      int max_categories, FeatureSpec::CatCol &out) {
+inline bool FitCatCol(const Frame &f, size_t col_index, const Column *anch, double train_cutoff, int max_categories,
+                      FeatureSpec::CatCol &out) {
 	const Column &c = f.columns[col_index];
 	if (c.type != ColType::CATEGORY) {
 		return false;
@@ -2581,8 +2559,7 @@ inline bool FitCatCol(const Frame &f, size_t col_index, const Column *anch, doub
 			fn++;
 		}
 		out.freq_mean = fn ? fs / double(fn) : 0.0;
-		const double var =
-		    fn > 1 ? (fq - double(fn) * out.freq_mean * out.freq_mean) / double(fn - 1) : 0.0;
+		const double var = fn > 1 ? (fq - double(fn) * out.freq_mean * out.freq_mean) / double(fn - 1) : 0.0;
 		out.freq_sd = var > 1e-18 ? std::sqrt(var) : 1.0;
 	}
 	out.Resolve(c);
@@ -2603,8 +2580,8 @@ inline uint32_t PrefixTotal(const Link &lk) {
 	const uint64_t nparents = lk.off.empty() ? 0 : (uint64_t)lk.off.size() - 1;
 	const uint64_t total = (uint64_t)lk.flat.size() + nparents;
 	if (total > (uint64_t)UINT32_MAX) {
-		throw std::runtime_error("pql: link " + lk.child_table + " -> " + lk.parent_table +
-		                         " has " + std::to_string(total) +
+		throw std::runtime_error("pql: link " + lk.child_table + " -> " + lk.parent_table + " has " +
+		                         std::to_string(total) +
 		                         " rows plus parents, more than the 4294967295 a model can index");
 	}
 	return (uint32_t)total;
@@ -2648,8 +2625,7 @@ inline AggCache BuildAggCache(const Database &db, const FeatureSpec &spec) {
 				for (uint32_t i = b; i < e; i++) {
 					const uint32_t j = i - b;
 					if (j >= 1) {
-						const double g =
-						    (lk.Time(lk.flat[i]) - lk.Time(lk.flat[i - 1])) / kMicrosPerDay;
+						const double g = (lk.Time(lk.flat[i]) - lk.Time(lk.flat[i - 1])) / kMicrosPerDay;
 						run += g * g;
 					}
 					lc.pgap2[base + j + 1] = (float)run;
@@ -2688,9 +2664,8 @@ inline AggCache BuildAggCache(const Database &db, const FeatureSpec &spec) {
 
 // Build the feature vector for one entity row at a given anchor time. Every
 // value is drawn from (-inf, anchor], which is what keeps forecasts honest.
-inline void BuildFeatures(const Database &db, const Frame &entity, const FeatureSpec &spec,
-                          const AggCache &cache, uint32_t row, double anchor,
-                          std::vector<float> &out) {
+inline void BuildFeatures(const Database &db, const Frame &entity, const FeatureSpec &spec, const AggCache &cache,
+                          uint32_t row, double anchor, std::vector<float> &out) {
 	out.assign((size_t)spec.width, 0.0f);
 	size_t k = 0;
 	for (const auto &sc : spec.self_cols) {
@@ -2726,8 +2701,7 @@ inline void BuildFeatures(const Database &db, const Frame &entity, const Feature
 			// Otherwise the block stays zero: the encoding has nothing to say.
 			k += (size_t)cc.Width();
 		} else {
-			const double f = (known && c.valid[row]) ? (double)cc.freq_by_code[code]
-			                                         : cc.freq_other;
+			const double f = (known && c.valid[row]) ? (double)cc.freq_by_code[code] : cc.freq_other;
 			out[k++] = float((f - cc.freq_mean) / cc.freq_sd);
 		}
 	}
@@ -2782,13 +2756,11 @@ inline void BuildFeatures(const Database &db, const Frame &entity, const Feature
 			// them.
 			float cv = 0.0f;
 			if (timed && n >= 2) {
-				const double span = (lk.Time(lk.flat[bslice + visible - 1]) -
-				                     lk.Time(lk.flat[bslice + start])) /
-				                    kMicrosPerDay;
+				const double span =
+				    (lk.Time(lk.flat[bslice + visible - 1]) - lk.Time(lk.flat[bslice + start])) / kMicrosPerDay;
 				const double ng = double(n - 1);
 				const double mean_gap = span / ng; // the gaps telescope
-				const double sumsq =
-				    double(lc.pgap2[base + visible]) - double(lc.pgap2[base + start + 1]);
+				const double sumsq = double(lc.pgap2[base + visible]) - double(lc.pgap2[base + start + 1]);
 				if (mean_gap > 1e-9) {
 					const double var = sumsq / ng - mean_gap * mean_gap;
 					const double c = std::sqrt(var > 0 ? var : 0.0) / mean_gap;
@@ -2807,8 +2779,7 @@ inline void BuildFeatures(const Database &db, const Frame &entity, const Feature
 	}
 }
 
-inline void MatMulNT(const float *A, const float *W, const float *bias, float *C, int B, int K,
-                     int N, bool relu);
+inline void MatMulNT(const float *A, const float *W, const float *bias, float *C, int B, int K, int N, bool relu);
 
 // ===========================================================================
 // 9b. Heterogeneous GraphSAGE
@@ -2852,9 +2823,9 @@ struct SageSpec {
 		int dim = 0;
 	};
 	struct EdgeType {
-		int link = -1;   // index into Database::links
-		int src_node = -1; // index into nodes: the child
-		int dst_node = -1; // index into nodes: the parent (the entity)
+		int link = -1;         // index into Database::links
+		int src_node = -1;     // index into nodes: the child
+		int dst_node = -1;     // index into nodes: the parent (the entity)
 		std::string child_key; // the child's key column, to tell two links apart
 	};
 	std::vector<NodeType> nodes;
@@ -2910,8 +2881,7 @@ inline SageFeatures BuildSageFeatures(const Database &db, const SageSpec &spec) 
 						dst[r * (size_t)stride + cc.labels.size()] = 1.0f;
 					}
 				} else {
-					const double fq = (known && col.valid[r]) ? (double)cc.freq_by_code[code]
-					                                          : cc.freq_other;
+					const double fq = (known && col.valid[r]) ? (double)cc.freq_by_code[code] : cc.freq_other;
 					dst[r * (size_t)stride] = float((fq - cc.freq_mean) / cc.freq_sd);
 				}
 			}
@@ -2921,8 +2891,7 @@ inline SageFeatures BuildSageFeatures(const Database &db, const SageSpec &spec) 
 	return f;
 }
 
-inline SagePrefix BuildSagePrefix(const Database &db, const SageSpec &spec,
-                                  const SageFeatures &feat) {
+inline SagePrefix BuildSagePrefix(const Database &db, const SageSpec &spec, const SageFeatures &feat) {
 	SagePrefix pre;
 	pre.psum.resize(spec.edges.size());
 	pre.off.resize(spec.edges.size());
@@ -2995,12 +2964,12 @@ struct SageHop2 {
 // grandchild edge. Mirrors SageParams but is indexed per entity-edge.
 struct SageChildParams {
 	int channels = 0;
-	std::vector<int> self_dim;                            // per entity-edge
-	std::vector<std::vector<float>> w_self;               // [C x self_dim]
-	std::vector<std::vector<float>> bias;                 // [C]
-	std::vector<std::vector<int>> gc_link;                // grandchild link ids
-	std::vector<std::vector<int>> gc_dim;                 // + degree slot
-	std::vector<std::vector<std::vector<float>>> w_gc;    // [C x gc_dim]
+	std::vector<int> self_dim;                         // per entity-edge
+	std::vector<std::vector<float>> w_self;            // [C x self_dim]
+	std::vector<std::vector<float>> bias;              // [C]
+	std::vector<std::vector<int>> gc_link;             // grandchild link ids
+	std::vector<std::vector<int>> gc_dim;              // + degree slot
+	std::vector<std::vector<std::vector<float>>> w_gc; // [C x gc_dim]
 
 	size_t ParamCount() const {
 		size_t n = 0;
@@ -3020,8 +2989,7 @@ struct SageChildParams {
 };
 
 // Mean of a neighbourhood visible at `anchor`, written into `out` (length d).
-inline void SageMeanAt(const SagePrefix &pre, size_t e, uint32_t parent_row, size_t visible,
-                       float *out, int d) {
+inline void SageMeanAt(const SagePrefix &pre, size_t e, uint32_t parent_row, size_t visible, float *out, int d) {
 	const uint32_t base = pre.off[e][parent_row];
 	const float *hi = pre.psum[e].data() + (size_t)(base + visible) * (size_t)d;
 	const float *lo = pre.psum[e].data() + (size_t)base * (size_t)d;
@@ -3049,8 +3017,7 @@ inline void SageMeanAt(const SagePrefix &pre, size_t e, uint32_t parent_row, siz
 
 // Numeric columns of a table that can encode a node, excluding keys and clocks
 // (an id is identity, not signal; a timestamp is the axis, not a feature).
-inline void SageNodeColumns(const Database &db, int table, const Link *incoming,
-                            std::vector<int> &out) {
+inline void SageNodeColumns(const Database &db, int table, const Link *incoming, std::vector<int> &out) {
 	const Frame &f = db.tables[(size_t)table];
 	for (size_t c = 0; c < f.columns.size(); c++) {
 		if (!f.columns[c].IsNumeric()) {
@@ -3061,10 +3028,10 @@ inline void SageNodeColumns(const Database &db, int table, const Link *incoming,
 		}
 		bool is_key = false;
 		for (const auto &fk : db.fks) {
-			const bool child_side = ToUpper(fk.child_table) == ToUpper(f.name) &&
-			                        ToUpper(fk.child_column) == ToUpper(f.columns[c].name);
-			const bool parent_side = ToUpper(fk.parent_table) == ToUpper(f.name) &&
-			                         ToUpper(fk.parent_column) == ToUpper(f.columns[c].name);
+			const bool child_side =
+			    ToUpper(fk.child_table) == ToUpper(f.name) && ToUpper(fk.child_column) == ToUpper(f.columns[c].name);
+			const bool parent_side =
+			    ToUpper(fk.parent_table) == ToUpper(f.name) && ToUpper(fk.parent_column) == ToUpper(f.columns[c].name);
 			if (child_side || parent_side) {
 				is_key = true;
 				break;
@@ -3090,8 +3057,7 @@ inline bool IsExcluded(const Statement &stmt, const Frame &entity, const std::st
 			}
 			continue;
 		}
-		if (ToUpper(r.qualifier) == ToUpper(table) ||
-		    ToUpper(r.qualifier) == ToUpper(stmt.entity_alias)) {
+		if (ToUpper(r.qualifier) == ToUpper(table) || ToUpper(r.qualifier) == ToUpper(stmt.entity_alias)) {
 			return true;
 		}
 	}
@@ -3117,16 +3083,14 @@ inline void ValidateExcluded(const Database &db, const Frame &entity, const Stat
 			}
 		}
 		if (!found) {
-			throw std::runtime_error("pql: EXCLUDE names '" + r.ToString() +
-			                         "', which is not a column of " +
-			                         (r.qualifier.empty() ? ("'" + entity.name + "'")
-			                                              : ("'" + r.qualifier + "'")));
+			throw std::runtime_error("pql: EXCLUDE names '" + r.ToString() + "', which is not a column of " +
+			                         (r.qualifier.empty() ? ("'" + entity.name + "'") : ("'" + r.qualifier + "'")));
 		}
 	}
 }
 
-inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Statement &stmt,
-                              int anchor_col, int target_col, double train_cutoff) {
+inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Statement &stmt, int anchor_col,
+                              int target_col, double train_cutoff) {
 	SageSpec spec;
 	auto add_node = [&](int table, const Link *incoming) {
 		for (size_t n = 0; n < spec.nodes.size(); n++) {
@@ -3160,14 +3124,12 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 			nt.cols.swap(keep);
 		}
 		const Frame &f = db.tables[(size_t)table];
-		const Column *anch = (table == db.Find(entity.name) && anchor_col >= 0)
-		                         ? &f.columns[(size_t)anchor_col]
-		                         : nullptr;
+		const Column *anch =
+		    (table == db.Find(entity.name) && anchor_col >= 0) ? &f.columns[(size_t)anchor_col] : nullptr;
 		// A child table has no anchor column, but its rows are dated by the link
 		// that reaches it, and that clock bounds its statistics the same way.
 		Column clock;
-		if (!anch && incoming && incoming->dated && std::isfinite(train_cutoff) &&
-		    incoming->ctime.size() == f.nrows) {
+		if (!anch && incoming && incoming->dated && std::isfinite(train_cutoff) && incoming->ctime.size() == f.nrows) {
 			clock.name = "clock";
 			clock.type = ColType::TIMESTAMP;
 			clock.num = incoming->ctime;
@@ -3187,8 +3149,7 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 					continue;
 				}
 				// Statistics come from the training era only.
-				if (anch && std::isfinite(train_cutoff) &&
-				    (!anch->valid[r] || anch->num[r] > train_cutoff)) {
+				if (anch && std::isfinite(train_cutoff) && (!anch->valid[r] || anch->num[r] > train_cutoff)) {
 					continue;
 				}
 				sum += col.num[r];
@@ -3213,12 +3174,10 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 			if (f.columns[ci].type != ColType::CATEGORY) {
 				continue;
 			}
-			if (incoming && ((int)ci == incoming->child_key_col ||
-			                 (int)ci == incoming->child_time_col)) {
+			if (incoming && ((int)ci == incoming->child_key_col || (int)ci == incoming->child_time_col)) {
 				continue;
 			}
-			if (table == db.Find(entity.name) &&
-			    ((int)ci == anchor_col || (int)ci == target_col)) {
+			if (table == db.Find(entity.name) && ((int)ci == anchor_col || (int)ci == target_col)) {
 				continue;
 			}
 			bool is_key = false;
@@ -3289,8 +3248,7 @@ inline void RebindSageSpec(const Database &db, const Frame &entity, SageSpec &sp
 	for (auto &nt : spec.nodes) {
 		const int t = db.Find(nt.table_name);
 		if (t < 0) {
-			throw std::runtime_error("pql: table '" + nt.table_name +
-			                         "' used by this model is not available");
+			throw std::runtime_error("pql: table '" + nt.table_name + "' used by this model is not available");
 		}
 		nt.table = t;
 		const Frame &f = db.tables[(size_t)t];
@@ -3317,22 +3275,19 @@ inline void RebindSageSpec(const Database &db, const Frame &entity, SageSpec &sp
 		int found = -1;
 		for (size_t l = 0; l < db.links.size(); l++) {
 			const Link &lk = db.links[l];
-			if (ToUpper(lk.child_table) != ToUpper(ct) ||
-			    ToUpper(lk.parent_table) != ToUpper(entity.name)) {
+			if (ToUpper(lk.child_table) != ToUpper(ct) || ToUpper(lk.parent_table) != ToUpper(entity.name)) {
 				continue;
 			}
 			const Frame &child = db.At(lk.child_table);
-			const std::string key = lk.child_key_col >= 0
-			                            ? child.columns[(size_t)lk.child_key_col].name
-			                            : std::string();
+			const std::string key =
+			    lk.child_key_col >= 0 ? child.columns[(size_t)lk.child_key_col].name : std::string();
 			if (et.child_key.empty() || ToUpper(key) == ToUpper(et.child_key)) {
 				found = (int)l;
 				break;
 			}
 		}
 		if (found < 0) {
-			throw std::runtime_error("pql: the link from '" + ct +
-			                         "' used by this model is not available");
+			throw std::runtime_error("pql: the link from '" + ct + "' used by this model is not available");
 		}
 		et.link = found;
 	}
@@ -3403,17 +3358,17 @@ struct SageParams {
 // vocabulary does.
 struct Model {
 	std::string name;
-	Statement spec_stmt;      // the training statement, replayed at predict time
+	Statement spec_stmt; // the training statement, replayed at predict time
 	FeatureSpec features;
 	int hidden = 64;
 	bool classification = true;
-	bool sage = false;        // hetero GraphSAGE instead of the dense head
+	bool sage = false; // hetero GraphSAGE instead of the dense head
 	int sage_layers = 1;
 	SageSpec sage_spec;
 	SageParams sage_params;
 	SageChildParams sage_child;
-	bool residual = false;    // output is base + f(x)
-	bool nonnegative = false; // counts and sums of non-negative columns
+	bool residual = false;               // output is base + f(x)
+	bool nonnegative = false;            // counts and sums of non-negative columns
 	double label_mean = 0, label_sd = 1; // regression targets are standardized
 
 	std::vector<float> w1, b1; // width x hidden
@@ -3468,7 +3423,6 @@ struct Model {
 		bytes += features.self_cols.size() * 48 + features.link_aggs.size() * 96;
 		return bytes;
 	}
-
 };
 
 // ---------------------------------------------------------------------------
@@ -3596,8 +3550,7 @@ private:
 // to what C already holds, which is what lets a sum of several linear terms be
 // formed in place instead of through a scratch buffer and a second pass.
 template <bool BIAS, bool RELU, bool ACC = false>
-inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, float *C, int B,
-                           int M, int N) {
+inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, float *C, int B, int M, int N) {
 	int b = 0;
 	for (; b + 4 <= B; b += 4) {
 		int n = 0;
@@ -3605,8 +3558,7 @@ inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, fl
 			float acc[4][16];
 			for (int x = 0; x < 4; x++) {
 				for (int y = 0; y < 16; y++) {
-					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) +
-					            (BIAS ? bias[n + y] : 0.0f);
+					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) + (BIAS ? bias[n + y] : 0.0f);
 				}
 			}
 			for (int m = 0; m < M; m++) {
@@ -3632,8 +3584,7 @@ inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, fl
 			float acc[4][4];
 			for (int x = 0; x < 4; x++) {
 				for (int y = 0; y < 4; y++) {
-					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) +
-					            (BIAS ? bias[n + y] : 0.0f);
+					acc[x][y] = (ACC ? C[(size_t)(b + x) * (size_t)N + n + y] : 0.0f) + (BIAS ? bias[n + y] : 0.0f);
 				}
 			}
 			for (int m = 0; m < M; m++) {
@@ -3680,14 +3631,12 @@ inline void MatMulNN_Tiled(const float *A, const float *W, const float *bias, fl
 
 // bias and ReLU are template parameters rather than branches so the tile body
 // stays free of both a load and a compare.
-inline void MatMulNN(const float *A, const float *W, const float *bias, float *C, int B, int M,
-                     int N, bool relu) {
+inline void MatMulNN(const float *A, const float *W, const float *bias, float *C, int B, int M, int N, bool relu) {
 	if (B <= 0 || N <= 0) {
 		return;
 	}
 	if (bias) {
-		relu ? MatMulNN_Tiled<true, true>(A, W, bias, C, B, M, N)
-		     : MatMulNN_Tiled<true, false>(A, W, bias, C, B, M, N);
+		relu ? MatMulNN_Tiled<true, true>(A, W, bias, C, B, M, N) : MatMulNN_Tiled<true, false>(A, W, bias, C, B, M, N);
 	} else {
 		relu ? MatMulNN_Tiled<false, true>(A, W, bias, C, B, M, N)
 		     : MatMulNN_Tiled<false, false>(A, W, bias, C, B, M, N);
@@ -3724,8 +3673,7 @@ inline void TransposeInto(const float *W, float *wt, int K, int N) {
 // C[B x N] = A[B x K] * W[N x K]^T + bias, optionally ReLU'd. W is stored one
 // row per output channel, which is the wrong way round for the tile, so it is
 // transposed first.
-inline void MatMulNT(const float *A, const float *W, const float *bias, float *C, int B, int K,
-                     int N, bool relu) {
+inline void MatMulNT(const float *A, const float *W, const float *bias, float *C, int B, int K, int N, bool relu) {
 	if (B <= 0 || N <= 0 || K <= 0) {
 		return;
 	}
@@ -3739,8 +3687,7 @@ inline void MatMulNT(const float *A, const float *W, const float *bias, float *C
 // the products themselves.
 // bias and ReLU belong to the last term of the sum, so the activation can be
 // finished inside the same kernel rather than in a pass of its own.
-inline void MatMulAccNT(const float *A, const float *W, const float *bias, float *C, int B, int K,
-                        int N, bool relu) {
+inline void MatMulAccNT(const float *A, const float *W, const float *bias, float *C, int B, int K, int N, bool relu) {
 	if (B <= 0 || N <= 0 || K <= 0) {
 		return;
 	}
@@ -3987,8 +3934,7 @@ inline void AccumOuter(const float *D, const float *A, float *G, int B, int K, i
 // dA[B x K] = D[B x N] * W[N x K], masked by the pre-activation sign of H.
 // W is stored [N x K], so K is already the contiguous axis and this is the
 // plain tiled product with no transpose at all.
-inline void BackThroughRelu(const float *D, const float *W, const float *H, float *dA, int B,
-                            int K, int N) {
+inline void BackThroughRelu(const float *D, const float *W, const float *H, float *dA, int B, int K, int N) {
 	MatMulNN(D, W, nullptr, dA, B, N, K, false);
 	for (int b = 0; b < B; b++) {
 		float *arow = dA + (size_t)b * (size_t)K;
@@ -4192,8 +4138,8 @@ inline double AveragePrecision(const std::vector<std::pair<double, int>> &scored
 	std::vector<std::pair<double, int>> v(scored);
 	// Descending by score. Ties share a threshold, so they are consumed together
 	// or the result would depend on the order they happen to arrive in.
-	std::sort(v.begin(), v.end(), [](const std::pair<double, int> &a,
-	                                 const std::pair<double, int> &b) { return a.first > b.first; });
+	std::sort(v.begin(), v.end(),
+	          [](const std::pair<double, int> &a, const std::pair<double, int> &b) { return a.first > b.first; });
 	int64_t npos = 0;
 	for (const auto &p : v) {
 		npos += p.second ? 1 : 0;
@@ -4264,8 +4210,8 @@ struct Dataset {
 // One definition, because anything that wants to reproduce the folds later (to
 // explain a model on rows it did not learn from, say) has to agree with training
 // exactly or it is measuring something else.
-inline void SplitByAnchor(const Dataset &ds, const Statement &stmt, std::vector<size_t> &tr,
-                          std::vector<size_t> &va, std::vector<size_t> &te) {
+inline void SplitByAnchor(const Dataset &ds, const Statement &stmt, std::vector<size_t> &tr, std::vector<size_t> &va,
+                          std::vector<size_t> &te) {
 	tr.clear();
 	va.clear();
 	te.clear();
@@ -4313,8 +4259,7 @@ inline int ResolveAnchorColumn(const Frame &entity, const Statement &stmt) {
 	if (!stmt.anchor.name.empty()) {
 		const int i = entity.Find(stmt.anchor.name);
 		if (i < 0) {
-			throw std::runtime_error("pql: AT column '" + stmt.anchor.name + "' not found on '" +
-			                         entity.name + "'");
+			throw std::runtime_error("pql: AT column '" + stmt.anchor.name + "' not found on '" + entity.name + "'");
 		}
 		return i;
 	}
@@ -4328,16 +4273,14 @@ inline int ResolveAnchorColumn(const Frame &entity, const Statement &stmt) {
 // statistics. Fitting mean/sd over every row, including the folds the model will
 // be scored on, is transductive: harmless-looking, but it leaks the shape of the
 // test distribution into training.
-inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const Statement &stmt,
-                                  int anchor_col, int target_col, int max_mean_cols,
-                                  int max_categories = 16,
+inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const Statement &stmt, int anchor_col,
+                                  int target_col, int max_mean_cols, int max_categories = 16,
                                   double train_cutoff = std::numeric_limits<double>::infinity()) {
 	FeatureSpec spec;
 	// Only when the anchor is a real instant. An attribute model with no clock
 	// anywhere has nothing to take a phase of.
 	spec.anchor_cycles =
-	    stmt.every.present ||
-	    (anchor_col >= 0 && entity.columns[(size_t)anchor_col].type == ColType::TIMESTAMP);
+	    stmt.every.present || (anchor_col >= 0 && entity.columns[(size_t)anchor_col].type == ColType::TIMESTAMP);
 	std::vector<bool> excluded(entity.columns.size(), false);
 	if (anchor_col >= 0) {
 		excluded[(size_t)anchor_col] = true;
@@ -4473,9 +4416,7 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 		la.link = (int)l;
 		la.child_table = lk.child_table;
 		const Frame &child = db.At(lk.child_table);
-		la.child_key = lk.child_key_col >= 0
-		                   ? child.columns[(size_t)lk.child_key_col].name
-		                   : std::string();
+		la.child_key = lk.child_key_col >= 0 ? child.columns[(size_t)lk.child_key_col].name : std::string();
 		for (size_t c = 0; c < child.columns.size() && (int)la.mean_cols.size() < max_mean_cols; c++) {
 			if ((int)c == lk.child_key_col || (int)c == lk.child_time_col) {
 				continue;
@@ -4499,8 +4440,7 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			// The child's clock bounds these statistics to the training era, the
 			// way the entity's anchor bounds its own columns above. Same mask
 			// multiply as before, so the loop stays branchless.
-			const bool bounded = lk.dated && std::isfinite(train_cutoff) &&
-			                     lk.ctime.size() == crows;
+			const bool bounded = lk.dated && std::isfinite(train_cutoff) && lk.ctime.size() == crows;
 			const double *ct = bounded ? lk.ctime.data() : nullptr;
 			double cs0 = 0, cs1 = 0, cq0 = 0, cq1 = 0;
 			uint64_t k0 = 0, k1 = 0;
@@ -4526,8 +4466,7 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			}
 			const size_t cn = (size_t)(k0 + k1);
 			const double mu = cn ? (cs0 + cs1) / double(cn) : 0.0;
-			const double cvar =
-			    cn > 1 ? ((cq0 + cq1) - double(cn) * mu * mu) / double(cn - 1) : 0.0;
+			const double cvar = cn > 1 ? ((cq0 + cq1) - double(cn) * mu * mu) / double(cn - 1) : 0.0;
 			const double sd = cvar > 0 ? std::sqrt(cvar) : 1.0;
 			if (!std::isfinite(mu) || !std::isfinite(sd)) {
 				continue;
@@ -4570,22 +4509,19 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 			// to be reported as a missing relationship, sending people to look at
 			// their foreign keys for a table that was never there.
 			if (db.Find(stmt.target.target_table) < 0) {
-				throw std::runtime_error("pql: there is no table '" + stmt.target.target_table +
-				                         "' to aggregate over");
+				throw std::runtime_error("pql: there is no table '" + stmt.target.target_table + "' to aggregate over");
 			}
-			throw std::runtime_error("pql: no foreign key connects '" + stmt.target.target_table +
-			                         "' to '" + entity.name +
-			                         "', so its rows cannot be attributed to an entity");
+			throw std::runtime_error("pql: no foreign key connects '" + stmt.target.target_table + "' to '" +
+			                         entity.name + "', so its rows cannot be attributed to an entity");
 		}
 		// Without a time column on the child, every row is inside every window: the
 		// horizon silently becomes a no-op and the label collapses to the lifetime
 		// total, which is also fed back in as a feature. That is a leak, so refuse.
 		if (!db.links[(size_t)target_link].dated) {
-			throw std::runtime_error(
-			    "pql: '" + stmt.target.target_table +
-			    "' has no time column, so HORIZON cannot place its rows in the future. "
-			    "Join a timestamp onto it (e.g. from its parent transaction) and predict "
-			    "over that table instead.");
+			throw std::runtime_error("pql: '" + stmt.target.target_table +
+			                         "' has no time column, so HORIZON cannot place its rows in the future. "
+			                         "Join a timestamp onto it (e.g. from its parent transaction) and predict "
+			                         "over that table instead.");
 		}
 		if (!stmt.target.ref.name.empty()) {
 			value_col = db.At(stmt.target.target_table).Find(stmt.target.ref.name);
@@ -4597,8 +4533,7 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 	}
 	const int attr_col = forecast ? -1 : entity.Find(stmt.target.ref.name);
 	if (!forecast && attr_col < 0) {
-		throw std::runtime_error("pql: no column '" + stmt.target.ref.ToString() + "' on '" +
-		                         entity.name + "'");
+		throw std::runtime_error("pql: no column '" + stmt.target.ref.ToString() + "' on '" + entity.name + "'");
 	}
 
 	const double horizon = stmt.horizon.present ? double(stmt.horizon.Micros()) : 0.0;
@@ -4646,9 +4581,8 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 				}
 			}
 			if (generated.empty()) {
-				throw std::runtime_error(
-				    "pql: EVERY produced no anchors; '" + stmt.target.target_table +
-				    "' does not span enough time for one horizon before and after");
+				throw std::runtime_error("pql: EVERY produced no anchors; '" + stmt.target.target_table +
+				                         "' does not span enough time for one horizon before and after");
 			}
 		}
 	}
@@ -4665,15 +4599,13 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 				gex.entity_row = (uint32_t)r;
 				gex.anchor = gen_anchor;
 				bool any_prev = false;
-				gex.base = AggregateWindow(db, db.links[(size_t)target_link],
-				                           db.At(stmt.target.target_table), (uint32_t)r,
-				                           gex.anchor - horizon, gex.anchor, stmt.target.kind,
-				                           value_col, stmt.target.filter.get(), any_prev);
+				gex.base = AggregateWindow(db, db.links[(size_t)target_link], db.At(stmt.target.target_table),
+				                           (uint32_t)r, gex.anchor - horizon, gex.anchor, stmt.target.kind, value_col,
+				                           stmt.target.filter.get(), any_prev);
 				if (need_labels) {
 					bool any = false;
-					gex.label = AggregateWindow(db, db.links[(size_t)target_link],
-					                            db.At(stmt.target.target_table), (uint32_t)r,
-					                            gex.anchor, gex.anchor + horizon, stmt.target.kind,
+					gex.label = AggregateWindow(db, db.links[(size_t)target_link], db.At(stmt.target.target_table),
+					                            (uint32_t)r, gex.anchor, gex.anchor + horizon, stmt.target.kind,
 					                            value_col, stmt.target.filter.get(), any);
 					gex.has_label = true;
 				}
@@ -4686,9 +4618,7 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 		Example ex;
 		ex.entity_row = (uint32_t)r;
 		if (stmt.anchor_is_literal) {
-			ex.anchor = stmt.anchor_literal.kind == Literal::Kind::NUMBER
-			                ? stmt.anchor_literal.number
-			                : 0.0;
+			ex.anchor = stmt.anchor_literal.kind == Literal::Kind::NUMBER ? stmt.anchor_literal.number : 0.0;
 		} else if (anchor_col >= 0) {
 			const Column &ac = entity.columns[(size_t)anchor_col];
 			if (!ac.valid[r]) {
@@ -4702,8 +4632,7 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 
 		if (forecast && target_link >= 0) {
 			bool any_prev = false;
-			ex.base = AggregateWindow(db, db.links[(size_t)target_link],
-			                          db.At(stmt.target.target_table), (uint32_t)r,
+			ex.base = AggregateWindow(db, db.links[(size_t)target_link], db.At(stmt.target.target_table), (uint32_t)r,
 			                          ex.anchor - horizon, ex.anchor, stmt.target.kind, value_col,
 			                          stmt.target.filter.get(), any_prev);
 		}
@@ -4717,9 +4646,8 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 					continue;
 				}
 				bool any = false;
-				ex.label = AggregateWindow(db, db.links[(size_t)target_link],
-				                           db.At(stmt.target.target_table), (uint32_t)r, ex.anchor,
-				                           ex.anchor + horizon, stmt.target.kind, value_col,
+				ex.label = AggregateWindow(db, db.links[(size_t)target_link], db.At(stmt.target.target_table),
+				                           (uint32_t)r, ex.anchor, ex.anchor + horizon, stmt.target.kind, value_col,
 				                           stmt.target.filter.get(), any);
 				ex.has_label = true;
 			} else {
@@ -4750,9 +4678,8 @@ using CancelCheck = std::function<void()>; // empty means never cancelled
 
 // Score an index set in batches through MatMulNT. The scratch is grown on the
 // first call and reused, so an epoch's validation pass performs no allocation.
-inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<size_t> &idx,
-                      EvalScratch &scratch, std::vector<double> &out,
-                      const CancelCheck &cancelled = CancelCheck()) {
+inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<size_t> &idx, EvalScratch &scratch,
+                      std::vector<double> &out, const CancelCheck &cancelled = CancelCheck()) {
 	const int width = ds.width, hidden = model.hidden;
 	const size_t cap = EvalScratch::ROWS;
 	out.assign(idx.size(), 0.0);
@@ -4767,16 +4694,13 @@ inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<s
 			const float *row = ds.Row(idx[base + (size_t)i]);
 			std::memcpy(xb + (size_t)i * (size_t)width, row, sizeof(float) * (size_t)width);
 		}
-		MatMulNT(xb, model.w1.data(), model.b1.data(), scratch.h1.data(), B, width, hidden,
-		         true);
-		MatMulNT(scratch.h1.data(), model.w2.data(), model.b2.data(), scratch.h2.data(), B, hidden,
-		         hidden, true);
+		MatMulNT(xb, model.w1.data(), model.b1.data(), scratch.h1.data(), B, width, hidden, true);
+		MatMulNT(scratch.h1.data(), model.w2.data(), model.b2.data(), scratch.h2.data(), B, hidden, hidden, true);
 		scratch.o.resize((size_t)B);
 		OutputLayer(scratch.h2.data(), model.w3.data(), model.b3[0], scratch.o.data(), B, hidden);
 		for (int i = 0; i < B; i++) {
 			const double o = scratch.o[(size_t)i];
-			double v = model.classification ? 1.0 / (1.0 + std::exp(-o))
-			                                : o * model.label_sd + model.label_mean;
+			double v = model.classification ? 1.0 / (1.0 + std::exp(-o)) : o * model.label_sd + model.label_mean;
 			if (!model.classification) {
 				if (model.residual) {
 					v += ds.examples[idx[base + (size_t)i]].base;
@@ -4804,12 +4728,12 @@ inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<s
 // are carved once and stay valid for the run.
 struct SageScratch {
 	Arena arena;
-	float *xself = nullptr;      // [B x self_dim]
-	std::vector<float *> means;  // per edge: [B x src_dim]
-	float *z = nullptr;          // [B x C] pre-activation
-	float *h = nullptr;          // [B x C] post-ReLU
-	float *dz = nullptr;         // [B x C]
-	float *obuf = nullptr;       // [B] output-layer values
+	float *xself = nullptr;     // [B x self_dim]
+	std::vector<float *> means; // per edge: [B x src_dim]
+	float *z = nullptr;         // [B x C] pre-activation
+	float *h = nullptr;         // [B x C] post-ReLU
+	float *dz = nullptr;        // [B x C]
+	float *obuf = nullptr;      // [B] output-layer values
 	size_t self_stride = 0;
 	std::vector<size_t> mean_stride;
 
@@ -4837,10 +4761,9 @@ struct SageScratch {
 
 // Gather the batch's own features and its neighbourhood means. This is the only
 // part that touches the graph; everything after it is dense linear algebra.
-inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatures &feat,
-                       const SagePrefix &pre, const Dataset &ds, const std::vector<size_t> &idx,
-                       size_t from, int B, const SageParams &params, const VisibleCounts &vc,
-                       SageScratch &sc) {
+inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatures &feat, const SagePrefix &pre,
+                       const Dataset &ds, const std::vector<size_t> &idx, size_t from, int B, const SageParams &params,
+                       const VisibleCounts &vc, SageScratch &sc) {
 	const Frame &entity = db.tables[(size_t)spec.nodes[(size_t)spec.entity_node].table];
 	(void)entity;
 	const int sd = std::max(1, params.self_dim);
@@ -4849,15 +4772,13 @@ inline void SageGather(const Database &db, const SageSpec &spec, const SageFeatu
 		const size_t exi = idx[from + (size_t)i];
 		const Example &ex = ds.examples[exi];
 		if (params.self_dim > 0) {
-			std::memcpy(sc.xself + (size_t)i * (size_t)sd,
-			            xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
+			std::memcpy(sc.xself + (size_t)i * (size_t)sd, xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
 			            sizeof(float) * (size_t)params.self_dim);
 		}
 		for (size_t e = 0; e < spec.edges.size(); e++) {
 			const int d = params.src_dim[e];
 			// src_dim already includes the degree slot, so pass the feature width.
-			SageMeanAt(pre, e, ex.entity_row, vc.At(e, exi),
-			           sc.means[e] + (size_t)i * (size_t)std::max(1, d), d - 1);
+			SageMeanAt(pre, e, ex.entity_row, vc.At(e, exi), sc.means[e] + (size_t)i * (size_t)std::max(1, d), d - 1);
 		}
 	}
 }
@@ -4927,8 +4848,7 @@ struct SageGrads {
 
 // `dout` holds dLoss/dout per row. Layer-1 inputs are raw features, so no
 // gradient flows past the aggregation; that is exact for a single layer.
-inline void SageBackward(const SageParams &p, int B, const std::vector<float> &dout,
-                         SageScratch &sc, SageGrads &g) {
+inline void SageBackward(const SageParams &p, int B, const std::vector<float> &dout, SageScratch &sc, SageGrads &g) {
 	const int C = p.channels;
 	// Blocked by channel, not by row: gw_out and gbias are accumulated over the
 	// whole batch, so walking rows on the inside would make both a
@@ -4981,8 +4901,7 @@ inline void SageBackward(const SageParams &p, int B, const std::vector<float> &d
 
 // Build the child layer: for every entity-edge, find the child's own children,
 // and size a W_self plus one W_neigh per grandchild relation.
-inline SageChildParams BuildChildLayer(const Database &db, const SageSpec &spec, int C,
-                                       uint64_t seed) {
+inline SageChildParams BuildChildLayer(const Database &db, const SageSpec &spec, int C, uint64_t seed) {
 	SageChildParams cp;
 	cp.channels = C;
 	uint64_t st = seed ? seed ^ 0xA5A5A5A5u : 0x1234567u;
@@ -5005,8 +4924,7 @@ inline SageChildParams BuildChildLayer(const Database &db, const SageSpec &spec,
 		cp.w_self.push_back({});
 		fill(cp.w_self.back(), (size_t)C * (size_t)std::max(1, sd), std::max(1, sd));
 		cp.bias.push_back(std::vector<float>((size_t)C, 0.0f));
-		const std::string child_tbl =
-		    db.tables[(size_t)spec.nodes[(size_t)spec.edges[e].src_node].table].name;
+		const std::string child_tbl = db.tables[(size_t)spec.nodes[(size_t)spec.edges[e].src_node].table].name;
 		std::vector<int> links;
 		std::vector<int> dims;
 		std::vector<std::vector<float>> ws;
@@ -5090,8 +5008,7 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 			X.assign(flatn * (size_t)std::max(1, sd), 0.0f);
 			if (sd > 0) {
 				for (size_t i = 0; i < flatn; i++) {
-					std::memcpy(&X[i * (size_t)sd], src + (size_t)elk.flat[i] * (size_t)sd,
-					            sizeof(float) * (size_t)sd);
+					std::memcpy(&X[i * (size_t)sd], src + (size_t)elk.flat[i] * (size_t)sd, sizeof(float) * (size_t)sd);
 				}
 			}
 		}
@@ -5157,8 +5074,7 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 				if ((size_t)u >= gparents) {
 					continue;
 				}
-				const double tu = elk.dated ? elk.Time(u)
-				                            : std::numeric_limits<double>::infinity();
+				const double tu = elk.dated ? elk.Time(u) : std::numeric_limits<double>::infinity();
 				const size_t vis = Database::VisiblePrefix(glk, gf, u, tu);
 				if (vis == 0) {
 					continue;
@@ -5181,9 +5097,8 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 
 // Per epoch, only the weight-dependent part: the GEMMs, the ReLU, and the
 // running sums the entity reads. Buffers are sized on the first call and reused.
-inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
-                                   const SageChildParams &cp, const ChildStatic &cs,
-                                   ChildEmbed &ce) {
+inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec, const SageChildParams &cp,
+                                   const ChildStatic &cs, ChildEmbed &ce) {
 	const int C = cp.channels;
 	ce.hmask.resize(spec.edges.size());
 	ce.psum.resize(spec.edges.size());
@@ -5244,8 +5159,7 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 			bool finished = false;
 			if (sd > 0) {
 				const bool last = ngc == 0;
-				MatMulNT(xc + base * (size_t)sd, cp.w_self[e].data(), last ? bs : nullptr, hbuf,
-				         rows, sd, C, last);
+				MatMulNT(xc + base * (size_t)sd, cp.w_self[e].data(), last ? bs : nullptr, hbuf, rows, sd, C, last);
 				finished = last;
 			} else {
 				std::fill(hbuf, hbuf + (size_t)rows * (size_t)C, 0.0f);
@@ -5253,8 +5167,8 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 			for (size_t g = 0; g < ngc; g++) {
 				const bool last = g + 1 == ngc;
 				const int gd = cp.gc_dim[e][g];
-				MatMulAccNT(cs.gc_mean[e][g].data() + base * (size_t)gd, cp.w_gc[e][g].data(),
-				            last ? bs : nullptr, hbuf, rows, gd, C, last);
+				MatMulAccNT(cs.gc_mean[e][g].data() + base * (size_t)gd, cp.w_gc[e][g].data(), last ? bs : nullptr,
+				            hbuf, rows, gd, C, last);
 				finished = finished || last;
 			}
 			if (!finished) {
@@ -5305,10 +5219,9 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 
 // Gather for the two-hop case: the entity's message is the mean of its
 // children's EMBEDDINGS (plus degree), not of their raw columns.
-inline void SageGather2(const SageSpec &spec, const SageFeatures &feat, const ChildEmbed &ce,
-                        const Dataset &ds, const std::vector<size_t> &idx, size_t from, int B,
-                        int C, const SageParams &params, const VisibleCounts &vc,
-                        SageScratch &sc) {
+inline void SageGather2(const SageSpec &spec, const SageFeatures &feat, const ChildEmbed &ce, const Dataset &ds,
+                        const std::vector<size_t> &idx, size_t from, int B, int C, const SageParams &params,
+                        const VisibleCounts &vc, SageScratch &sc) {
 	// The entity's own columns, exactly as the one-hop gather collects them. This
 	// used to be left out here, so xself stayed at the zeros the arena handed
 	// back: two-hop models saw none of the entity's own attributes, and w_self
@@ -5318,8 +5231,7 @@ inline void SageGather2(const SageSpec &spec, const SageFeatures &feat, const Ch
 		const float *xsrc = feat.x[(size_t)spec.entity_node].data();
 		for (int i = 0; i < B; i++) {
 			const Example &ex = ds.examples[idx[from + (size_t)i]];
-			std::memcpy(sc.xself + (size_t)i * (size_t)sd,
-			            xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
+			std::memcpy(sc.xself + (size_t)i * (size_t)sd, xsrc + (size_t)ex.entity_row * (size_t)params.self_dim,
 			            sizeof(float) * (size_t)params.self_dim);
 		}
 	}
@@ -5384,16 +5296,14 @@ struct ChildGrads {
 // child, then through the child layer. Only rows actually touched by this batch
 // are cleared and updated, so the cost is O(batch * degree * C) rather than
 // O(all children * C).
-inline void BuildVisibleCounts(const Database &db, const SageSpec &spec, const Dataset &ds,
-                               VisibleCounts &vc) {
+inline void BuildVisibleCounts(const Database &db, const SageSpec &spec, const Dataset &ds, VisibleCounts &vc) {
 	vc.n.assign(spec.edges.size(), std::vector<uint32_t>());
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const Link &lk = db.links[(size_t)spec.edges[e].link];
 		const Frame &child = db.At(lk.child_table);
 		vc.n[e].resize(ds.examples.size());
 		for (size_t i = 0; i < ds.examples.size(); i++) {
-			vc.n[e][i] = (uint32_t)Database::VisiblePrefix(lk, child, ds.examples[i].entity_row,
-			                                              ds.examples[i].anchor);
+			vc.n[e][i] = (uint32_t)Database::VisiblePrefix(lk, child, ds.examples[i].entity_row, ds.examples[i].anchor);
 		}
 	}
 }
@@ -5468,11 +5378,10 @@ struct ChildBackScratch {
 	}
 };
 
-inline void SageBackward2(const Database &db, const SageSpec &spec, const SageParams &p,
-                          const SageChildParams &cp, const ChildStatic &cs,
-                          const ChildEmbed &ce, const Dataset &ds,
-                          const std::vector<size_t> &idx, size_t from, int B, SageScratch &sc,
-                          ChildGrads &cg, ChildBackScratch &st, const VisibleCounts &vc) {
+inline void SageBackward2(const Database &db, const SageSpec &spec, const SageParams &p, const SageChildParams &cp,
+                          const ChildStatic &cs, const ChildEmbed &ce, const Dataset &ds,
+                          const std::vector<size_t> &idx, size_t from, int B, SageScratch &sc, ChildGrads &cg,
+                          ChildBackScratch &st, const VisibleCounts &vc) {
 	const int C = p.channels;
 	for (size_t e = 0; e < spec.edges.size(); e++) {
 		const Link &lk = db.links[(size_t)spec.edges[e].link];
@@ -5587,14 +5496,12 @@ inline void SageBackward2(const Database &db, const SageSpec &spec, const SagePa
 				if (sd > 0) {
 					// Only the feature columns are written; the ones column and the pad
 					// were set when the buffer was sized and never change.
-					std::memcpy(xmat + (size_t)rows * (size_t)xw, xsrc + pos * (size_t)sd,
-					            sizeof(float) * (size_t)sd);
+					std::memcpy(xmat + (size_t)rows * (size_t)xw, xsrc + pos * (size_t)sd, sizeof(float) * (size_t)sd);
 				}
 				for (size_t g = 0; g < ngc; g++) {
 					const int gd = cp.gc_dim[e][g];
 					std::memcpy(st.gcmat[g].data() + (size_t)rows * (size_t)st.gcw[g],
-					            &cs.gc_mean[e][g][pos * (size_t)gd],
-					            sizeof(float) * (size_t)gd);
+					            &cs.gc_mean[e][g][pos * (size_t)gd], sizeof(float) * (size_t)gd);
 				}
 				if (++rows == ChildBackScratch::CH) {
 					st.rows = rows;
@@ -5626,7 +5533,6 @@ struct TrainReport {
 	int width = 0;
 };
 
-
 inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &model,
                               const CancelCheck &cancelled = CancelCheck()) {
 	TrainReport rep;
@@ -5636,16 +5542,13 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	// Qualifiers are checked once, up front, against the relation each filter is
 	// actually evaluated on.
 	ValidateFilterScope(stmt.filter.get(), entity, stmt.entity_alias, "WHERE");
-	if (forecast && stmt.target.filter && stmt.target.target_table != "*" &&
-	    db.Find(stmt.target.target_table) >= 0) {
-		ValidateFilterScope(stmt.target.filter.get(), db.At(stmt.target.target_table), "",
-		                    "inner WHERE");
+	if (forecast && stmt.target.filter && stmt.target.target_table != "*" && db.Find(stmt.target.target_table) >= 0) {
+		ValidateFilterScope(stmt.target.filter.get(), db.At(stmt.target.target_table), "", "inner WHERE");
 	}
 	const int target_col = forecast ? -1 : entity.Find(stmt.target.ref.name);
 
 	// A text target would be regressed as an arbitrary dictionary code.
-	if (!forecast && target_col >= 0 &&
-	    entity.columns[(size_t)target_col].type == ColType::CATEGORY) {
+	if (!forecast && target_col >= 0 && entity.columns[(size_t)target_col].type == ColType::CATEGORY) {
 		throw std::runtime_error("pql: '" + stmt.target.ref.ToString() +
 		                         "' is text; PQL predicts numeric and boolean attributes only");
 	}
@@ -5699,18 +5602,17 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		}
 	}
 	ValidateExcluded(db, entity, stmt);
-	model.features =
-	    FitFeatureSpec(db, entity, stmt, anchor_col, target_col, max_mean_cols,
-	                   (int)stmt.options.Num("MAX_CATEGORIES", 16), train_cutoff);
+	model.features = FitFeatureSpec(db, entity, stmt, anchor_col, target_col, max_mean_cols,
+	                                (int)stmt.options.Num("MAX_CATEGORIES", 16), train_cutoff);
 	const AggCache cache = BuildAggCache(db, model.features);
 	Dataset ds = CollectExamples(db, stmt, model.features, cache, anchor_col, true);
 	if (ds.examples.empty()) {
 		if (ds.censored > 0) {
-			throw std::runtime_error(
-			    "pql: all " + std::to_string(ds.censored) +
-			    " candidate rows were dropped because their label window ends after the last "
-			    "row of '" + stmt.target.target_table +
-			    "'. Use a shorter HORIZON or anchors further from the end of the data.");
+			throw std::runtime_error("pql: all " + std::to_string(ds.censored) +
+			                         " candidate rows were dropped because their label window ends after the last "
+			                         "row of '" +
+			                         stmt.target.target_table +
+			                         "'. Use a shorter HORIZON or anchors further from the end of the data.");
 		}
 		throw std::runtime_error("pql: no training rows matched; check WHERE and AT");
 	}
@@ -5740,10 +5642,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	SplitByAnchor(ds, stmt, tr, va, te);
 	// Now that the folds exist, decide the task type from training labels alone.
 	{
-		const bool countish = stmt.target.kind == TargetKind::COUNT ||
-		                      stmt.target.kind == TargetKind::SUM ||
-		                      stmt.target.kind == TargetKind::AVG ||
-		                      stmt.target.kind == TargetKind::MIN ||
+		const bool countish = stmt.target.kind == TargetKind::COUNT || stmt.target.kind == TargetKind::SUM ||
+		                      stmt.target.kind == TargetKind::AVG || stmt.target.kind == TargetKind::MIN ||
 		                      stmt.target.kind == TargetKind::MAX;
 		binary = !countish;
 		if (binary) {
@@ -5760,8 +5660,7 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	rep.metric_name = binary ? "auroc" : "mae";
 	// Residual only helps a real forecast; an attribute has no "previous window".
 	model.residual = forecast && !binary;
-	model.nonnegative = stmt.target.kind == TargetKind::COUNT ||
-	                    stmt.target.kind == TargetKind::EXISTS;
+	model.nonnegative = stmt.target.kind == TargetKind::COUNT || stmt.target.kind == TargetKind::EXISTS;
 	if (model.residual) {
 		for (auto &e : ds.examples) {
 			e.label -= e.base;
@@ -5770,9 +5669,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	if (tr.empty()) {
 		// Falling back to "train on everything" here would report a test metric
 		// measured on the training rows, which reads as a great result.
-		throw std::runtime_error(
-		    "pql: SPLIT leaves no training rows (every anchor is at or after VALIDATE FROM). "
-		    "Check the split boundaries against the anchor column's range.");
+		throw std::runtime_error("pql: SPLIT leaves no training rows (every anchor is at or after VALIDATE FROM). "
+		                         "Check the split boundaries against the anchor column's range.");
 	}
 	if (binary) {
 		// One class cannot be separated from nothing: the fit is a constant and
@@ -5783,8 +5681,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		}
 		if (pos == 0 || pos == tr.size()) {
 			throw std::runtime_error(std::string("pql: the target has ") +
-			                         (pos == 0 ? "no positives" : "no negatives") +
-			                         " in the training fold (" + std::to_string(tr.size()) +
+			                         (pos == 0 ? "no positives" : "no negatives") + " in the training fold (" +
+			                         std::to_string(tr.size()) +
 			                         " rows), so there is nothing to separate. Check the "
 			                         "target, its inner WHERE, and the HORIZON.");
 		}
@@ -5892,11 +5790,9 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 			for (size_t b = 0; b < fold.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, fold.size() - b);
 				if (n_layers >= 2) {
-					SageGather2(model.sage_spec, feats, ce, ds, fold, b, B, C, model.sage_params,
-					            vcounts, sc);
+					SageGather2(model.sage_spec, feats, ce, ds, fold, b, B, C, model.sage_params, vcounts, sc);
 				} else {
-					SageGather(db, model.sage_spec, feats, prefix, ds, fold, b, B,
-					           model.sage_params, vcounts, sc);
+					SageGather(db, model.sage_spec, feats, prefix, ds, fold, b, B, model.sage_params, vcounts, sc);
 				}
 				SageForward(model.sage_params, B, sc, outs);
 				for (int i = 0; i < B; i++) {
@@ -5929,11 +5825,9 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 					cancelled();
 				}
 				if (n_layers >= 2) {
-					SageGather2(model.sage_spec, feats, ce, ds, tr, b, B, C, model.sage_params,
-					            vcounts, sc);
+					SageGather2(model.sage_spec, feats, ce, ds, tr, b, B, C, model.sage_params, vcounts, sc);
 				} else {
-					SageGather(db, model.sage_spec, feats, prefix, ds, tr, b, B,
-					           model.sage_params, vcounts, sc);
+					SageGather(db, model.sage_spec, feats, prefix, ds, tr, b, B, model.sage_params, vcounts, sc);
 				}
 				SageForward(model.sage_params, B, sc, outs);
 				douts.assign((size_t)B, 0.0f);
@@ -5951,12 +5845,11 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				SageBackward(model.sage_params, B, douts, sc, gr);
 				if (n_layers >= 2) {
 					cg.Zero();
-					SageBackward2(db, model.sage_spec, model.sage_params, model.sage_child, cstat,
-					              ce, ds, tr, b, B, sc, cg, cbs, vcounts);
+					SageBackward2(db, model.sage_spec, model.sage_params, model.sage_child, cstat, ce, ds, tr, b, B, sc,
+					              cg, cbs, vcounts);
 				}
 				const float inv = 1.0f / float(std::max(1, B));
-				auto step = [&](std::vector<float> &w, std::vector<float> &g, Adam &opt,
-				                double decay) {
+				auto step = [&](std::vector<float> &w, std::vector<float> &g, Adam &opt, double decay) {
 					for (auto &v : g) {
 						v *= inv;
 					}
@@ -6025,16 +5918,15 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		if (have_m) {
 			model.sage_params = best_p;
 			model.sage_child = best_c;
-			rep.val_metric = std::isfinite(best_m) ? (binary ? best_m : -best_m)
-			                                       : std::numeric_limits<double>::quiet_NaN();
+			rep.val_metric =
+			    std::isfinite(best_m) ? (binary ? best_m : -best_m) : std::numeric_limits<double>::quiet_NaN();
 		}
 		rep.n_train = tr.size();
 		rep.n_val = va.size();
 		rep.n_test = te.size();
 		rep.n_censored = ds.censored;
 		rep.n_no_anchor = ds.no_anchor;
-		rep.width = (int)(model.sage_params.ParamCount() +
-		                  (n_layers >= 2 ? model.sage_child.ParamCount() : 0));
+		rep.width = (int)(model.sage_params.ParamCount() + (n_layers >= 2 ? model.sage_child.ParamCount() : 0));
 		if (binary) {
 			for (const auto &e : ds.examples) {
 				rep.n_positives += (e.label > 0.5) ? 1 : 0;
@@ -6274,8 +6166,8 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		model = best;
 		// -inf means no epoch ever produced a defined metric (a single-class fold),
 		// which must read as "undefined", not as a very bad score.
-		rep.val_metric = std::isfinite(best_val) ? (binary ? best_val : -best_val)
-		                                        : std::numeric_limits<double>::quiet_NaN();
+		rep.val_metric =
+		    std::isfinite(best_val) ? (binary ? best_val : -best_val) : std::numeric_limits<double>::quiet_NaN();
 	}
 	rep.n_train = tr.size();
 	rep.n_val = va.size();
@@ -6332,9 +6224,8 @@ struct Prediction {
 // whatever the model was trained with: a two-hop model's edge widths are C+1
 // (child embeddings), so the one-hop prefix sums, whose stride is the child's
 // raw width, were read past their end and the predictions were garbage.
-inline void ScoreSage(const Database &db, const Model &model, const Frame &entity,
-                      const Dataset &ds, std::vector<double> &out,
-                      const CancelCheck &cancelled = CancelCheck()) {
+inline void ScoreSage(const Database &db, const Model &model, const Frame &entity, const Dataset &ds,
+                      std::vector<double> &out, const CancelCheck &cancelled = CancelCheck()) {
 	SageSpec spec_s = model.sage_spec;
 	RebindSageSpec(db, entity, spec_s);
 	const SageFeatures feats = BuildSageFeatures(db, spec_s);
@@ -6405,8 +6296,7 @@ inline void ScoreSage(const Database &db, const Model &model, const Frame &entit
 // anchor and horizon so a PREDICT that omits them still lines up; anything the
 // caller does restate must match, or the features would be built differently
 // from how they were learned.
-inline std::vector<Prediction> RunPredict(const Database &db, const Model &model,
-                                          const Statement &stmt,
+inline std::vector<Prediction> RunPredict(const Database &db, const Model &model, const Statement &stmt,
                                           const CancelCheck &cancelled = CancelCheck()) {
 	const Frame &entity = db.At(stmt.entity_table);
 	Statement eff = stmt;
@@ -6446,15 +6336,14 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 		const std::string asked = stmt.target.ToString();
 		const std::string trained = model.spec_stmt.target.ToString();
 		if (ToUpper(asked) != ToUpper(trained)) {
-			throw std::runtime_error("pql: model '" + model.name + "' predicts " + trained +
-			                         ", not " + asked + "; drop the target or retrain");
+			throw std::runtime_error("pql: model '" + model.name + "' predicts " + trained + ", not " + asked +
+			                         "; drop the target or retrain");
 		}
 	}
 	if (stmt.horizon.present && model.spec_stmt.horizon.present &&
 	    stmt.horizon.Micros() != model.spec_stmt.horizon.Micros()) {
 		throw std::runtime_error("pql: model '" + model.name + "' was trained with HORIZON " +
-		                         model.spec_stmt.horizon.ToString() + ", not " +
-		                         stmt.horizon.ToString());
+		                         model.spec_stmt.horizon.ToString() + ", not " + stmt.horizon.ToString());
 	}
 	eff.target = model.spec_stmt.target;
 	const int anchor_col = eff.anchor_is_literal ? -1 : ResolveAnchorColumn(entity, eff);
@@ -6534,8 +6423,7 @@ struct FeatureImportance {
 	double drop = 0; // metric lost when this group is shuffled; higher means more used
 };
 
-inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model &model,
-                                                 const Statement &stmt,
+inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model &model, const Statement &stmt,
                                                  const CancelCheck &cancelled = CancelCheck()) {
 	if (model.sage) {
 		throw std::runtime_error("pql: EXPLAIN reads the dense feature vector, and this model was "
@@ -6620,21 +6508,17 @@ inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model
 		saved.assign(n * (size_t)w, 0.0f);
 		shuffled.assign(n * (size_t)w, 0.0f);
 		for (size_t i = 0; i < n; i++) {
-			std::memcpy(&saved[i * (size_t)w], &ds.x[all[i] * (size_t)width + k],
-			            sizeof(float) * (size_t)w);
+			std::memcpy(&saved[i * (size_t)w], &ds.x[all[i] * (size_t)width + k], sizeof(float) * (size_t)w);
 		}
 		for (size_t i = 0; i < n; i++) {
-			std::memcpy(&shuffled[i * (size_t)w], &saved[perm[i] * (size_t)w],
-			            sizeof(float) * (size_t)w);
+			std::memcpy(&shuffled[i * (size_t)w], &saved[perm[i] * (size_t)w], sizeof(float) * (size_t)w);
 		}
 		for (size_t i = 0; i < n; i++) {
-			std::memcpy(&ds.x[all[i] * (size_t)width + k], &shuffled[i * (size_t)w],
-			            sizeof(float) * (size_t)w);
+			std::memcpy(&ds.x[all[i] * (size_t)width + k], &shuffled[i * (size_t)w], sizeof(float) * (size_t)w);
 		}
 		const double m = measure();
 		for (size_t i = 0; i < n; i++) {
-			std::memcpy(&ds.x[all[i] * (size_t)width + k], &saved[i * (size_t)w],
-			            sizeof(float) * (size_t)w);
+			std::memcpy(&ds.x[all[i] * (size_t)width + k], &saved[i * (size_t)w], sizeof(float) * (size_t)w);
 		}
 		FeatureImportance fi;
 		fi.feature = g.first;
@@ -6653,8 +6537,7 @@ inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model
 	return out;
 }
 
-inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &model,
-                                            const Statement &stmt,
+inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &model, const Statement &stmt,
                                             const CancelCheck &cancelled = CancelCheck()) {
 	Statement eff = model.spec_stmt;
 	eff.kind = StmtKind::BACKTEST;
@@ -6685,10 +6568,8 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 		ScoreRows(model, ds, all, es, preds, cancelled);
 	}
 
-	const double lo = stmt.has_from ? stmt.backtest_from.number
-	                                : -std::numeric_limits<double>::infinity();
-	const double hi =
-	    stmt.has_to ? stmt.backtest_to.number : std::numeric_limits<double>::infinity();
+	const double lo = stmt.has_from ? stmt.backtest_from.number : -std::numeric_limits<double>::infinity();
+	const double hi = stmt.has_to ? stmt.backtest_to.number : std::numeric_limits<double>::infinity();
 	std::vector<BacktestRow> out;
 	out.reserve(ds.examples.size());
 	for (size_t i = 0; i < ds.examples.size(); i++) {

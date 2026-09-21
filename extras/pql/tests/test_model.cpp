@@ -1,4 +1,4 @@
-#include "src/pql.hpp"
+#include "pql.hpp"
 #include <cstdio>
 #include <random>
 using namespace pql;
