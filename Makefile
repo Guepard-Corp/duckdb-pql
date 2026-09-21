@@ -5,7 +5,8 @@ EXT_NAME=pql
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 # Include the Makefile from extension-ci-tools
-include extension-ci-tools/makefiles/duckdb_extension.Makefile
+# Optional: the standalone language tests below need neither it nor the submodules.
+-include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 #### Standalone tests of the language itself (no DuckDB build needed)
 CPP_TESTS=parse model categorical links degenerate fuzz
