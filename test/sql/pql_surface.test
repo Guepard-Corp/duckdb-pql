@@ -1,0 +1,360 @@
+# name: test/sql/pql_surface.test
+# description: PQL through the extension: error paths, quoting, schema changes, keys, connections
+# group: [sql]
+
+require pql
+
+statement ok
+CREATE TABLE customers AS
+  SELECT i AS id,
+         TIMESTAMP '2025-01-01' + INTERVAL '1 day' * ((i * 13) % 300) AS last_seen,
+         ['EU', 'US', 'APAC'][1 + (i % 3)] AS region,
+         (i % 7) + 1 AS tier,
+         CASE WHEN (i % 18) < 6 THEN (i % 5) <> 0 ELSE (i % 5) = 0 END AS churned
+  FROM range(1500) t(i);
+
+statement ok
+CREATE TABLE orders AS
+  SELECT row_number() OVER () AS id, c.id AS customer_id,
+         c.last_seen - INTERVAL '1 day' * (k * 7 + 1) AS placed_at,
+         20.0 + (k * 3) AS amount,
+         CASE WHEN (c.id + k) % 9 = 0 THEN 'refunded' ELSE 'paid' END AS status
+  FROM customers c, range(20) r(k) WHERE k < (c.id % 18);
+
+statement ok
+INSERT INTO orders
+  SELECT 900000 + c.id * 10 + k, c.id, c.last_seen + INTERVAL '1 day' * (k * 7 + 2), 20.0 + (k * 3), 'paid'
+  FROM customers c, range(20) r(k)
+  WHERE k < (c.id % 18)
+    AND (((c.id % 18) > 9 AND (c.id * 7 % 10) < 7) OR ((c.id % 18) <= 9 AND (c.id * 7 % 10) < 2));
+
+# ---------------------------------------------------------------------------
+# Names that resolve to nothing are named in the error.
+# ---------------------------------------------------------------------------
+
+statement error
+TRAIN MODEL m PREDICT COUNT(nosuch) FOR customers AT last_seen HORIZON 30 DAYS;
+----
+<REGEX>:.*no table 'nosuch'.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR nosuch AT last_seen HORIZON 30 DAYS;
+----
+<REGEX>:.*entity table 'nosuch' not found.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT nosuch HORIZON 30 DAYS;
+----
+<REGEX>:.*AT column 'nosuch' not found.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS WHERE nosuch = 1;
+----
+<REGEX>:.*column 'nosuch'.*does not exist.*
+
+statement error
+TRAIN MODEL m PREDICT customers.nosuch FOR customers;
+----
+<REGEX>:.*no column 'customers.nosuch'.*
+
+# the inner WHERE is evaluated on the child, and says so when given the entity
+statement error
+TRAIN MODEL m PREDICT EXISTS(orders WHERE customers.tier > 3) FOR customers AT last_seen HORIZON 30 DAYS;
+----
+<REGEX>:.*inner WHERE.*evaluated on 'orders'.*
+
+# ---------------------------------------------------------------------------
+# Option bounds and the argument to pql_exec.
+# ---------------------------------------------------------------------------
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = -1);
+----
+<REGEX>:.*EPOCHS must be between.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (lr = 0);
+----
+<REGEX>:.*LR must be between.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (batch = 0);
+----
+<REGEX>:.*BATCH must be between.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (layers = 3);
+----
+<REGEX>:.*LAYERS must be between.*
+
+statement error
+TRAIN MODEL m PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (arch = 'nope');
+----
+<REGEX>:.*ARCH must be.*
+
+statement error
+SELECT * FROM pql_exec('');
+----
+<REGEX>:.*PQL.*
+
+statement error
+SELECT * FROM pql_exec('SELECT 1');
+----
+<REGEX>:.*PQL.*
+
+# DuckDB's own EXPLAIN is untouched by the parser extension
+statement ok
+EXPLAIN SELECT 42;
+
+# ---------------------------------------------------------------------------
+# Quoting: mixed-case tables, a column named after a keyword, quotes in values.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE "Mixed Case" AS SELECT id, last_seen, tier, region AS "Region Name", churned AS horizon FROM customers;
+
+statement ok
+CREATE TABLE "Mixed Case_ev" AS SELECT id, customer_id AS "Mixed Case_id", placed_at FROM orders;
+
+statement ok
+TRAIN MODEL q1 PREDICT COUNT("Mixed Case_ev") FOR "Mixed Case" AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+statement ok
+TRAIN MODEL q2 PREDICT "Mixed Case".horizon FOR "Mixed Case" WHERE "Region Name" = 'EU' OPTIONS (epochs = 1);
+
+query I
+SELECT count(*) FROM pql_exec('PREDICT "Mixed Case".horizon FOR "Mixed Case" WHERE "Region Name" = ''EU'' USING MODEL q2');
+----
+500
+
+statement ok
+CREATE TABLE names AS
+  SELECT id, last_seen, tier, CASE WHEN id % 2 = 0 THEN 'O''Brien' ELSE 'Zoë' END AS surname FROM customers;
+
+statement ok
+CREATE TABLE names_ev AS SELECT id, customer_id AS names_id, placed_at FROM orders;
+
+statement ok
+TRAIN MODEL q3 PREDICT COUNT(names_ev) FOR names AT last_seen HORIZON 30 DAYS WHERE surname = 'O''Brien' OPTIONS (epochs = 1);
+
+# the escaped quote survives both the parser extension and the string form
+query I
+SELECT count(*) FROM pql_exec('PREDICT COUNT(names_ev) FOR names WHERE surname = ''O''''Brien'' USING MODEL q3');
+----
+750
+
+query I
+SELECT count(*) FROM pql_exec('PREDICT COUNT(names_ev) FOR names WHERE surname = ''Zoë'' USING MODEL q3');
+----
+750
+
+# a quoted model name, and an unquoted one is matched case-insensitively
+statement ok
+TRAIN MODEL "my model" PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+query I
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers WHERE id < 3 USING MODEL "my model"');
+----
+3
+
+statement ok
+TRAIN MODEL CaseName PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+query I
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers WHERE id < 3 USING MODEL casename');
+----
+3
+
+statement ok
+TRAIN MODEL cmt PREDICT COUNT(orders) -- a comment
+  FOR customers AT last_seen /* block */ HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+# ---------------------------------------------------------------------------
+# PREDICT AT <literal>: one forecast per entity, made from that moment.
+# ---------------------------------------------------------------------------
+
+query III
+SELECT count(*), min(anchor) = TIMESTAMP '2025-06-01', max(anchor) = TIMESTAMP '2025-06-01'
+FROM pql_exec('PREDICT COUNT(orders) FOR customers AT ''2025-06-01'' USING MODEL cmt');
+----
+1500	true	true
+
+statement ok
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers AT ''2025-06-01'' HORIZON 30 DAYS USING MODEL cmt');
+
+statement error
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers AT ''garbage'' USING MODEL cmt');
+----
+<REGEX>:.*'garbage' is not a timestamp.*
+
+statement error
+SELECT count(*) FROM pql_exec('BACKTEST MODEL cmt FROM ''junk''');
+----
+<REGEX>:.*'junk' is not a timestamp.*
+
+# the alias may be used in the filter, or the table name may
+query I
+SELECT CAST((SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers AS c WHERE c.tier > 3 USING MODEL cmt'))
+          = (SELECT count(*) FROM customers WHERE tier > 3) AS INTEGER);
+----
+1
+
+# EXPLAIN over a slice too small to permute says so
+statement error
+SELECT count(*) FROM pql_exec('EXPLAIN MODEL cmt WHERE tier = 999');
+----
+<REGEX>:.*too few rows.*
+
+# ---------------------------------------------------------------------------
+# The schema moves under a trained model.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE gone AS SELECT * FROM customers;
+
+statement ok
+CREATE TABLE gone_ev AS SELECT id, customer_id AS gone_id, placed_at, amount FROM orders;
+
+statement ok
+TRAIN MODEL dg PREDICT COUNT(gone_ev) FOR gone AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+# a new column is ignored: the model reads what it was trained on
+statement ok
+ALTER TABLE gone ADD COLUMN extra DOUBLE DEFAULT 1.0;
+
+query I
+SELECT count(*) FROM pql_exec('PREDICT COUNT(gone_ev) FOR gone USING MODEL dg');
+----
+1500
+
+# a column the model needs cannot go missing quietly
+statement ok
+ALTER TABLE gone DROP COLUMN tier;
+
+statement error
+SELECT count(*) FROM pql_exec('PREDICT COUNT(gone_ev) FOR gone USING MODEL dg');
+----
+<REGEX>:.*column 'tier' used by this model is not present.*
+
+statement error
+SELECT count(*) FROM pql_exec('BACKTEST MODEL dg');
+----
+<REGEX>:.*column 'tier' used by this model.*
+
+statement ok
+DROP TABLE gone;
+
+statement error
+SELECT count(*) FROM pql_exec('PREDICT COUNT(gone_ev) FOR gone USING MODEL dg');
+----
+<REGEX>:.*entity table 'gone' not found.*
+
+# ---------------------------------------------------------------------------
+# Keys come back in their own type.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE strkey AS SELECT 'c' || id AS id, last_seen, tier FROM customers;
+
+statement ok
+CREATE TABLE strkey_ev AS SELECT id, 'c' || customer_id AS strkey_id, placed_at FROM orders;
+
+statement ok
+TRAIN MODEL sk PREDICT COUNT(strkey_ev) FOR strkey AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+query T
+SELECT string_agg(id, ',' ORDER BY id) FROM pql_exec('PREDICT COUNT(strkey_ev) FOR strkey WHERE id IN (''c1'', ''c2'') USING MODEL sk');
+----
+c1,c2
+
+statement ok
+CREATE TABLE hkey AS SELECT id::HUGEINT * 10000000000000 AS id, last_seen, tier FROM customers;
+
+statement ok
+CREATE TABLE hkey_ev AS SELECT id, customer_id::HUGEINT * 10000000000000 AS hkey_id, placed_at FROM orders;
+
+statement ok
+TRAIN MODEL hk PREDICT COUNT(hkey_ev) FOR hkey AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+query I
+SELECT id FROM pql_exec('PREDICT COUNT(hkey_ev) FOR hkey WHERE id = 70000000000000 USING MODEL hk');
+----
+70000000000000
+
+# ---------------------------------------------------------------------------
+# NaN and infinity in a feature column do not poison the model.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ex AS
+  SELECT id, last_seen, tier,
+         CASE WHEN id % 5 = 0 THEN 'nan'::DOUBLE WHEN id % 7 = 0 THEN 'inf'::DOUBLE ELSE id * 1.0 END AS f
+  FROM customers;
+
+statement ok
+CREATE TABLE ex_ev AS
+  SELECT id, customer_id AS ex_id, placed_at, CASE WHEN id % 11 = 0 THEN 'inf'::DOUBLE ELSE amount END AS amount
+  FROM orders;
+
+statement ok
+TRAIN MODEL ex1 PREDICT SUM(ex_ev.amount) FOR ex AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 2);
+
+query I
+SELECT CAST(count(*) = 1500 AND count(prediction) = 1500
+            AND sum(CASE WHEN isnan(prediction) OR isinf(prediction) THEN 1 ELSE 0 END) = 0 AS INTEGER)
+FROM pql_exec('PREDICT SUM(ex_ev.amount) FOR ex USING MODEL ex1');
+----
+1
+
+# ---------------------------------------------------------------------------
+# Models belong to the database, not the connection.
+# ---------------------------------------------------------------------------
+
+statement ok con1
+TRAIN MODEL shared PREDICT COUNT(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 1);
+
+query I con2
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers WHERE id < 5 USING MODEL shared');
+----
+5
+
+statement ok con2
+DROP MODEL shared;
+
+statement error con1
+SELECT count(*) FROM pql_exec('PREDICT COUNT(orders) FOR customers WHERE id < 5 USING MODEL shared');
+----
+<REGEX>:.*no model named 'shared'.*
+
+# ---------------------------------------------------------------------------
+# The same statement gives the same model and the same predictions, bit for bit.
+# ---------------------------------------------------------------------------
+
+statement ok
+TRAIN MODEL det1 PREDICT EXISTS(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 10, hidden = 32);
+
+statement ok
+TRAIN MODEL det2 PREDICT EXISTS(orders) FOR customers AT last_seen HORIZON 30 DAYS OPTIONS (epochs = 10, hidden = 32);
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM pql_exec('PREDICT EXISTS(orders) FOR customers USING MODEL det1')
+  EXCEPT
+  SELECT * FROM pql_exec('PREDICT EXISTS(orders) FOR customers USING MODEL det2'));
+----
+0
+
+# ---------------------------------------------------------------------------
+# BACKTEST over the test fold reproduces TRAIN's own test metric and baseline.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE tr AS SELECT * FROM pql_exec('TRAIN MODEL bt PREDICT SUM(orders.amount) FOR customers AT last_seen HORIZON 60 DAYS SPLIT TEMPORAL VALIDATE FROM ''2025-08-01'' TEST FROM ''2025-09-15'' OPTIONS (epochs = 20)');
+
+query I
+SELECT CAST(round(avg(abs(error)), 6) = round((SELECT test FROM tr), 6)
+        AND round(avg(abs(baseline - actual)), 6) = round((SELECT baseline FROM tr), 6)
+        AND count(*) = (SELECT test_rows FROM tr) AS INTEGER)
+FROM pql_exec('BACKTEST MODEL bt FROM ''2025-09-15''');
+----
+1

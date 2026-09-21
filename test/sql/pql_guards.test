@@ -1,0 +1,415 @@
+# name: test/sql/pql_guards.test
+# description: PQL refuses the inputs that used to produce silently meaningless models
+# group: [sql]
+
+require pql
+
+statement ok
+CREATE TABLE users AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts,
+         (i % 11) * 1.0 AS score, 'g' || (i % 3) AS grp
+  FROM range(400) t(i);
+
+statement ok
+CREATE TABLE events AS
+  SELECT row_number() OVER () AS id, u.id AS user_id,
+         u.ts - INTERVAL '1 day' * (k + 1) AS ts, (k * 2.0) AS amount
+  FROM users u, range(12) r(k) WHERE k < (u.id % 12);
+
+# a child table with no time column cannot honour a horizon
+statement ok
+CREATE TABLE undated AS SELECT row_number() OVER () AS id, u.id AS user_id, 1.0 AS v FROM users u;
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(undated) FOR users AT ts HORIZON 30 DAYS;
+----
+<REGEX>:.*no time column.*
+
+# text columns are not prediction targets
+statement error
+TRAIN MODEL bad PREDICT users.grp FOR users;
+----
+<REGEX>:.*is text.*
+
+# option hygiene
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epocs = 10);
+----
+<REGEX>:.*unknown option.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (hidden = 60000);
+----
+<REGEX>:.*HIDDEN must be between.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 0 DAYS;
+----
+<REGEX>:.*positive.*
+
+# clauses must belong to the statement they appear in
+statement error
+TRAIN MODEL a PREDICT COUNT(events) FOR users AT ts HORIZON 5 DAYS USING MODEL b;
+----
+<REGEX>:.*USING MODEL belongs.*
+
+# a filter qualifier must name the relation it is evaluated on
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AS u AT ts HORIZON 30 DAYS WHERE zzz.score > 1;
+----
+<REGEX>:.*evaluated on.*
+
+statement ok
+TRAIN MODEL good PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20);
+
+# a prediction may not restate a different target or horizon
+statement error
+PREDICT EXISTS(events) FOR users USING MODEL good;
+----
+<REGEX>:.*predicts COUNT.*
+
+statement error
+PREDICT COUNT(events) FOR users HORIZON 365 DAYS USING MODEL good;
+----
+<REGEX>:.*trained with HORIZON.*
+
+# SPLIT accepts real dates and yields disjoint folds
+query I
+SELECT CAST(train_rows > 0 AND val_rows > 0 AND test_rows > 0 AS INTEGER)
+FROM pql_exec('TRAIN MODEL sp PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS SPLIT TEMPORAL VALIDATE FROM ''2024-04-01'' TEST FROM ''2024-06-01'' OPTIONS (epochs = 10)');
+----
+1
+
+# a split that leaves no training rows is an error, not a silent full-set fallback
+statement error
+TRAIN MODEL sp2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  SPLIT TEMPORAL VALIDATE FROM '1990-01-01' TEST FROM '1990-06-01' OPTIONS (epochs = 5);
+----
+<REGEX>:.*no training rows.*
+
+# a timestamp filter compares as a timestamp, not as epoch zero
+query I
+SELECT CAST(count(*) > 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users WHERE ts > ''2024-05-01'' USING MODEL good');
+----
+1
+
+# counts are never negative
+query I
+SELECT CAST(min(prediction) >= 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users USING MODEL good');
+----
+1
+
+# persistence is reported so a user can see what to beat
+query I
+SELECT CAST(baseline IS NOT NULL AS INTEGER)
+FROM pql_exec('TRAIN MODEL b PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 10)');
+----
+1
+
+# a COUNT target stays a regression even when its labels happen to be 0/1
+query I
+SELECT CAST(metric = 'mae' AS INTEGER)
+FROM pql_exec('TRAIN MODEL c PREDICT COUNT(events) FOR users AT ts HORIZON 1 HOUR OPTIONS (epochs = 5)');
+----
+1
+
+# duplicate entity keys cannot be attributed
+statement ok
+CREATE TABLE dupes AS SELECT (i % 50) AS id, TIMESTAMP '2023-12-15' AS ts, 1.0 AS f FROM range(100) t(i);
+
+statement ok
+CREATE TABLE dupe_kids AS SELECT row_number() OVER () AS id, d.id AS dupe_id,
+         TIMESTAMP '2023-12-01' + INTERVAL '1 day' * (d.id % 90) AS ts, 1.0 AS v FROM dupes d;
+
+statement error
+TRAIN MODEL dup PREDICT COUNT(dupe_kids) FOR dupes AT ts HORIZON 10 DAYS;
+----
+<REGEX>:.*duplicate key.*
+
+# a horizon that runs past the end of the data is reported, not silently scored
+statement error
+TRAIN MODEL cens PREDICT COUNT(events) FOR users AT ts HORIZON 3650 DAYS;
+----
+<REGEX>:.*label window ends after.*
+
+# EVERY generates the anchor grid, so a catalog table needs no hand-built panel
+query I
+SELECT CAST(train_rows > (SELECT count(*) FROM users) AS INTEGER)
+FROM pql_exec('TRAIN MODEL gen PREDICT COUNT(events) FOR users EVERY 30 DAYS HORIZON 30 DAYS OPTIONS (epochs = 10)');
+----
+1
+
+# AT and EVERY are alternatives, not companions
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts EVERY 30 DAYS HORIZON 30 DAYS;
+----
+<REGEX>:.*not both.*
+
+# EVERY only makes sense for a forecast
+statement error
+TRAIN MODEL bad PREDICT users.score FOR users EVERY 30 DAYS;
+----
+<REGEX>:.*needs an aggregate target.*
+
+# predictions from a generated grid carry their anchor
+query I
+SELECT CAST(count(*) > 0 AS INTEGER) FROM pql_exec('PREDICT COUNT(events) FOR users WHERE id < 3 USING MODEL gen');
+----
+1
+
+# The same statement, run twice in one session, gives the same model. The SAGE
+# optimiser state used to persist between calls, so a second TRAIN started from
+# the previous model's Adam moments.
+statement ok
+TRAIN MODEL rep1 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 20, hidden = 32, arch = 'sage');
+
+# (every event in this dataset is dated before its user's anchor, so a forward
+# EXISTS(events) has no positives and is rightly refused; the model in between
+# is an attribute target, which needs no anchor)
+statement ok
+TRAIN MODEL between PREDICT users.score FOR users
+  OPTIONS (epochs = 20, hidden = 16, arch = 'sage', layers = 2);
+
+statement ok
+TRAIN MODEL rep2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 20, hidden = 32, arch = 'sage');
+
+query I
+SELECT CAST(
+    (SELECT test FROM pql_exec('TRAIN MODEL rep3 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20, hidden = 32, arch = ''sage'')'))
+  = (SELECT test FROM pql_exec('TRAIN MODEL rep4 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 20, hidden = 32, arch = ''sage'')'))
+  AS INTEGER);
+----
+1
+
+# Training over a name that already holds a model is refused. Rerunning a
+# statement and silently discarding the model that was there is not something
+# anyone asks for.
+statement ok
+TRAIN MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+statement error
+TRAIN MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+----
+<REGEX>:.*already exists.*OR REPLACE.*
+
+statement ok
+TRAIN OR REPLACE MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# SHOW MODELS echoes the defining statement back, in full, and it re-parses
+query I
+SELECT CAST(statement LIKE 'TRAIN OR REPLACE MODEL dup%HORIZON 60 DAYS%OPTIONS%' AS INTEGER)
+FROM pql_exec('SHOW MODELS') WHERE model = 'dup';
+----
+1
+
+# the echoed statement is a statement: running it again works
+statement ok
+TRAIN OR REPLACE MODEL dup PREDICT COUNT(events) FOR users AT ts HORIZON 60 DAYS
+  OPTIONS (EPOCHS = 5, HIDDEN = 16);
+
+# EXCLUDE survives into the model's record of itself
+statement ok
+TRAIN MODEL rec PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  EXCLUDE (score) OPTIONS (epochs = 5, hidden = 16);
+
+query I
+SELECT CAST(statement LIKE '%EXCLUDE (score)%' AS INTEGER)
+FROM pql_exec('SHOW MODELS') WHERE model = 'rec';
+----
+1
+
+# ---------------------------------------------------------------------------
+# DROP, and what may follow a complete statement.
+# ---------------------------------------------------------------------------
+
+statement ok
+TRAIN MODEL to_drop PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# IF EXISTS used to be read as the model name: `DROP MODEL IF EXISTS keep`
+# dropped a model called IF, reported success, and left the real one in place.
+query I
+SELECT CAST(dropped AS INTEGER) FROM pql_exec('DROP MODEL IF EXISTS to_drop');
+----
+1
+
+query I
+SELECT CAST(count(*) = 0 AS INTEGER) FROM pql_exec('SHOW MODELS') WHERE model = 'to_drop';
+----
+1
+
+query I
+SELECT CAST(dropped AS INTEGER) FROM pql_exec('DROP MODEL IF EXISTS never_existed');
+----
+0
+
+statement error
+DROP MODEL never_existed;
+----
+<REGEX>:.*no model named.*IF EXISTS.*
+
+# nothing may follow a finished statement
+statement error
+DROP MODEL to_drop and more;
+----
+<REGEX>:.*after DROP MODEL.*
+
+statement error
+SHOW MODELS junk;
+----
+<REGEX>:.*after SHOW MODELS.*
+
+# ---------------------------------------------------------------------------
+# Schemas. PQL names tables without one, so a bare name has to mean one table.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA warehouse;
+
+statement ok
+CREATE TABLE warehouse.parts AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts, (i % 5) * 1.0 AS w
+  FROM range(400) t(i);
+
+statement ok
+CREATE TABLE warehouse.moves AS
+  SELECT row_number() OVER () AS id, p.id AS parts_id, p.ts - INTERVAL '1 day' * (k + 1) AS ts
+  FROM warehouse.parts p, range(4) r(k) WHERE k < (p.id % 4);
+
+# a table that lives only in another schema is still reachable by its bare name
+statement ok
+TRAIN MODEL wh PREDICT COUNT(moves) FOR parts AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# the same name in two schemas, with neither being the current one, is refused
+# rather than resolved to whichever the catalog happened to list first
+statement ok
+CREATE SCHEMA depot;
+
+statement ok
+CREATE TABLE depot.parts AS SELECT i AS id, TIMESTAMP '2020-01-01' AS ts, 1.0 AS w FROM range(9) t(i);
+
+statement error
+TRAIN MODEL ambig PREDICT COUNT(moves) FOR parts AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+----
+<REGEX>:.*more than one schema.*
+
+# ---------------------------------------------------------------------------
+# Negative quantities. `WHERE balance < -100` used to be a syntax error, so no
+# schema holding one could be filtered at all.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE accounts AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS opened,
+         (i % 21) - 10.0 AS balance
+  FROM range(2000) t(i);
+
+statement ok
+CREATE TABLE txns AS
+  SELECT row_number() OVER () AS id, a.id AS accounts_id,
+         a.opened - INTERVAL '1 day' * (k + 1) AS at, 1.0 AS amt
+  FROM accounts a, range(6) r(k) WHERE k < (a.id % 6);
+
+statement ok
+TRAIN MODEL neg PREDICT COUNT(txns) FOR accounts AT opened WHERE balance < -5
+  HORIZON 30 DAYS OPTIONS (epochs = 5, hidden = 16);
+
+# the filter picks the same rows PQL and SQL would each pick alone
+query I
+SELECT CAST((SELECT count(*) FROM pql_exec('PREDICT COUNT(txns) FOR accounts WHERE balance IN (-10, -9) USING MODEL neg'))
+          = (SELECT count(*) FROM accounts WHERE balance IN (-10, -9)) AS INTEGER);
+----
+1
+
+# the options added most recently are bounded like the rest
+statement error
+TRAIN MODEL b PREDICT COUNT(txns) FOR accounts AT opened HORIZON 30 DAYS
+  OPTIONS (max_categories = 99999);
+----
+<REGEX>:.*MAX_CATEGORIES must be between.*
+
+statement error
+TRAIN MODEL b PREDICT COUNT(txns) FOR accounts AT opened HORIZON 30 DAYS OPTIONS (l2 = 1000);
+----
+<REGEX>:.*L2 must be between.*
+
+# ---------------------------------------------------------------------------
+# Foreign keys inferred from names, and what happens when the name is wrong.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE addresses AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS seen_on
+  FROM range(600) t(i);
+
+statement ok
+CREATE TABLE deliveries AS
+  SELECT row_number() OVER () AS id, a.id AS address_id,
+         a.seen_on - INTERVAL '1 day' * (k + 1) AS at_time
+  FROM addresses a, range(4) r(k) WHERE k < (a.id % 4);
+
+# addresses -> address needs the -es dropped whole. The single trailing -s rule
+# produced "addresse" and linked nothing, the same way it once produced
+# "categorie" for -ies plurals.
+statement ok
+TRAIN MODEL plural PREDICT COUNT(deliveries) FOR addresses AT seen_on HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# a name that matches no table says so, rather than blaming the foreign keys of
+# a table that was never there
+statement error
+TRAIN MODEL typo PREDICT COUNT(delivries) FOR addresses AT seen_on HORIZON 30 DAYS;
+----
+<REGEX>:.*no table 'delivries' to aggregate over.*
+
+# a real table with no path to the entity still reports the relationship
+statement ok
+CREATE TABLE unrelated AS SELECT i AS id, TIMESTAMP '2024-01-01' AS at_time FROM range(20) t(i);
+
+statement error
+TRAIN MODEL nolink PREDICT COUNT(unrelated) FOR addresses AT seen_on HORIZON 30 DAYS;
+----
+<REGEX>:.*no foreign key connects 'unrelated' to 'addresses'.*
+
+# ---------------------------------------------------------------------------
+# Column types the loader was not expecting.
+# ---------------------------------------------------------------------------
+
+# BIGINT[], STRUCT(a INTEGER, ...) and INTERVAL all contain "INT", and matching
+# the type name by substring read them as integers. The cast that followed
+# failed and took the whole table with it, so one list column anywhere made PQL
+# unusable on that table.
+statement ok
+CREATE TABLE widgets AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts,
+         (i % 2) = 0 AS flag, ((i % 97) * 1.5)::DECIMAL(18,4) AS price,
+         (i::HUGEINT * 1000000) AS big, (i % 100)::TINYINT AS small,
+         'ab'::BLOB AS raw, [1, 2, i] AS tags, {'a': i, 'b': 'z'} AS meta,
+         INTERVAL '1 hour' AS window_len,
+         ['red', 'green', 'blue'][1 + (i % 3)] AS colour
+  FROM range(1500) t(i);
+
+statement ok
+CREATE TABLE widget_hits AS
+  SELECT row_number() OVER () AS id, w.id AS widgets_id,
+         w.ts - INTERVAL '1 day' * (k + 1) AS seen
+  FROM widgets w, range(5) r(k) WHERE k < (w.id % 5);
+
+statement ok
+TRAIN MODEL wtypes PREDICT COUNT(widget_hits) FOR widgets AT ts HORIZON 30 DAYS
+  OPTIONS (epochs = 5, hidden = 16);
+
+# the scalar columns became features; the list, struct, interval, blob did not
+query T
+SELECT string_agg(feature, ', ' ORDER BY feature)
+FROM pql_exec('EXPLAIN MODEL wtypes')
+WHERE feature NOT LIKE 'widget_hits%' AND feature NOT LIKE 'anchor%';
+----
+big, colour (category), flag, price, small

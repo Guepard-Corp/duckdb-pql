@@ -1,0 +1,33 @@
+#
+# The language (src/include/pql/pql.hpp) is tested without DuckDB: each file
+# under test/cpp is a standalone program. This runs them on both compilers the
+# distribution pipeline uses, plus the fuzzer and degenerate-data harness under
+# sanitizers, which is how most of what they guard was found.
+#
+name: Language Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cpp-tests:
+    name: ${{ matrix.os }} / ${{ matrix.cxx }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cxx: g++
+          - os: ubuntu-latest
+            cxx: clang++
+          - os: macos-latest
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Standalone tests
+        run: make test_cpp CXX=${{ matrix.cxx }}
+      - name: Sanitized fuzz and degenerate runs
+        if: matrix.cxx == 'clang++'
+        run: make test_cpp_sanitize CXX=${{ matrix.cxx }}
