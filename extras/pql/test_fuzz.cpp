@@ -14,6 +14,7 @@
 // end of the input and was accepted as `region = 'US'`.
 #include "src/pql.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -43,15 +44,35 @@ static std::vector<std::string> Tokens(const std::string &s) {
   return out;
 }
 
-int main() {
-  std::mt19937 rng(12345);
+int main(int argc, char **argv) {
+  // test_fuzz [iterations] [seed]: the defaults are the quick check; a soak
+  // run under sanitizers loops over seeds.
+  const long iters = argc > 1 ? std::atol(argv[1]) : 60000;
+  std::mt19937 rng(argc > 2 ? (unsigned)std::atol(argv[2]) : 12345u);
+  // Every keyword in the grammar, every literal shape, and the things a
+  // tokenizer gets wrong: unterminated quotes, unicode, very long identifiers,
+  // numbers at the edge of int64 and doubles, deep nesting.
+  static const std::string long_ident(5000, 'z');
+  static const std::string deep_open(300, '(');
+  static const std::string deep_close(300, ')');
+  static const std::string many_nots = [] { std::string s; for (int i = 0; i < 300; i++) s += "NOT "; return s; }();
   const char *alphabet[] = {"(", ")", ",", "'", "\"", "=", ";", "*", "-", ".", "0", "99",
                             "TRAIN", "MODEL", "PREDICT", "FOR", "AT", "HORIZON", "DAYS",
                             "WHERE", "OPTIONS", "EXCLUDE", "SPLIT", "x", "'s", "1e999",
-                            "--", "/*", "\\", "\t", "\n", nullptr};
+                            "--", "/*", "\\", "\t", "\n",
+                            "OR", "REPLACE", "AND", "NOT", "IN", "IS", "NULL", "AS", "IF",
+                            "EXISTS", "COUNT", "SUM", "AVG", "MIN", "MAX", "EVERY", "USING",
+                            "GRAPH", "TEMPORAL", "VALIDATE", "TEST", "FROM", "TO", "BACKTEST",
+                            "EXPLAIN", "SHOW", "MODELS", "DROP", "WEEKS", "MONTHS", "YEARS",
+                            "HOURS", "DAY", "<", ">", "<=", ">=", "!=", "<>", "==", "+", "/",
+                            "1.2.3", "99999999999999999999", ".5", "1e5", "-0", "0.0.0",
+                            "1000000000000", "'", "''", "'a''b'", "\"q\"", "\"\"",
+                            "\xc3\xa9", "\xe2\x82\xac", "\xff", "\x00",
+                            long_ident.c_str(), deep_open.c_str(), deep_close.c_str(),
+                            many_nots.c_str(), nullptr};
   int nalpha = 0; while (alphabet[nalpha]) nalpha++;
   long parsed = 0, rejected = 0, roundtrip_fail = 0, badpos = 0, other = 0;
-  for (long iter = 0; iter < 60000; iter++) {
+  for (long iter = 0; iter < iters; iter++) {
     // build an input: a mutated seed, or pure noise
     std::string in;
     if (iter % 4 == 3) {

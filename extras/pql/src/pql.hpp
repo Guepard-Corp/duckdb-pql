@@ -175,6 +175,21 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 			}
 			continue;
 		}
+		// block comment. DuckDB hands the statement over verbatim, comments and
+		// all, once its own parser has rejected it; an unclosed one is an error
+		// rather than a comment that swallows the rest of the statement.
+		if (c == '/' && i + 1 < n && src[i + 1] == '*') {
+			const uint32_t open = i;
+			i += 2;
+			while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) {
+				i++;
+			}
+			if (i + 1 >= n) {
+				throw ParseError("unterminated block comment; a /* is never closed", open);
+			}
+			i += 2;
+			continue;
+		}
 		Token t;
 		t.pos = i;
 		// single-quoted string literal, '' escapes a quote
@@ -247,7 +262,11 @@ inline std::vector<Token> Tokenize(const std::string &src) {
 			t.kind = Tok::NUMBER;
 			t.text = src.substr(s, i - s);
 			t.upper = t.text;
-			t.number = std::strtod(t.text.c_str(), nullptr);
+			char *end = nullptr;
+			t.number = std::strtod(t.text.c_str(), &end);
+			if (!end || *end != '\0') {
+				throw ParseError("malformed number '" + t.text + "'", s);
+			}
 			out.push_back(std::move(t));
 			continue;
 		}
@@ -354,8 +373,18 @@ struct Literal {
 			const bool plain = end && end != begin && *end == '\0';
 			return plain ? text : ("'" + text + "'");
 		}
-		case Kind::STRING:
-			return "'" + text + "'";
+		case Kind::STRING: {
+			// A quote inside the text is written doubled, the way it was read.
+			std::string q = "'";
+			for (char c : text) {
+				if (c == '\'') {
+					q += "''";
+				} else {
+					q.push_back(c);
+				}
+			}
+			return q + "'";
+		}
 		default:
 			return "NULL";
 		}
@@ -1211,6 +1240,12 @@ private:
 		if (t.kind != Tok::NUMBER) {
 			throw ParseError("HORIZON expects a number followed by a unit, e.g. 30 DAYS", t.pos);
 		}
+		// Bounded before the cast: a 20-digit amount is undefined to convert and
+		// came out negative, slipping past the positivity check.
+		if (!(t.number >= 0.0) || t.number > 1.0e9 || t.number != std::floor(t.number)) {
+			throw ParseError("interval amount must be a whole number of units, at most 1000000000",
+			                 t.pos);
+		}
 		iv.amount = (int64_t)t.number;
 		Next();
 		const Token &u = Peek();
@@ -1231,6 +1266,10 @@ private:
 		}
 		iv.unit = up;
 		iv.present = true;
+		// Micros() multiplies in int64; keep the total inside it with a wide margin.
+		if (double(iv.amount) * (up == "HOUR" ? 3600.0e6 : up == "DAY" ? 86400.0e6 : up == "WEEK" ? 7 * 86400.0e6 : up == "MONTH" ? 30.436875 * 86400.0e6 : 365.2425 * 86400.0e6) > 1.0e17) {
+			throw ParseError("interval is too long; at most about 3000 years", t.pos);
+		}
 		Next();
 		return iv;
 	}
@@ -1266,19 +1305,34 @@ private:
 		}
 		return node;
 	}
+	// Every level of parentheses or NOT is a few stack frames, and a statement
+	// can be as long as the caller likes; a runaway nest must fail as a parse
+	// error rather than overrun the thread's stack.
+	static const int kMaxFilterDepth = 200;
+	void Descend(uint32_t pos) {
+		if (++depth_ > kMaxFilterDepth) {
+			throw ParseError("filter is nested too deeply (more than 200 levels)", pos);
+		}
+	}
 	std::unique_ptr<FilterNode> ParseNot() {
-		if (AcceptKw("NOT")) {
+		if (PeekKw("NOT")) {
+			Descend(Peek().pos);
+			Next();
 			auto node = std::unique_ptr<FilterNode>(new FilterNode());
 			node->kind = FilterNode::Kind::NOT;
 			node->children.push_back(ParseNot());
+			depth_--;
 			return node;
 		}
 		return ParsePrimary();
 	}
 	std::unique_ptr<FilterNode> ParsePrimary() {
-		if (AcceptPunct("(")) {
+		if (PeekPunct("(")) {
+			Descend(Peek().pos);
+			Next();
 			auto n = ParseOr();
 			ExpectPunct(")");
+			depth_--;
 			return n;
 		}
 		auto node = std::unique_ptr<FilterNode>(new FilterNode());
@@ -1375,9 +1429,12 @@ private:
 			                 Peek().pos);
 		}
 	}
-	bool AcceptPunct(const char *p) {
+	bool PeekPunct(const char *p) const {
 		const Token &t = Peek();
-		if (t.kind == Tok::PUNCT && t.text == p) {
+		return t.kind == Tok::PUNCT && t.text == p;
+	}
+	bool AcceptPunct(const char *p) {
+		if (PeekPunct(p)) {
 			Next();
 			return true;
 		}
@@ -1403,6 +1460,7 @@ private:
 	std::string src_;
 	std::vector<Token> toks_;
 	size_t idx_ = 0;
+	int depth_ = 0;
 };
 
 inline Statement Parse(const std::string &src) {
@@ -1501,6 +1559,20 @@ struct ForeignKey {
 	std::string parent_table, parent_column;
 };
 
+// Project a numeric key onto int64 for matching. An integral value inside the
+// int64 range maps to itself, so integer keys stored as doubles round-trip
+// exactly and the dense direct-address table below still applies. Anything else
+// (a fraction, a magnitude at or past 2^63) maps to its bit pattern: a plain
+// cast there is undefined behaviour, and truncation matched 12.5 onto 12.
+inline int64_t NumericKey(double v) {
+	if (v >= -9223372036854775808.0 && v < 9223372036854775808.0 && v == std::floor(v)) {
+		return (int64_t)v;
+	}
+	int64_t bits = 0;
+	std::memcpy(&bits, &v, sizeof(bits));
+	return bits;
+}
+
 // One directed traversal from a parent row to the child rows pointing at it,
 // with the child rows pre-sorted by time. Sorting once at build time is what
 // turns every windowed aggregate into two binary searches instead of a scan,
@@ -1594,6 +1666,21 @@ inline void SortBucketsByTime(Link &lk, size_t nparents) {
 		for (uint32_t i = 0; i < n; i++) {
 			lk.flat[b + i] = rows[i];
 		}
+		// The float key is coarse: at 1e15 micros one float step is ~134 s, so
+		// children closer than that share a key and came out in input order. Each
+		// run of equal keys is the only span that can still be unsorted, so sort
+		// those on the double; runs are short, so the pass stays linear.
+		for (uint32_t i = 0; i < n;) {
+			uint32_t j = i + 1;
+			while (j < n && keys[j] == keys[i]) {
+				j++;
+			}
+			if (j - i >= 2) {
+				std::sort(lk.flat.begin() + b + i, lk.flat.begin() + b + j,
+				          [&](uint32_t x, uint32_t y) { return lk.Time(x) < lk.Time(y); });
+			}
+			i = j;
+		}
 	}
 }
 
@@ -1671,6 +1758,13 @@ struct Database {
 	void BuildLinks(const std::vector<std::string> &allow) {
 		MarkNonFiniteMissing();
 		links.clear();
+		// Rows are addressed with uint32 throughout the link index.
+		for (const auto &t : tables) {
+			if (t.nrows >= (size_t)UINT32_MAX) {
+				throw std::runtime_error("pql: table '" + t.name + "' has " + std::to_string(t.nrows) +
+				                         " rows; at most 4294967294 are supported");
+			}
+		}
 		for (size_t k = 0; k < fks.size(); k++) {
 			const ForeignKey &fk = fks[k];
 			if (!allow.empty()) {
@@ -1750,7 +1844,7 @@ struct Database {
 								by_str.emplace(gpk.dict.values[code], gtc.num[r]);
 							}
 						} else if ((gpk.type == ColType::CATEGORY) == (cc2.type == ColType::CATEGORY)) {
-							by_num.emplace((int64_t)gpk.num[r], gtc.num[r]);
+							by_num.emplace(NumericKey(gpk.num[r]), gtc.num[r]);
 						}
 					}
 					if (by_str.empty() && by_num.empty()) {
@@ -1773,7 +1867,7 @@ struct Database {
 								hit++;
 							}
 						} else {
-							auto it = by_num.find((int64_t)cc2.num[r]);
+							auto it = by_num.find(NumericKey(cc2.num[r]));
 							if (it != by_num.end()) {
 								lk.ctime[r] = it->second;
 								hit++;
@@ -1804,16 +1898,17 @@ struct Database {
 					continue;
 				}
 				const int64_t key =
-				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : (int64_t)pk.num[r];
+				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
 				kmin = std::min(kmin, key);
 				kmax = std::max(kmax, key);
 			}
 			std::vector<uint32_t> direct;
 			bool use_direct = false;
 			if (parent.nrows > 0 && kmin <= kmax) {
-				const uint64_t span = (uint64_t)(kmax - kmin) + 1u;
-				if (span <= (uint64_t)parent.nrows * 4u + 64u) {
-					direct.assign((size_t)span, UINT32_MAX);
+				// Unsigned: kmax - kmin overflows when a column holds both int64 ends.
+				const uint64_t span = (uint64_t)kmax - (uint64_t)kmin;
+				if (span < (uint64_t)parent.nrows * 4u + 64u) {
+					direct.assign((size_t)span + 1u, UINT32_MAX);
 					use_direct = true;
 				}
 			}
@@ -1826,7 +1921,7 @@ struct Database {
 					continue;
 				}
 				const int64_t key =
-				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : (int64_t)pk.num[r];
+				    pk.type == ColType::CATEGORY ? (int64_t)pk.code[r] : NumericKey(pk.num[r]);
 				if (use_direct) {
 					uint32_t &slot = direct[(size_t)(key - kmin)];
 					if (slot != UINT32_MAX) {
@@ -1890,6 +1985,11 @@ struct Database {
 				if (!ck.valid[r]) {
 					continue;
 				}
+				// A dated child with no time can fall inside no window, and kept in
+				// the bucket it breaks the sort the binary searches rely on.
+				if (lk.dated && !std::isfinite(lk.ctime[r])) {
+					continue;
+				}
 				uint32_t pr;
 				if (string_key) {
 					const uint32_t code = ck.code[r];
@@ -1903,7 +2003,7 @@ struct Database {
 					pr = it->second;
 				} else {
 					const int64_t key =
-					    ck.type == ColType::CATEGORY ? (int64_t)ck.code[r] : (int64_t)ck.num[r];
+					    ck.type == ColType::CATEGORY ? (int64_t)ck.code[r] : NumericKey(ck.num[r]);
 					if (!lookup(key, pr)) {
 						continue;
 					}
@@ -2306,10 +2406,20 @@ struct FeatureSpec {
 			cc.Resolve(col);
 		}
 		for (auto &la : link_aggs) {
+			// Two foreign keys between the same pair of tables are two links, so the
+			// child key column has to take part or both aggregates land on the first.
 			int found = -1;
 			for (size_t l = 0; l < db.links.size(); l++) {
-				if (ToUpper(db.links[l].child_table) == ToUpper(la.child_table) &&
-				    ToUpper(db.links[l].parent_table) == ToUpper(entity.name)) {
+				const Link &lk = db.links[l];
+				if (ToUpper(lk.child_table) != ToUpper(la.child_table) ||
+				    ToUpper(lk.parent_table) != ToUpper(entity.name)) {
+					continue;
+				}
+				const Frame &child = db.At(lk.child_table);
+				const std::string key = lk.child_key_col >= 0
+				                            ? child.columns[(size_t)lk.child_key_col].name
+				                            : std::string();
+				if (la.child_key.empty() || ToUpper(key) == ToUpper(la.child_key)) {
 					found = (int)l;
 					break;
 				}
@@ -2486,6 +2596,20 @@ inline bool FitCatCol(const Frame &f, size_t col_index, const Column *anch, doub
 // to bound its cost. Laying the values out once in link order, with a running
 // sum per parent, turns every windowed mean into two lookups. It is exact
 // (the cap is gone) and it is O(1) per window instead of O(window).
+// Length of a link's prefix-sum arena: one running row per child plus a zero
+// row per parent. Those arenas are indexed with uint32, so a link the index
+// cannot hold is refused here, before any of them is sized, rather than wrapped.
+inline uint32_t PrefixTotal(const Link &lk) {
+	const uint64_t nparents = lk.off.empty() ? 0 : (uint64_t)lk.off.size() - 1;
+	const uint64_t total = (uint64_t)lk.flat.size() + nparents;
+	if (total > (uint64_t)UINT32_MAX) {
+		throw std::runtime_error("pql: link " + lk.child_table + " -> " + lk.parent_table +
+		                         " has " + std::to_string(total) +
+		                         " rows plus parents, more than the 4294967295 a model can index");
+	}
+	return (uint32_t)total;
+}
+
 struct AggCache {
 	struct LinkCache {
 		std::vector<uint32_t> off;               // per parent: base into the prefix arrays
@@ -2508,6 +2632,7 @@ inline AggCache BuildAggCache(const Database &db, const FeatureSpec &spec) {
 		AggCache::LinkCache &lc = cache.links[li];
 		const size_t nparents = lk.off.empty() ? 0 : lk.off.size() - 1;
 		lc.off.assign(nparents + 1, 0);
+		PrefixTotal(lk); // refuses what the uint32 running index below cannot hold
 		uint32_t total = 0;
 		for (size_t p = 0; p < nparents; p++) {
 			lc.off[p] = total;
@@ -2730,6 +2855,7 @@ struct SageSpec {
 		int link = -1;   // index into Database::links
 		int src_node = -1; // index into nodes: the child
 		int dst_node = -1; // index into nodes: the parent (the entity)
+		std::string child_key; // the child's key column, to tell two links apart
 	};
 	std::vector<NodeType> nodes;
 	std::vector<EdgeType> edges;
@@ -2806,6 +2932,7 @@ inline SagePrefix BuildSagePrefix(const Database &db, const SageSpec &spec,
 		const int d = spec.NodeDim(et.src_node);
 		const size_t nparents = lk.off.empty() ? 0 : lk.off.size() - 1;
 		pre.off[e].assign(nparents + 1, 0u);
+		PrefixTotal(lk);
 		uint32_t total = 0;
 		for (size_t p = 0; p < nparents; p++) {
 			pre.off[e][p] = total;
@@ -3036,6 +3163,20 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 		const Column *anch = (table == db.Find(entity.name) && anchor_col >= 0)
 		                         ? &f.columns[(size_t)anchor_col]
 		                         : nullptr;
+		// A child table has no anchor column, but its rows are dated by the link
+		// that reaches it, and that clock bounds its statistics the same way.
+		Column clock;
+		if (!anch && incoming && incoming->dated && std::isfinite(train_cutoff) &&
+		    incoming->ctime.size() == f.nrows) {
+			clock.name = "clock";
+			clock.type = ColType::TIMESTAMP;
+			clock.num = incoming->ctime;
+			clock.valid.resize(f.nrows);
+			for (size_t r = 0; r < f.nrows; r++) {
+				clock.valid[r] = std::isfinite(clock.num[r]) ? 1 : 0;
+			}
+			anch = &clock;
+		}
 		std::vector<int> usable;
 		for (int c : nt.cols) {
 			const Column &col = f.columns[(size_t)c];
@@ -3066,8 +3207,8 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 		}
 		nt.cols.swap(usable);
 		// Text columns on this node type, fitted over the same era as the numerics
-		// above: bounded by the entity's anchor for the entity itself, unbounded
-		// for child tables, which have no anchor of their own.
+		// above: the entity's anchor for the entity itself, the link's clock for a
+		// child table.
 		for (size_t ci = 0; ci < f.columns.size(); ci++) {
 			if (f.columns[ci].type != ColType::CATEGORY) {
 				continue;
@@ -3126,6 +3267,9 @@ inline SageSpec BuildSageSpec(const Database &db, const Frame &entity, const Sta
 		}
 		SageSpec::EdgeType et;
 		et.link = (int)l;
+		if (lk.child_key_col >= 0) {
+			et.child_key = db.tables[(size_t)ct].columns[(size_t)lk.child_key_col].name;
+		}
 		et.src_node = add_node(ct, &lk);
 		et.dst_node = spec.entity_node;
 		if (spec.NodeDim(et.src_node) > 0) {
@@ -3172,8 +3316,16 @@ inline void RebindSageSpec(const Database &db, const Frame &entity, SageSpec &sp
 		const std::string ct = spec.nodes[(size_t)et.src_node].table_name;
 		int found = -1;
 		for (size_t l = 0; l < db.links.size(); l++) {
-			if (ToUpper(db.links[l].child_table) == ToUpper(ct) &&
-			    ToUpper(db.links[l].parent_table) == ToUpper(entity.name)) {
+			const Link &lk = db.links[l];
+			if (ToUpper(lk.child_table) != ToUpper(ct) ||
+			    ToUpper(lk.parent_table) != ToUpper(entity.name)) {
+				continue;
+			}
+			const Frame &child = db.At(lk.child_table);
+			const std::string key = lk.child_key_col >= 0
+			                            ? child.columns[(size_t)lk.child_key_col].name
+			                            : std::string();
+			if (et.child_key.empty() || ToUpper(key) == ToUpper(et.child_key)) {
 				found = (int)l;
 				break;
 			}
@@ -3335,12 +3487,41 @@ public:
 		}
 		used_ = 0;
 	}
+	// Size the block from the code that carves it. `carve(arena)` runs once
+	// against a counting arena, which hands out no memory and only tallies what
+	// it would have, and then once for real against the block that tally sized.
+	// One code path for both, so the total cannot drift from the allocations:
+	// a hand-written total once left the gradient buffers out, and the growth
+	// that followed dangled every pointer already handed out.
+	template <typename F>
+	static size_t Measure(F &&carve) {
+		Arena a;
+		a.counting_ = true;
+		carve(a);
+		return a.used_;
+	}
+	template <typename F>
+	void Carve(F &&carve) {
+		Reserve(Measure(carve));
+		carve(*this);
+	}
 	template <typename T>
 	T *Alloc(size_t n) {
 		const size_t align = alignof(T) > 16 ? alignof(T) : 16;
+		// n * sizeof(T) wrapping would pass the capacity check and hand out a
+		// pointer to far less than was asked for.
+		if (n > (std::numeric_limits<size_t>::max() / 2) / sizeof(T)) {
+			throw std::runtime_error("pql: arena allocation overflows size_t");
+		}
 		used_ = (used_ + align - 1) & ~(align - 1);
 		const size_t bytes = n * sizeof(T);
-		if (used_ + bytes > buf_.size()) {
+		if (counting_) {
+			used_ += bytes;
+			return nullptr;
+		}
+		// The alignment step alone can carry used_ past the end of a full block,
+		// so both halves are checked; the subtraction never wraps.
+		if (used_ > buf_.size() || bytes > buf_.size() - used_) {
 			// Growing would reallocate and dangle every pointer already returned.
 			throw std::runtime_error("pql: arena exhausted; Reserve() was undersized");
 		}
@@ -3351,7 +3532,9 @@ public:
 	template <typename T>
 	T *Zeroed(size_t n) {
 		T *p = Alloc<T>(n);
-		std::memset(p, 0, n * sizeof(T));
+		if (p != nullptr && n > 0) {
+			std::memset(p, 0, n * sizeof(T));
+		}
 		return p;
 	}
 	void Reset() {
@@ -3363,10 +3546,14 @@ public:
 	size_t Capacity() const {
 		return buf_.size();
 	}
+	bool Counting() const {
+		return counting_;
+	}
 
 private:
 	std::vector<uint8_t> buf_;
 	size_t used_ = 0;
+	bool counting_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -3945,7 +4132,23 @@ struct Adam {
 // 11. Metrics
 // ===========================================================================
 
+// A score that is not a number makes the ranking undefined. It also has to be
+// caught before the sort: std::sort on NaN keys is undefined behaviour, and the
+// tie loop below advances on `==`, which NaN never satisfies, so one NaN score
+// used to spin the validation pass forever.
+inline bool AnyNaNScore(const std::vector<std::pair<double, int>> &scored) {
+	for (const auto &p : scored) {
+		if (std::isnan(p.first)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 inline double AUROC(const std::vector<std::pair<double, int>> &scored) {
+	if (AnyNaNScore(scored)) {
+		return std::numeric_limits<double>::quiet_NaN();
+	}
 	std::vector<std::pair<double, int>> v(scored);
 	std::sort(v.begin(), v.end());
 	double rank_sum = 0;
@@ -3983,6 +4186,9 @@ inline double AUROC(const std::vector<std::pair<double, int>> &scored) {
 // visibly there, and the number to beat is the positive rate itself, which is
 // what a coin achieves.
 inline double AveragePrecision(const std::vector<std::pair<double, int>> &scored) {
+	if (AnyNaNScore(scored)) {
+		return std::numeric_limits<double>::quiet_NaN();
+	}
 	std::vector<std::pair<double, int>> v(scored);
 	// Descending by score. Ties share a threshold, so they are consumed together
 	// or the result would depend on the order they happen to arrive in.
@@ -4203,8 +4409,10 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 				sc_b.mean = mean_b;
 				sc_b.sd = var_b > 1e-18 ? std::sqrt(var_b) : 1.0;
 				spec.self_cols.push_back(sc_b);
-				continue;
 			}
+			// Fewer than two training-era values is not a feature; falling through
+			// to the pass over every row would fit it on the folds being scored.
+			continue;
 		}
 		double s0 = 0, s1 = 0, q0 = 0, q1 = 0;
 		uint64_t n0 = 0, n1 = 0;
@@ -4288,24 +4496,33 @@ inline FeatureSpec FitFeatureSpec(const Database &db, const Frame &entity, const
 			const double *cnum = cc.num.data();
 			const uint8_t *cval = cc.valid.data();
 			const size_t crows = child.nrows;
+			// The child's clock bounds these statistics to the training era, the
+			// way the entity's anchor bounds its own columns above. Same mask
+			// multiply as before, so the loop stays branchless.
+			const bool bounded = lk.dated && std::isfinite(train_cutoff) &&
+			                     lk.ctime.size() == crows;
+			const double *ct = bounded ? lk.ctime.data() : nullptr;
 			double cs0 = 0, cs1 = 0, cq0 = 0, cq1 = 0;
 			uint64_t k0 = 0, k1 = 0;
 			size_t cr = 0;
 			for (; cr + 1 < crows; cr += 2) {
-				const double v0 = cnum[cr] * double(cval[cr]);
-				const double v1 = cnum[cr + 1] * double(cval[cr + 1]);
+				const uint8_t m0 = cval[cr] & (uint8_t)(!bounded || ct[cr] <= train_cutoff);
+				const uint8_t m1 = cval[cr + 1] & (uint8_t)(!bounded || ct[cr + 1] <= train_cutoff);
+				const double v0 = cnum[cr] * double(m0);
+				const double v1 = cnum[cr + 1] * double(m1);
 				cs0 += v0;
 				cs1 += v1;
 				cq0 += v0 * cnum[cr];
 				cq1 += v1 * cnum[cr + 1];
-				k0 += cval[cr];
-				k1 += cval[cr + 1];
+				k0 += m0;
+				k1 += m1;
 			}
 			for (; cr < crows; cr++) {
-				const double v = cnum[cr] * double(cval[cr]);
+				const uint8_t m = cval[cr] & (uint8_t)(!bounded || ct[cr] <= train_cutoff);
+				const double v = cnum[cr] * double(m);
 				cs0 += v;
 				cq0 += v * cnum[cr];
-				k0 += cval[cr];
+				k0 += m;
 			}
 			const size_t cn = (size_t)(k0 + k1);
 			const double mu = cn ? (cs0 + cs1) / double(cn) : 0.0;
@@ -4527,10 +4744,15 @@ inline Dataset CollectExamples(const Database &db, const Statement &stmt, const 
 // 13. Training
 // ===========================================================================
 
+// Called between units of work (a minibatch, a scoring block); it throws to
+// abort. The DuckDB binding uses it for Ctrl-C and max_execution_time.
+using CancelCheck = std::function<void()>; // empty means never cancelled
+
 // Score an index set in batches through MatMulNT. The scratch is grown on the
 // first call and reused, so an epoch's validation pass performs no allocation.
 inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<size_t> &idx,
-                      EvalScratch &scratch, std::vector<double> &out) {
+                      EvalScratch &scratch, std::vector<double> &out,
+                      const CancelCheck &cancelled = CancelCheck()) {
 	const int width = ds.width, hidden = model.hidden;
 	const size_t cap = EvalScratch::ROWS;
 	out.assign(idx.size(), 0.0);
@@ -4538,6 +4760,9 @@ inline void ScoreRows(const Model &model, const Dataset &ds, const std::vector<s
 	float *const xb = scratch.x.data();
 	for (size_t base = 0; base < idx.size(); base += cap) {
 		const int B = (int)std::min(cap, idx.size() - base);
+		if (cancelled) {
+			cancelled();
+		}
 		for (int i = 0; i < B; i++) {
 			const float *row = ds.Row(idx[base + (size_t)i]);
 			std::memcpy(xb + (size_t)i * (size_t)width, row, sizeof(float) * (size_t)width);
@@ -4588,30 +4813,25 @@ struct SageScratch {
 	size_t self_stride = 0;
 	std::vector<size_t> mean_stride;
 
-	size_t Bytes(size_t B, const SageParams &p) const {
-		size_t f = B * (size_t)std::max(1, p.self_dim);
-		for (size_t e = 0; e < p.w_neigh.size(); e++) {
-			f += B * (size_t)std::max(1, p.src_dim[e]);
-		}
-		f += 3 * B * (size_t)p.channels + B;
-		// one alignment pad per allocation, generously
-		return f * sizeof(float) + 64 * (8 + p.w_neigh.size());
-	}
-
+	// The block is sized by the carve itself (Arena::Carve), not by a formula
+	// kept in step with it by hand.
 	void Ensure(size_t B, const SageParams &p) {
-		arena.Reserve(Bytes(B, p));
 		self_stride = (size_t)std::max(1, p.self_dim);
-		xself = arena.Zeroed<float>(B * self_stride);
 		means.assign(p.w_neigh.size(), nullptr);
 		mean_stride.assign(p.w_neigh.size(), 0);
 		for (size_t e = 0; e < p.w_neigh.size(); e++) {
 			mean_stride[e] = (size_t)std::max(1, p.src_dim[e]);
-			means[e] = arena.Zeroed<float>(B * mean_stride[e]);
 		}
-		z = arena.Zeroed<float>(B * (size_t)p.channels);
-		h = arena.Zeroed<float>(B * (size_t)p.channels);
-		dz = arena.Zeroed<float>(B * (size_t)p.channels);
-		obuf = arena.Zeroed<float>(B);
+		arena.Carve([&](Arena &a) {
+			xself = a.Zeroed<float>(B * self_stride);
+			for (size_t e = 0; e < p.w_neigh.size(); e++) {
+				means[e] = a.Zeroed<float>(B * mean_stride[e]);
+			}
+			z = a.Zeroed<float>(B * (size_t)p.channels);
+			h = a.Zeroed<float>(B * (size_t)p.channels);
+			dz = a.Zeroed<float>(B * (size_t)p.channels);
+			obuf = a.Zeroed<float>(B);
+		});
 	}
 };
 
@@ -4910,6 +5130,7 @@ inline void BuildChildStatic(const Database &db, const SageSpec &spec, const Sag
 			}
 			const size_t gparents = glk.off.empty() ? 0 : glk.off.size() - 1;
 			std::vector<uint32_t> goff(gparents + 1, 0u);
+			PrefixTotal(glk);
 			uint32_t tot = 0;
 			for (size_t p = 0; p < gparents; p++) {
 				goff[p] = tot;
@@ -4981,6 +5202,7 @@ inline void ComputeChildEmbeddings(const Database &db, const SageSpec &spec,
 		}
 		if (ce.off[e].size() != nparents + 1) {
 			ce.off[e].assign(nparents + 1, 0u);
+			PrefixTotal(elk);
 			uint32_t total = 0;
 			for (size_t p = 0; p < nparents; p++) {
 				ce.off[e][p] = total;
@@ -5394,16 +5616,16 @@ struct TrainReport {
 	// What a model with no information gets, so the metric beside it means
 	// something: persistence for a forecast, the positive rate for a classifier.
 	double baseline_metric = 0;
-	double val_metric = 0, test_metric = 0;
+	// Undefined until a fold was scored: an empty fold reported 0.0, which for
+	// MAE is a perfect model and for AUROC the worst one.
+	double val_metric = std::numeric_limits<double>::quiet_NaN();
+	double test_metric = std::numeric_limits<double>::quiet_NaN();
 	double pr_auc = std::numeric_limits<double>::quiet_NaN(); // classification only
 	std::string metric_name = "auroc";
 	int epochs_run = 0;
 	int width = 0;
 };
 
-// Called once per epoch. The host passes something that throws when the user
-// has interrupted; without it a long fit ignored Ctrl-C entirely.
-using CancelCheck = std::function<void()>;
 
 inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &model,
                               const CancelCheck &cancelled = CancelCheck()) {
@@ -5552,9 +5774,19 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		    "pql: SPLIT leaves no training rows (every anchor is at or after VALIDATE FROM). "
 		    "Check the split boundaries against the anchor column's range.");
 	}
-	if (stmt.split.present && (!va.empty() || !te.empty())) {
+	if (binary) {
+		// One class cannot be separated from nothing: the fit is a constant and
+		// every metric is undefined. This used to train silently and report NULLs.
+		size_t pos = 0;
 		for (size_t i : tr) {
-			(void)i;
+			pos += ds.examples[i].label > 0.5 ? 1 : 0;
+		}
+		if (pos == 0 || pos == tr.size()) {
+			throw std::runtime_error(std::string("pql: the target has ") +
+			                         (pos == 0 ? "no positives" : "no negatives") +
+			                         " in the training fold (" + std::to_string(tr.size()) +
+			                         " rows), so there is nothing to separate. Check the "
+			                         "target, its inner WHERE, and the HORIZON.");
 		}
 	}
 
@@ -5644,6 +5876,12 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		std::vector<double> outs;
 		std::vector<float> douts;
 		SageParams best_p = model.sage_params;
+		// The child weights the current epoch's embeddings were computed from. A
+		// validation score is a property of (entity weights, these), so this is
+		// what gets restored with best_p; restoring the entity layer alone left a
+		// two-hop model with child weights from a later epoch that was never
+		// validated, and its metric could not be reproduced by PREDICT.
+		SageChildParams ce_child = model.sage_child, best_c = model.sage_child;
 		double best_m = -std::numeric_limits<double>::infinity();
 		bool have_m = false;
 		const size_t sbatch = (size_t)std::max(1.0, stmt.options.Num("BATCH", 64));
@@ -5683,9 +5921,13 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				// Child embeddings depend on the child weights, so they are refreshed
 				// once per epoch rather than per batch.
 				ComputeChildEmbeddings(db, model.sage_spec, model.sage_child, cstat, ce);
+				ce_child = model.sage_child;
 			}
 			for (size_t b = 0; b < tr.size(); b += sbatch) {
 				const int B = (int)std::min(sbatch, tr.size() - b);
+				if (cancelled) {
+					cancelled();
+				}
 				if (n_layers >= 2) {
 					SageGather2(model.sage_spec, feats, ce, ds, tr, b, B, C, model.sage_params,
 					            vcounts, sc);
@@ -5754,27 +5996,35 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				double m;
 				if (binary) {
 					std::vector<std::pair<double, int>> sc2;
+					sc2.reserve(va.size());
 					for (size_t i = 0; i < va.size(); i++) {
 						sc2.emplace_back(scores[i], ds.examples[va[i]].label > 0.5 ? 1 : 0);
 					}
 					m = AUROC(sc2);
 				} else {
 					std::vector<std::pair<double, double>> pt;
+					pt.reserve(va.size());
 					for (size_t i = 0; i < va.size(); i++) {
 						const Example &ex = ds.examples[va[i]];
 						pt.emplace_back(scores[i], model.residual ? ex.label + ex.base : ex.label);
 					}
 					m = -MAE(pt);
 				}
-				if (!(m < best_m)) {
+				// >= so a later epoch wins ties. An undefined metric is adopted only
+				// while no epoch has ever produced a defined one (a single-class fold
+				// keeps the latest weights); once one has, a NaN epoch is a diverged
+				// model and must not replace the best.
+				if (std::isnan(m) ? !std::isfinite(best_m) : !(m < best_m)) {
 					best_m = std::isnan(m) ? best_m : m;
 					best_p = model.sage_params;
+					best_c = ce_child;
 					have_m = true;
 				}
 			}
 		}
 		if (have_m) {
 			model.sage_params = best_p;
+			model.sage_child = best_c;
 			rep.val_metric = std::isfinite(best_m) ? (binary ? best_m : -best_m)
 			                                       : std::numeric_limits<double>::quiet_NaN();
 		}
@@ -5820,35 +6070,37 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 	}
 
 	const size_t batch = (size_t)std::max(1.0, stmt.options.Num("BATCH", 64));
-	// One block for the whole run. The working set is a known function of
-	// (batch, width, hidden), so it is sized once here and never grown.
+	// One block for the whole run: activations, gradients and the batch's
+	// labels. The working set is a function of (batch, width, hidden), so it is
+	// carved once here and never grown; the block is sized by this same carve
+	// (Arena::Carve), which is what keeps a buffer from being left out of it.
 	const size_t bw = batch * (size_t)width, bh = batch * (size_t)hidden;
 	const size_t n_w1 = (size_t)width * (size_t)hidden, n_w2 = (size_t)hidden * (size_t)hidden;
-	// Activations AND gradients. Sizing only the activations meant the gradient
-	// allocations grew the buffer, which reallocates and dangles every pointer
-	// already handed out.
-	const size_t need =
-	    sizeof(float) * (bw + 4 * bh + 3 * batch + n_w1 + n_w2 + 3 * (size_t)hidden + 1) + 64 * 17;
 	Arena arena;
-	arena.Reserve(need);
-	float *X = arena.Zeroed<float>(bw);
-	float *H1 = arena.Zeroed<float>(bh);
-	float *H2 = arena.Zeroed<float>(bh);
-	float *DH2 = arena.Zeroed<float>(bh);
-	float *DH1 = arena.Zeroed<float>(bh);
-	float *DO = arena.Zeroed<float>(batch);
-	float *YB = arena.Zeroed<float>(batch);
-	float *OB = arena.Zeroed<float>(batch);
+	float *X = nullptr, *H1 = nullptr, *H2 = nullptr, *DH2 = nullptr, *DH1 = nullptr;
+	float *DO = nullptr, *YB = nullptr, *OB = nullptr;
+	float *gw1 = nullptr, *gb1 = nullptr, *gw2 = nullptr, *gb2 = nullptr, *gw3 = nullptr;
+	float *gb3 = nullptr;
+	arena.Carve([&](Arena &a) {
+		X = a.Zeroed<float>(bw);
+		H1 = a.Zeroed<float>(bh);
+		H2 = a.Zeroed<float>(bh);
+		DH2 = a.Zeroed<float>(bh);
+		DH1 = a.Zeroed<float>(bh);
+		DO = a.Zeroed<float>(batch);
+		YB = a.Zeroed<float>(batch);
+		OB = a.Zeroed<float>(batch);
+		gw1 = a.Zeroed<float>(n_w1);
+		gb1 = a.Zeroed<float>((size_t)hidden);
+		gw2 = a.Zeroed<float>(n_w2);
+		gb2 = a.Zeroed<float>((size_t)hidden);
+		gw3 = a.Zeroed<float>((size_t)hidden);
+		gb3 = a.Zeroed<float>(1);
+	});
 	EvalScratch escratch;
 	std::vector<double> scores;
 
 	Adam a1, a2, a3, ab1, ab2, ab3;
-	float *gw1 = arena.Zeroed<float>(n_w1);
-	float *gb1 = arena.Zeroed<float>((size_t)hidden);
-	float *gw2 = arena.Zeroed<float>(n_w2);
-	float *gb2 = arena.Zeroed<float>((size_t)hidden);
-	float *gw3 = arena.Zeroed<float>((size_t)hidden);
-	float *gb3 = arena.Zeroed<float>(1);
 	const size_t n_gw1 = n_w1, n_gw2 = n_w2;
 
 	Model best = model;
@@ -5874,6 +6126,9 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 		shuffle(tr);
 		for (size_t bstart = 0; bstart < tr.size(); bstart += batch) {
 			const size_t bend = std::min(bstart + batch, tr.size());
+			if (cancelled) {
+				cancelled();
+			}
 			const int B = (int)(bend - bstart);
 			for (int i = 0; i < B; i++) {
 				const float *xv = ds.Row(tr[bstart + (size_t)i]);
@@ -6005,8 +6260,10 @@ inline TrainReport TrainModel(const Database &db, const Statement &stmt, Model &
 				m = -MAE(pt);
 			}
 			// >= so a later epoch wins ties; NaN (undefined metric) falls back to the
-			// most recent weights rather than freezing at epoch 1.
-			if (!(m < best_val)) {
+			// most recent weights rather than freezing at epoch 1, but only while no
+			// epoch has produced a defined metric: after one has, a NaN epoch is a
+			// diverged model, and it used to replace the best one.
+			if (std::isnan(m) ? !std::isfinite(best_val) : !(m < best_val)) {
 				best_val = std::isnan(m) ? best_val : m;
 				best = model;
 				have_val = true;
@@ -6069,12 +6326,88 @@ struct Prediction {
 	double value = 0;
 };
 
+// Score every example of `ds` through a SAGE model of either depth, in the
+// units the caller reports (probability, or a de-standardised value plus the
+// persistence base). RunPredict and RunBacktest both used to gather one hop
+// whatever the model was trained with: a two-hop model's edge widths are C+1
+// (child embeddings), so the one-hop prefix sums, whose stride is the child's
+// raw width, were read past their end and the predictions were garbage.
+inline void ScoreSage(const Database &db, const Model &model, const Frame &entity,
+                      const Dataset &ds, std::vector<double> &out,
+                      const CancelCheck &cancelled = CancelCheck()) {
+	SageSpec spec_s = model.sage_spec;
+	RebindSageSpec(db, entity, spec_s);
+	const SageFeatures feats = BuildSageFeatures(db, spec_s);
+	VisibleCounts vcounts;
+	BuildVisibleCounts(db, spec_s, ds, vcounts);
+	const bool two_hop = model.sage_layers >= 2;
+	const int C = model.sage_params.channels;
+	SagePrefix prefix;
+	SageChildParams cp;
+	ChildStatic cstat;
+	ChildEmbed ce;
+	if (two_hop) {
+		// Link ids are per load, so the child layer's shape is rediscovered the
+		// way training discovered it and the trained weights are laid over it. A
+		// different shape means the graph is not the one the model was fitted on.
+		cp = BuildChildLayer(db, spec_s, C, 1);
+		const SageChildParams &tr = model.sage_child;
+		if (cp.self_dim != tr.self_dim || cp.gc_dim != tr.gc_dim) {
+			throw std::runtime_error("pql: model '" + model.name +
+			                         "' was trained on a graph whose child tables or their "
+			                         "columns differ from what is loaded now; retrain it");
+		}
+		cp.w_self = tr.w_self;
+		cp.bias = tr.bias;
+		cp.w_gc = tr.w_gc;
+		BuildChildStatic(db, spec_s, cp, feats, cstat);
+		ComputeChildEmbeddings(db, spec_s, cp, cstat, ce);
+	} else {
+		prefix = BuildSagePrefix(db, spec_s, feats);
+	}
+	SageScratch sc;
+	const size_t B0 = 256;
+	sc.Ensure(B0, model.sage_params);
+	std::vector<size_t> all(ds.examples.size());
+	for (size_t i = 0; i < all.size(); i++) {
+		all[i] = i;
+	}
+	out.assign(all.size(), 0.0);
+	std::vector<double> outs;
+	for (size_t b = 0; b < all.size(); b += B0) {
+		const int B = (int)std::min(B0, all.size() - b);
+		if (cancelled) {
+			cancelled();
+		}
+		if (two_hop) {
+			SageGather2(spec_s, feats, ce, ds, all, b, B, C, model.sage_params, vcounts, sc);
+		} else {
+			SageGather(db, spec_s, feats, prefix, ds, all, b, B, model.sage_params, vcounts, sc);
+		}
+		SageForward(model.sage_params, B, sc, outs);
+		for (int i = 0; i < B; i++) {
+			double v = model.classification ? 1.0 / (1.0 + std::exp(-outs[(size_t)i]))
+			                                : outs[(size_t)i] * model.label_sd + model.label_mean;
+			if (!model.classification) {
+				if (model.residual) {
+					v += ds.examples[b + (size_t)i].base;
+				}
+				if (model.nonnegative && v < 0.0) {
+					v = 0.0;
+				}
+			}
+			out[b + (size_t)i] = v;
+		}
+	}
+}
+
 // Predict with a trained model. The stored training statement supplies the
 // anchor and horizon so a PREDICT that omits them still lines up; anything the
 // caller does restate must match, or the features would be built differently
 // from how they were learned.
 inline std::vector<Prediction> RunPredict(const Database &db, const Model &model,
-                                          const Statement &stmt) {
+                                          const Statement &stmt,
+                                          const CancelCheck &cancelled = CancelCheck()) {
 	const Frame &entity = db.At(stmt.entity_table);
 	Statement eff = stmt;
 	if (eff.anchor.name.empty() && !eff.anchor_is_literal) {
@@ -6131,45 +6464,20 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 	spec.Rebind(db, entity);
 	const AggCache cache = BuildAggCache(db, spec);
 	Dataset ds = CollectExamples(db, eff, spec, cache, anchor_col, false);
+	if (cancelled) {
+		cancelled();
+	}
 	std::vector<Prediction> out;
 	out.reserve(ds.examples.size());
 	if (model.sage) {
-		SageSpec spec_s = model.sage_spec;
-		RebindSageSpec(db, entity, spec_s);
-		const SageFeatures feats = BuildSageFeatures(db, spec_s);
-		const SagePrefix prefix = BuildSagePrefix(db, spec_s, feats);
-		VisibleCounts vcounts;
-		BuildVisibleCounts(db, spec_s, ds, vcounts);
-		SageScratch sc;
-		const size_t B0 = 256;
-		sc.Ensure(B0, model.sage_params);
-		std::vector<size_t> all(ds.examples.size());
-		for (size_t i = 0; i < all.size(); i++) {
-			all[i] = i;
-		}
-		std::vector<double> outs;
-		for (size_t b = 0; b < all.size(); b += B0) {
-			const int B = (int)std::min(B0, all.size() - b);
-			SageGather(db, spec_s, feats, prefix, ds, all, b, B, model.sage_params, vcounts, sc);
-			SageForward(model.sage_params, B, sc, outs);
-			for (int i = 0; i < B; i++) {
-				Prediction p;
-				p.entity_row = ds.examples[b + (size_t)i].entity_row;
-				p.anchor = ds.examples[b + (size_t)i].anchor;
-				double v = model.classification
-				               ? 1.0 / (1.0 + std::exp(-outs[(size_t)i]))
-				               : outs[(size_t)i] * model.label_sd + model.label_mean;
-				if (!model.classification) {
-					if (model.residual) {
-						v += ds.examples[b + (size_t)i].base;
-					}
-					if (model.nonnegative && v < 0.0) {
-						v = 0.0;
-					}
-				}
-				p.value = v;
-				out.push_back(p);
-			}
+		std::vector<double> vals;
+		ScoreSage(db, model, entity, ds, vals, cancelled);
+		for (size_t i = 0; i < ds.examples.size(); i++) {
+			Prediction p;
+			p.entity_row = ds.examples[i].entity_row;
+			p.anchor = ds.examples[i].anchor;
+			p.value = vals[i];
+			out.push_back(p);
 		}
 		return out;
 	}
@@ -6183,7 +6491,7 @@ inline std::vector<Prediction> RunPredict(const Database &db, const Model &model
 		}
 		EvalScratch es;
 		std::vector<double> vals;
-		ScoreRows(model, ds, all, es, vals);
+		ScoreRows(model, ds, all, es, vals, cancelled);
 		for (size_t i = 0; i < ds.examples.size(); i++) {
 			Prediction p;
 			p.entity_row = ds.examples[i].entity_row;
@@ -6227,7 +6535,8 @@ struct FeatureImportance {
 };
 
 inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model &model,
-                                                 const Statement &stmt) {
+                                                 const Statement &stmt,
+                                                 const CancelCheck &cancelled = CancelCheck()) {
 	if (model.sage) {
 		throw std::runtime_error("pql: EXPLAIN reads the dense feature vector, and this model was "
 		                         "trained with arch='sage', whose inputs are gathered from the "
@@ -6267,7 +6576,7 @@ inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model
 	EvalScratch es;
 	std::vector<double> preds;
 	auto measure = [&]() {
-		ScoreRows(model, ds, all, es, preds);
+		ScoreRows(model, ds, all, es, preds, cancelled);
 		if (model.classification) {
 			std::vector<std::pair<double, int>> sc;
 			sc.reserve(n);
@@ -6345,7 +6654,8 @@ inline std::vector<FeatureImportance> RunExplain(const Database &db, const Model
 }
 
 inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &model,
-                                            const Statement &stmt) {
+                                            const Statement &stmt,
+                                            const CancelCheck &cancelled = CancelCheck()) {
 	Statement eff = model.spec_stmt;
 	eff.kind = StmtKind::BACKTEST;
 	if (!stmt.entity_table.empty()) {
@@ -6365,47 +6675,14 @@ inline std::vector<BacktestRow> RunBacktest(const Database &db, const Model &mod
 
 	std::vector<double> preds;
 	if (model.sage) {
-		SageSpec ss = model.sage_spec;
-		RebindSageSpec(db, entity, ss);
-		const SageFeatures feats = BuildSageFeatures(db, ss);
-		const SagePrefix pre = BuildSagePrefix(db, ss, feats);
-		VisibleCounts vcounts;
-		BuildVisibleCounts(db, ss, ds, vcounts);
-		SageScratch sc;
-		const size_t B0 = 256;
-		sc.Ensure(B0, model.sage_params);
-		std::vector<size_t> all(ds.examples.size());
-		for (size_t i = 0; i < all.size(); i++) {
-			all[i] = i;
-		}
-		preds.assign(all.size(), 0.0);
-		std::vector<double> outs;
-		for (size_t b = 0; b < all.size(); b += B0) {
-			const int B = (int)std::min(B0, all.size() - b);
-			SageGather(db, ss, feats, pre, ds, all, b, B, model.sage_params, vcounts, sc);
-			SageForward(model.sage_params, B, sc, outs);
-			for (int i = 0; i < B; i++) {
-				double v = model.classification
-				               ? 1.0 / (1.0 + std::exp(-outs[(size_t)i]))
-				               : outs[(size_t)i] * model.label_sd + model.label_mean;
-				if (!model.classification) {
-					if (model.residual) {
-						v += ds.examples[b + (size_t)i].base;
-					}
-					if (model.nonnegative && v < 0.0) {
-						v = 0.0;
-					}
-				}
-				preds[b + (size_t)i] = v;
-			}
-		}
+		ScoreSage(db, model, entity, ds, preds, cancelled);
 	} else {
 		std::vector<size_t> all(ds.examples.size());
 		for (size_t i = 0; i < all.size(); i++) {
 			all[i] = i;
 		}
 		EvalScratch es;
-		ScoreRows(model, ds, all, es, preds);
+		ScoreRows(model, ds, all, es, preds, cancelled);
 	}
 
 	const double lo = stmt.has_from ? stmt.backtest_from.number

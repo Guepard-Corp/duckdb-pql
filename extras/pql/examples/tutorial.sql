@@ -26,7 +26,8 @@ CREATE OR REPLACE TABLE orders AS
 -- opponent for the spend forecast rather than a straw man.
 INSERT INTO orders
   SELECT 900000 + c.id * 10 + k, c.id,
-         c.last_seen + INTERVAL '1 day' * (k * 7 + 2), 20.0 + (k * 3), 'paid'
+         c.last_seen + INTERVAL '1 day' * (k * 7 + 2), 20.0 + (k * 3),
+         CASE WHEN (c.id + k) % 9 = 0 THEN 'refunded' ELSE 'paid' END
   FROM customers c, range(20) r(k)
   WHERE k < (c.id % 18)
     AND (((c.id % 18) > 9 AND (c.id * 7 % 10) < 7)    -- most heavy buyers return

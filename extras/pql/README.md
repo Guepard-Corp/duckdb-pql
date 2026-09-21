@@ -16,6 +16,7 @@ This directory holds the implementation and its examples.
 | [`test_model.cpp`](test_model.cpp) | end-to-end model tests including the leakage canary |
 | [`test_fuzz.cpp`](test_fuzz.cpp) | parser fuzzer: mutated statements and garbage, checking that anything accepted round-trips |
 | [`test_degenerate.cpp`](test_degenerate.cpp) | databases that should not exist: empty, one row, duplicate keys, NaN, infinity |
+| [`test_memory.cpp`](test_memory.cpp) | memory discipline: zero heap allocations per training step, the arena sized exactly by its own carve, prediction allocating per call not per row, a trained model keeping none of its data |
 | [`console/server.py`](console/server.py) | a small local browser console |
 
 The DuckDB binding is in

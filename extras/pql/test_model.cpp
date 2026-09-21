@@ -194,6 +194,50 @@ int main() {
     printf("   1 hop = %.4f   2 hops = %.4f\n", a1, a2);
     if (a2 <= a1 + 0.03) { printf("   FAIL: the second hop did not reach the signal\n"); fails++; }
 
+    // PREDICT and BACKTEST must run the two-hop model the way it was trained.
+    // Both used to gather one hop whatever LAYERS said: the edge widths of a
+    // two-hop model are C+1, the one-hop prefix sums are the child's raw width,
+    // and the read ran past the buffer (ASan) and produced garbage ranks.
+    {
+      auto st = Parse(std::string("TRAIN MODEL h2p PREDICT EXISTS(orders) FOR users AT ts HORIZON 20 DAYS ") + opts2);
+      Model m; TrainReport rep = TrainModel(db, st, m);
+      auto preds = RunPredict(db, m, Parse("PREDICT EXISTS(orders) FOR users USING MODEL h2p"));
+      std::vector<std::pair<double,int>> sc;
+      for (const auto &p : preds) sc.emplace_back(p.value, heavy[p.entity_row]);
+      const double planted = AUROC(sc);
+      auto rows = RunBacktest(db, m, Parse("BACKTEST MODEL h2p"));
+      std::vector<std::pair<double,int>> bt;
+      for (const auto &r : rows) bt.emplace_back(r.predicted, r.actual > 0.5 ? 1 : 0);
+      const double backtest = AUROC(bt);
+      printf("   two-hop PREDICT ranks the planted signal at %.4f, BACKTEST auroc %.4f (train test %.4f)\n",
+             planted, backtest, rep.test_metric);
+      if (preds.size() != NU || !(planted > 0.9)) {
+        printf("   FAIL: a two-hop model does not predict what it learned\n"); fails++;
+      }
+      // Rows whose label window runs past the data are censored, so fewer than
+      // NU come back; the ranking over the rest must at least match training.
+      if (rows.size() < NU / 2 || !(backtest > rep.test_metric - 0.1)) {
+        printf("   FAIL: BACKTEST of a two-hop model does not match training\n"); fails++;
+      }
+      // The model handed back must be the one that was validated: re-scoring
+      // the validation fold has to reproduce the reported metric. The child
+      // layer used to keep its last-epoch weights while the entity layer was
+      // restored to its best epoch, a pair no epoch had ever scored.
+      {
+        const AggCache cache = BuildAggCache(db, m.features);
+        Dataset ds = CollectExamples(db, st, m.features, cache, db.At("users").Find("ts"), true);
+        std::vector<size_t> ftr, fva, fte; SplitByAnchor(ds, st, ftr, fva, fte);
+        std::vector<char> inva(NU, 0); for (size_t i : fva) inva[ds.examples[i].entity_row] = 1;
+        std::vector<std::pair<double,int>> sv;
+        for (const auto &r : rows) if (inva[r.entity_row]) sv.emplace_back(r.predicted, r.actual > 0.5 ? 1 : 0);
+        const double again = AUROC(sv);
+        printf("   validation fold re-scored through BACKTEST: %.6f (reported %.6f)\n", again, rep.val_metric);
+        if (std::fabs(again - rep.val_metric) > 1e-3) {
+          printf("   FAIL: the returned model is not the one whose metric was reported\n"); fails++;
+        }
+      }
+    }
+
     // ---- H. the same statement twice in a session gives the same model -----
     // The SAGE optimiser state used to be static and was only reset when it had
     // to grow, so a second TRAIN inherited the first model's Adam moments and
@@ -571,6 +615,16 @@ int main() {
     // tie, so model selection never fired and training kept epoch 1.
     if (!(AUROC({{0.9,1},{0.8,1}}) != AUROC({{0.9,1},{0.8,1}}))) {
       printf("   FAIL: a single-class fold must be undefined\n"); fails++;
+    }
+    // A score that is not a number makes the ranking undefined. Both metrics
+    // used to spin forever on one: the tie loop advances on ==, which NaN never
+    // satisfies. (If this test hangs, that is the regression.)
+    {
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      const std::vector<std::pair<double,int>> poisoned = {{0.9,1},{nan,0},{0.7,1},{nan,1},{0.2,0}};
+      const double a = AUROC(poisoned), ap = AveragePrecision(poisoned);
+      printf("   NaN score: auroc %.4f ap %.4f (both must be undefined)\n", a, ap);
+      if (!std::isnan(a) || !std::isnan(ap)) { printf("   FAIL: a NaN score must make the metric undefined\n"); fails++; }
     }
   }
 

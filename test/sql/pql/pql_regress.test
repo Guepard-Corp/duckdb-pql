@@ -1,0 +1,205 @@
+# name: test/sql/pql/pql_regress.test
+# description: Regressions: labels match SQL, keys and links, two-hop SAGE replay, echoed statements re-parse
+# group: [pql]
+
+# ---------------------------------------------------------------------------
+# The label PQL computes is the count SQL computes. Children with a NULL time
+# sit between dated ones and must count for nothing; children seconds apart
+# must still sort.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE users AS
+  SELECT i AS id, TIMESTAMP '2024-01-01' + INTERVAL '1 day' * (i % 200) AS ts, (i % 9) * 1.0 AS score
+  FROM range(600) t(i);
+
+statement ok
+CREATE TABLE events AS
+  SELECT row_number() OVER () AS id, u.id AS user_id,
+         CASE WHEN k % 4 = 3 THEN NULL
+              ELSE u.ts + INTERVAL '1 day' * ((k * 7) % 45 - 20) + INTERVAL '1 second' * (k % 3) END AS ts,
+         1.0 + k AS v
+  FROM users u, range(12) r(k) WHERE k < (u.id % 12);
+
+statement ok
+TRAIN MODEL lab PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 3, hidden = 16);
+
+query I
+SELECT count(*)
+FROM pql_exec('BACKTEST MODEL lab') b
+JOIN users u ON u.id = b.id
+WHERE b.actual <> (SELECT count(*) FROM events e
+                   WHERE e.user_id = u.id AND e.ts > u.ts AND e.ts <= u.ts + INTERVAL '30 days');
+----
+0
+
+statement ok
+TRAIN MODEL labsum PREDICT SUM(events.v) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 3, hidden = 16);
+
+query I
+SELECT count(*)
+FROM pql_exec('BACKTEST MODEL labsum') b
+JOIN users u ON u.id = b.id
+WHERE abs(b.actual - (SELECT coalesce(sum(e.v), 0) FROM events e
+                      WHERE e.user_id = u.id AND e.ts > u.ts AND e.ts <= u.ts + INTERVAL '30 days')) > 1e-9;
+----
+0
+
+# ---------------------------------------------------------------------------
+# A DOUBLE key with fractional values links exactly and is echoed as a DOUBLE.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dk AS SELECT id + 0.5 AS id, ts, score FROM users;
+
+statement ok
+CREATE TABLE dk_ev AS SELECT id, user_id + 0.5 AS dk_id, ts, v FROM events;
+
+statement ok
+TRAIN MODEL dkm PREDICT COUNT(dk_ev) FOR dk AT ts HORIZON 30 DAYS OPTIONS (epochs = 3, hidden = 16);
+
+query I
+SELECT count(*)
+FROM pql_exec('BACKTEST MODEL dkm') b
+JOIN dk u ON u.id = b.id
+WHERE b.actual <> (SELECT count(*) FROM dk_ev e
+                   WHERE e.dk_id = u.id AND e.ts > u.ts AND e.ts <= u.ts + INTERVAL '30 days');
+----
+0
+
+query R
+SELECT id FROM pql_exec('PREDICT COUNT(dk_ev) FOR dk WHERE id = 7.5 USING MODEL dkm');
+----
+7.5
+
+# ---------------------------------------------------------------------------
+# Intervals and nesting that used to be undefined behaviour are errors.
+# ---------------------------------------------------------------------------
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 99999999999999999999 DAYS;
+----
+<REGEX>:.*interval.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 1000000000000 YEARS;
+----
+<REGEX>:.*interval.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 1.5 DAYS;
+----
+<REGEX>:.*whole number.*
+
+statement error
+SELECT * FROM pql_exec('PREDICT COUNT(events) FOR users WHERE ' || repeat('(', 5000) || 'score = 1' || repeat(')', 5000) || ' USING MODEL lab');
+----
+<REGEX>:.*nested too deeply.*
+
+statement error
+TRAIN MODEL bad PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS WHERE score = 1.2.3;
+----
+<REGEX>:.*malformed number.*
+
+# ---------------------------------------------------------------------------
+# Two foreign keys from one child table to the entity. PREDICT and BACKTEST
+# must rebind each aggregate block to the link it was trained on, so replaying
+# the test fold reproduces TRAIN's own number.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE people (id INTEGER PRIMARY KEY, ts TIMESTAMP, score DOUBLE);
+
+statement ok
+INSERT INTO people SELECT id, ts, score FROM users;
+
+statement ok
+CREATE TABLE messages (id BIGINT, sender_id INTEGER REFERENCES people(id), receiver_id INTEGER REFERENCES people(id),
+                       sent_at TIMESTAMP, len DOUBLE);
+
+statement ok
+INSERT INTO messages
+  SELECT row_number() OVER (), u.id, ((u.id * 7 + k) % 600),
+         u.ts - INTERVAL '1 day' * (k * 3 + 1), (k % 5) * 1.0
+  FROM people u, range(10) r(k) WHERE k < (u.id % 10);
+
+statement ok
+INSERT INTO messages
+  SELECT 700000 + u.id, u.id, (u.id * 11) % 600, u.ts + INTERVAL '5 days', 2.0
+  FROM people u WHERE (u.id % 10) > 5;
+
+statement ok
+CREATE TABLE trr AS SELECT * FROM pql_exec('TRAIN MODEL twofk PREDICT COUNT(messages) FOR people AT ts HORIZON 30 DAYS SPLIT TEMPORAL VALIDATE FROM ''2024-04-01'' TEST FROM ''2024-06-01'' OPTIONS (epochs = 10, hidden = 16)');
+
+query I
+SELECT CAST(round(avg(abs(error)), 6) = round((SELECT test FROM trr), 6) AND count(*) = (SELECT test_rows FROM trr) AS INTEGER)
+FROM pql_exec('BACKTEST MODEL twofk FROM ''2024-06-01''');
+----
+1
+
+# both links show up as feature groups
+query I
+SELECT CAST(count(DISTINCT feature) FILTER (WHERE feature LIKE 'messages%') > 0 AS INTEGER) FROM pql_exec('EXPLAIN MODEL twofk');
+----
+1
+
+# ---------------------------------------------------------------------------
+# Two-hop SAGE: PREDICT and BACKTEST replay what was trained (they used to read
+# past the end of the one-hop prefix sums).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE trs AS SELECT * FROM pql_exec('TRAIN MODEL sage2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS SPLIT TEMPORAL VALIDATE FROM ''2024-04-01'' TEST FROM ''2024-06-01'' OPTIONS (epochs = 10, hidden = 16, arch = ''sage'', layers = 2)');
+
+query I
+SELECT CAST(count(*) = 600 AND count(prediction) = 600
+            AND sum(CASE WHEN isnan(prediction) OR isinf(prediction) THEN 1 ELSE 0 END) = 0 AS INTEGER)
+FROM pql_exec('PREDICT COUNT(events) FOR users USING MODEL sage2');
+----
+1
+
+query I
+SELECT CAST(round(avg(abs(error)), 6) = round((SELECT test FROM trs), 6) AND count(*) = (SELECT test_rows FROM trs) AS INTEGER)
+FROM pql_exec('BACKTEST MODEL sage2 FROM ''2024-06-01''');
+----
+1
+
+# the same two-hop statement twice gives the same predictions
+statement ok
+TRAIN MODEL sage2b PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS SPLIT TEMPORAL VALIDATE FROM '2024-04-01' TEST FROM '2024-06-01' OPTIONS (epochs = 10, hidden = 16, arch = 'sage', layers = 2);
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM pql_exec('PREDICT COUNT(events) FOR users USING MODEL sage2')
+  EXCEPT
+  SELECT * FROM pql_exec('PREDICT COUNT(events) FOR users USING MODEL sage2b'));
+----
+0
+
+# ---------------------------------------------------------------------------
+# A quote inside a literal survives the echo, and the echo re-parses.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE notes AS SELECT id, ts, score, CASE WHEN id % 2 = 0 THEN 'it''s' ELSE 'plain' END AS note FROM users;
+
+statement ok
+CREATE TABLE notes_ev AS SELECT id, user_id AS notes_id, ts, v FROM events;
+
+statement ok
+TRAIN MODEL qq PREDICT COUNT(notes_ev) FOR notes AT ts HORIZON 30 DAYS WHERE note = 'it''s' OPTIONS (epochs = 2, hidden = 16);
+
+query I
+SELECT CAST(statement LIKE '%WHERE note = ''it''''s''%' AS INTEGER) FROM pql_models() WHERE model = 'qq';
+----
+1
+
+# A table function argument must be a constant, so the echoed statement is
+# pinned to its exact text here and that text is then run as written.
+query I
+SELECT statement FROM pql_models() WHERE model = 'qq';
+----
+TRAIN MODEL qq PREDICT COUNT(notes_ev) FOR notes WHERE note = 'it''s' AT ts HORIZON 30 DAYS OPTIONS (EPOCHS = 2, HIDDEN = 16)
+
+statement ok
+TRAIN OR REPLACE MODEL qq PREDICT COUNT(notes_ev) FOR notes WHERE note = 'it''s' AT ts HORIZON 30 DAYS OPTIONS (EPOCHS = 2, HIDDEN = 16);

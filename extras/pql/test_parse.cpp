@@ -76,7 +76,7 @@ int main() {
   Err("PREDICT users.x FOR users WHERE region = 'US USING MODEL m", "unterminated string");
   Err("BACKTEST MODEL \"m", "unterminated quoted identifier");
   Err("PREDICT users.x FOR \"\" USING MODEL m", "empty quoted identifier");
-  Ok("PREDICT users.x FOR users WHERE note = 'it''s fine' USING MODEL m", "it's fine");
+  Ok("PREDICT users.x FOR users WHERE note = 'it''s fine' USING MODEL m", "'it''s fine'");
   // An identifier that needed quotes going in needs them coming out, or the
   // statement a model records of itself cannot be run again.
   Ok("PREDICT \"my col\" FOR \"my table\" USING MODEL m", "FOR \"my table\"");
@@ -116,6 +116,14 @@ int main() {
   Err("SHOW MODELS extra", "after SHOW MODELS");
   Err("DROP MODEL IF m", "expected EXISTS");
 
+  // Comments arrive with the statement. DuckDB strips nothing before handing a
+  // statement its own parser rejected to an extension.
+  std::printf("== comments\n");
+  Ok("TRAIN MODEL m PREDICT COUNT(o) -- trailing\n FOR u /* block */ AT t HORIZON 5 DAYS", "HORIZON 5 DAYS");
+  Ok("/* leading */ DROP MODEL m", "DROP MODEL m");
+  Ok("PREDICT u.x FOR u /* a 'quote' inside */ USING MODEL m", "USING MODEL m");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u /* never closed", "unterminated block comment");
+
   // A date literal keeps its spelling after being resolved to microseconds, so
   // it has to echo with its quotes. Without them `VALIDATE FROM 2025-08-01`
   // tokenises as 2025, then a minus, and the statement a model recorded of
@@ -131,6 +139,38 @@ int main() {
   // enumerated by hand in the copy assignment, and EXCLUDE and OR REPLACE were
   // both missing from it: they parsed, took effect, and then disappeared from
   // the model's own record of what it was trained with.
+  std::printf("== quotes inside literals survive an echo\n");
+  {
+    pql::Statement st = pql::Parse("PREDICT u.x FOR u WHERE a = 'it''s' AND b IN ('x''y', '''') USING MODEL m");
+    const std::string once = st.ToString();
+    try {
+      pql::Statement again = pql::Parse(once);
+      if (again.ToString() != once) { std::printf("  FAIL drift: %s\n", once.c_str()); fails++; }
+      else if (st.filter->children[0]->values[0].text != "it's") { std::printf("  FAIL text: %s\n", once.c_str()); fails++; }
+      else oks++;
+    } catch (const std::exception &e) { std::printf("  FAIL echo rejected: %s\n     %s\n", once.c_str(), e.what()); fails++; }
+  }
+  std::printf("== input bounds\n");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT ts HORIZON 99999999999999999999 DAYS", "whole number");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT ts HORIZON 300000000 DAYS", "too long");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u AT ts HORIZON 1.5 DAYS", "whole number");
+  Err("TRAIN MODEL m PREDICT COUNT(o) FOR u EVERY 99999999999999999999 DAYS HORIZON 1 DAYS", "whole number");
+  Err("PREDICT u.x FOR u WHERE a = 1.2.3.4 USING MODEL m", "malformed number");
+  Err("PREDICT u.x FOR u WHERE a = .5. USING MODEL m", "malformed number");
+  Ok("PREDICT u.x FOR u WHERE a = .5 AND b = 10.25 USING MODEL m", "10.25");
+  {
+    // a nest deeper than any thread stack can take must be a parse error
+    std::string deep = "PREDICT u.x FOR u WHERE " + std::string(50000, '(') + "a = 1" +
+                       std::string(50000, ')') + " USING MODEL m";
+    Err(deep.c_str(), "nested too deeply");
+    std::string nots = "PREDICT u.x FOR u WHERE ";
+    for (int i = 0; i < 50000; i++) nots += "NOT ";
+    nots += "a = 1 USING MODEL m";
+    Err(nots.c_str(), "nested too deeply");
+    std::string fine = "PREDICT u.x FOR u WHERE " + std::string(100, '(') + "NOT NOT a = 1" +
+                       std::string(100, ')') + " USING MODEL m";
+    Ok(fine.c_str(), "NOT NOT a = 1");
+  }
   std::printf("== statement copies keep every clause\n");
   {
     const char *full =

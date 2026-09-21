@@ -162,8 +162,11 @@ statement ok
 TRAIN MODEL rep1 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS
   OPTIONS (epochs = 20, hidden = 32, arch = 'sage');
 
+# (every event in this dataset is dated before its user's anchor, so a forward
+# EXISTS(events) has no positives and is rightly refused; the model in between
+# is an attribute target, which needs no anchor)
 statement ok
-TRAIN MODEL between PREDICT EXISTS(events) FOR users AT ts HORIZON 30 DAYS
+TRAIN MODEL between PREDICT users.score FOR users
   OPTIONS (epochs = 20, hidden = 16, arch = 'sage', layers = 2);
 
 statement ok

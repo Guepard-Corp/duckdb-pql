@@ -1,4 +1,6 @@
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
@@ -10,6 +12,7 @@
 // pql.hpp is DuckDB-agnostic and declares its own namespace; keep this TU isolated.
 #include "../../../extras/pql/src/pql.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -400,11 +403,19 @@ static std::vector<TableSchema> LoadSchema(Connection &con) {
 			    ty.rfind("ARRAY", 0) == 0 || ty.rfind("INTERVAL", 0) == 0;
 			if (composite) {
 				t = pql::ColType::INVALID; // not a quantity and not a label; skipped
+			} else if (ty.rfind("ENUM", 0) == 0 || ty == "UUID") {
+				// An enum is matched before anything reads its value list, which can
+				// contain any word ("point" is an INT); a UUID is a text key.
+				t = pql::ColType::CATEGORY;
 			} else if (ty.find("TIMESTAMP") != std::string::npos ||
 			           ty.rfind("DATE", 0) == 0) {
 				t = pql::ColType::TIMESTAMP;
 			} else if (ty.find("BOOLEAN") != std::string::npos) {
 				t = pql::ColType::BOOL;
+			} else if (ty.find("HUGEINT") != std::string::npos || ty.find("VARINT") != std::string::npos) {
+				// Wider than int64: a BIGINT cast of one large value fails the whole
+				// load, and a DOUBLE holds the magnitude.
+				t = pql::ColType::DOUBLE;
 			} else if (ty.find("DOUBLE") != std::string::npos || ty.find("FLOAT") != std::string::npos ||
 			           ty.find("DECIMAL") != std::string::npos || ty.find("REAL") != std::string::npos) {
 				t = pql::ColType::DOUBLE;
@@ -454,10 +465,32 @@ static pql::Frame LoadFrameColumns(Connection &con, const TableSchema &schema, c
 	if (select.empty()) {
 		return frame;
 	}
+	{
+		// Sized once: growing three vectors per column chunk by chunk copies the
+		// whole column at every doubling and briefly holds it twice.
+		auto count = con.Query("SELECT count(*) FROM " + schema.Qualified());
+		if (count && !count->HasError()) {
+			auto ch = count->Fetch();
+			if (ch && ch->size() > 0) {
+				const size_t expect = (size_t)ch->GetValue(0, 0).GetValue<int64_t>();
+				for (auto &col : frame.columns) {
+					col.valid.reserve(expect);
+					col.num.reserve(expect);
+					col.code.reserve(expect);
+				}
+			}
+		}
+	}
 	auto result = con.Query("SELECT " + select + " FROM " + schema.Qualified());
 	if (result->HasError()) {
 		throw InvalidInputException("pql: cannot read table '%s': %s", schema.name, result->GetError());
 	}
+	// DuckDB's 'infinity' and '-infinity' timestamps sit at the ends of int64.
+	// They are finite as doubles, so nothing downstream would treat them as
+	// missing, and casting one back to int64 for the anchor column is undefined.
+	auto finite_ts = [](int64_t micros) {
+		return micros < INT64_MAX - 1024 && micros > -(INT64_MAX - 1024);
+	};
 	while (true) {
 		auto chunk = result->Fetch();
 		if (!chunk || chunk->size() == 0) {
@@ -491,8 +524,9 @@ static pql::Frame LoadFrameColumns(Connection &con, const TableSchema &schema, c
 				}
 			} else {
 				const int64_t *data = FlatVector::GetData<int64_t>(vec);
+				const bool ts = dst.type == pql::ColType::TIMESTAMP;
 				for (idx_t r = 0; r < n; r++) {
-					const bool ok = validity.RowIsValid(r);
+					const bool ok = validity.RowIsValid(r) && (!ts || finite_ts(data[r]));
 					dst.valid[base + r] = ok ? 1 : 0;
 					dst.num[base + r] = ok ? double(data[r]) : 0.0;
 				}
@@ -654,6 +688,16 @@ static const TableSchema *FindSchema(const std::vector<TableSchema> &schema, con
 
 static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &stmt) {
 	Connection con(DatabaseInstance::GetDatabase(context));
+	// Training is a function of row order (split, shuffle, minibatches), and a
+	// parallel scan hands rows back in whichever order its pipelines finish
+	// unless insertion order is preserved. This connection is ours alone, so the
+	// setting reaches nothing else.
+	{
+		auto set = con.Query("SET preserve_insertion_order = true");
+		if (set->HasError()) {
+			throw InvalidInputException("pql: cannot pin the scan order: %s", set->GetError());
+		}
+	}
 	std::vector<TableSchema> schema = LoadSchema(con);
 	{
 		// PQL names tables without a schema, so a bare name has to mean one table.
@@ -844,13 +888,93 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 struct PqlBindData : public TableFunctionData {
 	vector<Identifier> names;
 	vector<LogicalType> types;
-	// Result rows are produced during bind and replayed here.
-	std::vector<std::vector<Value>> rows;
+	// Result rows are produced during bind and replayed by PqlScan. They go
+	// into DuckDB's own columnar row store as they are emitted: kept as a
+	// std::vector<Value> per row they cost about ten times their payload (a heap
+	// block plus ~64 bytes per cell), which for a PREDICT over millions of
+	// entities was more memory than the frames and the dataset together.
+	unique_ptr<ColumnDataCollection> rows;
+	DataChunk staging;
+	idx_t staged = 0;
+
+	// Once the output types are known and before the first Emit.
+	void Begin(ClientContext &context) {
+		rows = make_uniq<ColumnDataCollection>(context, types);
+		staging.Destroy();
+		staging.Initialize(Allocator::Get(context), types);
+		staged = 0;
+	}
+	void Emit(const std::vector<Value> &row) {
+		for (idx_t c = 0; c < row.size() && c < staging.ColumnCount(); c++) {
+			staging.data[c].SetValue(staged, row[c]);
+		}
+		if (++staged == STANDARD_VECTOR_SIZE) {
+			Flush();
+		}
+	}
+	// After the last Emit; a partial staging chunk is appended here.
+	void Flush() {
+		if (!rows || staged == 0) {
+			return;
+		}
+		staging.SetCardinalityUnsafe(staged);
+		rows->Append(staging);
+		staging.Reset();
+		staged = 0;
+	}
 };
 
 struct PqlGlobalState : public GlobalTableFunctionState {
-	idx_t offset = 0;
+	ColumnDataScanState scan;
+	bool started = false;
 };
+
+// InterruptCheck evaluates the deadline only every 256th call and training calls
+// this once per epoch, so max_execution_time is checked here directly.
+static void CheckCancelled(ClientContext &context) {
+	context.InterruptCheck();
+	if (!context.query_deadline.IsValid()) {
+		return;
+	}
+	using namespace std::chrono;
+	const auto now = NumericCast<idx_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+	if (now >= context.query_deadline.GetIndex()) {
+		throw InterruptException("Query exceeded maximum execution time");
+	}
+}
+
+// The key column echoed beside every prediction, in its own type. A NULL key
+// stays NULL rather than turning into 0 or the empty string.
+static LogicalType KeyLogicalType(const pql::Column &kc) {
+	switch (kc.type) {
+	case pql::ColType::CATEGORY:
+		return LogicalType::VARCHAR;
+	case pql::ColType::DOUBLE:
+		return LogicalType::DOUBLE;
+	case pql::ColType::TIMESTAMP:
+		return LogicalType::TIMESTAMP;
+	default:
+		return LogicalType::BIGINT;
+	}
+}
+
+static Value KeyValue(const pql::Column &kc, size_t row) {
+	if (row >= kc.valid.size() || !kc.valid[row]) {
+		return Value(KeyLogicalType(kc));
+	}
+	switch (kc.type) {
+	case pql::ColType::CATEGORY: {
+		const uint32_t code = kc.code[row];
+		return Value(code < kc.dict.values.size() ? kc.dict.values[code] : std::string());
+	}
+	case pql::ColType::DOUBLE:
+		return Value::DOUBLE(kc.num[row]);
+	case pql::ColType::TIMESTAMP:
+		return Value::TIMESTAMP(timestamp_t((int64_t)kc.num[row]));
+	default:
+		return Value::BIGINT((int64_t)kc.num[row]);
+	}
+}
 
 static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
 	// Checked before any work, not after: refusing at the end would mean the user
@@ -868,7 +992,7 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 	pql::Database db = LoadDatabase(context, stmt);
 	pql::Model model;
 	model.name = stmt.model;
-	auto rep = pql::TrainModel(db, stmt, model, [&context]() { context.InterruptCheck(); });
+	auto rep = pql::TrainModel(db, stmt, model, [&context]() { CheckCancelled(context); });
 	{
 		auto entry = GetRegistryEntry(context);
 		std::lock_guard<std::mutex> guard(entry->lock);
@@ -882,11 +1006,12 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 	              LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::DOUBLE,
 	              LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
 	              LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};
+	bind.Begin(context);
 	// An undefined metric (single-class fold) surfaces as NULL, not as a number.
 	auto metric_value = [](double v) {
 		return std::isnan(v) ? Value(LogicalType::DOUBLE) : Value::DOUBLE(v);
 	};
-	bind.rows.push_back({Value(stmt.model), Value(stmt.target.ToString()), Value::BIGINT((int64_t)rep.n_train),
+	bind.Emit({Value(stmt.model), Value(stmt.target.ToString()), Value::BIGINT((int64_t)rep.n_train),
 	                     Value::BIGINT((int64_t)rep.n_val), Value::BIGINT((int64_t)rep.n_test),
 	                     Value::BIGINT((int64_t)rep.n_positives), Value(rep.metric_name), metric_value(rep.val_metric),
 	                     metric_value(rep.test_metric), metric_value(rep.pr_auc),
@@ -936,24 +1061,8 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	// Emit the key in its own type. Forcing it through a DOUBLE turned every
 	// string key into 0.0 and lost precision past 2^53, so the documented
 	// join-back silently produced nothing.
-	const pql::ColType key_type = key_col >= 0 ? entity.columns[(size_t)key_col].type : pql::ColType::INT64;
-	LogicalType key_logical = LogicalType::BIGINT;
-	if (key_col >= 0) {
-		switch (key_type) {
-		case pql::ColType::CATEGORY:
-			key_logical = LogicalType::VARCHAR;
-			break;
-		case pql::ColType::DOUBLE:
-			key_logical = LogicalType::DOUBLE;
-			break;
-		case pql::ColType::TIMESTAMP:
-			key_logical = LogicalType::TIMESTAMP;
-			break;
-		default:
-			key_logical = LogicalType::BIGINT;
-			break;
-		}
-	}
+	const LogicalType key_logical =
+	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
 	// Echo the anchor beside the key: a forecast is "for this entity, at this
 	// time", and a panel returns one row per as-of date. Without it the result is
 	// several numbers with nothing to tell them apart.
@@ -975,30 +1084,17 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 			bind.names[1] = Identifier(entity.columns[(size_t)anchor_out].name);
 		}
 	}
+	bind.Begin(context);
 	if (key_col >= 0) {
 		bind.names[0] = Identifier(entity.columns[(size_t)key_col].name);
 	}
 	for (const auto &p : preds) {
-		Value key_value;
-		if (key_col < 0) {
-			key_value = Value::BIGINT((int64_t)p.entity_row);
-		} else {
-			const pql::Column &kc = entity.columns[(size_t)key_col];
-			if (key_type == pql::ColType::CATEGORY) {
-				const uint32_t code = kc.code[p.entity_row];
-				key_value = Value(code < kc.dict.values.size() ? kc.dict.values[code] : std::string());
-			} else if (key_type == pql::ColType::DOUBLE) {
-				key_value = Value::DOUBLE(kc.num[p.entity_row]);
-			} else if (key_type == pql::ColType::TIMESTAMP) {
-				key_value = Value::TIMESTAMP(timestamp_t((int64_t)kc.num[p.entity_row]));
-			} else {
-				key_value = Value::BIGINT((int64_t)kc.num[p.entity_row]);
-			}
-		}
+		const Value key_value = key_col < 0 ? Value::BIGINT((int64_t)p.entity_row)
+		                                   : KeyValue(entity.columns[(size_t)key_col], p.entity_row);
 		if (with_anchor) {
-			bind.rows.push_back({key_value, Value::TIMESTAMP(timestamp_t((int64_t)p.anchor)), Value::DOUBLE(p.value)});
+			bind.Emit({key_value, Value::TIMESTAMP(timestamp_t((int64_t)p.anchor)), Value::DOUBLE(p.value)});
 		} else {
-			bind.rows.push_back({key_value, Value::DOUBLE(p.value)});
+			bind.Emit({key_value, Value::DOUBLE(p.value)});
 		}
 	}
 }
@@ -1022,8 +1118,9 @@ static void RunExplainStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	auto imp = pql::RunExplain(db, *model, effective);
 	bind.names = {Identifier("feature"), Identifier("slots"), Identifier("importance")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::DOUBLE};
+	bind.Begin(context);
 	for (const auto &f : imp) {
-		bind.rows.push_back({Value(f.feature), Value::BIGINT((int64_t)f.slots),
+		bind.Emit({Value(f.feature), Value::BIGINT((int64_t)f.slots),
 		                     std::isnan(f.drop) ? Value(LogicalType::DOUBLE)
 		                                        : Value::DOUBLE(f.drop)});
 	}
@@ -1063,12 +1160,8 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 			}
 		}
 	}
-	LogicalType key_logical = LogicalType::BIGINT;
-	if (key_col >= 0 && entity.columns[(size_t)key_col].type == pql::ColType::CATEGORY) {
-		key_logical = LogicalType::VARCHAR;
-	} else if (key_col >= 0 && entity.columns[(size_t)key_col].type == pql::ColType::DOUBLE) {
-		key_logical = LogicalType::DOUBLE;
-	}
+	const LogicalType key_logical =
+	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
 	bind.names = {Identifier("entity"), Identifier("anchor"), Identifier("predicted"),
 	              Identifier("actual"), Identifier("error"),  Identifier("baseline")};
 	if (key_col >= 0) {
@@ -1076,20 +1169,11 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	}
 	bind.types = {key_logical,         LogicalType::TIMESTAMP, LogicalType::DOUBLE,
 	              LogicalType::DOUBLE, LogicalType::DOUBLE,    LogicalType::DOUBLE};
+	bind.Begin(context);
 	for (const auto &r : rows) {
-		Value key_value = Value::BIGINT((int64_t)r.entity_row);
-		if (key_col >= 0) {
-			const pql::Column &kc = entity.columns[(size_t)key_col];
-			if (kc.type == pql::ColType::CATEGORY) {
-				const uint32_t code = kc.code[r.entity_row];
-				key_value = Value(code < kc.dict.values.size() ? kc.dict.values[code] : std::string());
-			} else if (kc.type == pql::ColType::DOUBLE) {
-				key_value = Value::DOUBLE(kc.num[r.entity_row]);
-			} else {
-				key_value = Value::BIGINT((int64_t)kc.num[r.entity_row]);
-			}
-		}
-		bind.rows.push_back({key_value, Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)), Value::DOUBLE(r.predicted),
+		const Value key_value = key_col < 0 ? Value::BIGINT((int64_t)r.entity_row)
+		                                   : KeyValue(entity.columns[(size_t)key_col], r.entity_row);
+		bind.Emit({key_value, Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)), Value::DOUBLE(r.predicted),
 		                     Value::DOUBLE(r.actual), Value::DOUBLE(r.predicted - r.actual),
 		                     Value::DOUBLE(r.baseline)});
 	}
@@ -1100,12 +1184,13 @@ static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 	              Identifier("features"), Identifier("statement")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	              LogicalType::BIGINT,   LogicalType::VARCHAR};
+	bind.Begin(context);
 	auto entry = GetRegistryEntry(context);
 	std::lock_guard<std::mutex> guard(entry->lock);
 	for (const auto &m : entry->registry.All()) {
 		// The defining statement, echoed back in full. Copy it to retrain, or read
 		// it to see exactly what a model was given.
-		bind.rows.push_back({Value(m->name), Value(m->spec_stmt.target.ToString()), Value(m->spec_stmt.entity_table),
+		bind.Emit({Value(m->name), Value(m->spec_stmt.target.ToString()), Value(m->spec_stmt.entity_table),
 		                     Value(m->classification ? "classification" : "regression"),
 		                     Value::BIGINT(m->features.width), Value(m->spec_stmt.ToString())});
 	}
@@ -1114,6 +1199,9 @@ static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<PqlBindData>();
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("pql_exec: the statement is NULL");
+	}
 	const std::string query = input.inputs[0].ToString();
 	pql::Statement stmt;
 	try {
@@ -1174,10 +1262,12 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 		}
 		bind->names = {Identifier("dropped")};
 		bind->types = {LogicalType::BOOLEAN};
-		bind->rows.push_back({Value::BOOLEAN(dropped)});
+		bind->Begin(context);
+		bind->Emit({Value::BOOLEAN(dropped)});
 		break;
 	}
 	}
+	bind->Flush();
 	return_types = bind->types;
 	names = bind->names;
 	return std::move(bind);
@@ -1189,6 +1279,7 @@ static unique_ptr<FunctionData> PqlModelsBind(ClientContext &context, TableFunct
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<PqlBindData>();
 	RunShowModels(context, *bind);
+	bind->Flush();
 	return_types = bind->types;
 	names = bind->names;
 	return std::move(bind);
@@ -1201,15 +1292,17 @@ static unique_ptr<GlobalTableFunctionState> PqlInit(ClientContext &, TableFuncti
 static void PqlScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
 	auto &bind = data.bind_data->Cast<PqlBindData>();
 	auto &state = data.global_state->Cast<PqlGlobalState>();
-	idx_t count = 0;
-	while (state.offset < bind.rows.size() && count < STANDARD_VECTOR_SIZE) {
-		const auto &row = bind.rows[state.offset++];
-		for (idx_t c = 0; c < row.size() && c < output.ColumnCount(); c++) {
-			output.SetValue(c, count, row[c]);
-		}
-		count++;
+	if (!bind.rows) {
+		output.SetCardinalityUnsafe(0);
+		return;
 	}
-	output.SetCardinality(count);
+	if (!state.started) {
+		bind.rows->InitializeScan(state.scan);
+		state.started = true;
+	}
+	// Scan resets the output and leaves it empty once the store is exhausted,
+	// which is how the executor learns the function is done.
+	bind.rows->Scan(state.scan, output);
 }
 
 //===--------------------------------------------------------------------===//

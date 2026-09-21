@@ -102,6 +102,46 @@ int main() {
   { Rows r; for(int i=0;i<400;i++){r.uid.push_back(i);r.uts.push_back((1000.0+i)*DAY);r.ux.push_back(1.0);
       r.eid.push_back(i);r.euid.push_back(i);r.ets.push_back((3000.0+i)*DAY);r.eamt.push_back(1.0);}
     Try("every event is after every anchor", Make(r), Q); }
+  // ---- a classifier with one class must refuse, not train a constant --------
+  { Rows r; for(int i=0;i<400;i++){r.uid.push_back(i);r.uts.push_back((1000.0+i)*DAY);r.ux.push_back(1.0);
+      r.eid.push_back(i);r.euid.push_back(i);r.ets.push_back((999.0+i)*DAY);r.eamt.push_back(1.0);}
+    Database db = Make(r);
+    bool refused = false; std::string msg;
+    try { auto st = Parse("TRAIN MODEL m PREDICT EXISTS(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 3, hidden = 8)");
+          Model m; TrainModel(db, st, m); }
+    catch (const std::exception &e) { refused = true; msg = e.what(); }
+    printf("  %-34s %s\n", "EXISTS with no positive anywhere", refused ? msg.substr(0, 62).c_str() : "TRAINED (wrong)");
+    if (!refused || msg.find("no positives") == std::string::npos) { printf("      expected a refusal naming the missing class\n"); fails++; }
+  }
+  // ---- empty folds are undefined, not 0.0 -----------------------------------
+  { Rows r; for(int i=0;i<5;i++){r.uid.push_back(i);r.uts.push_back((1000.0+i)*DAY);r.ux.push_back(double(i%2));}
+    Database db = Make(r);
+    auto st = Parse("TRAIN MODEL a PREDICT users.x FOR users OPTIONS (epochs = 3, hidden = 8)");
+    Model m; TrainReport rep = TrainModel(db, st, m);
+    printf("  %-34s train=%zu val=%zu test=%zu val=%f test=%f\n", "5 rows: no validation or test fold", rep.n_train, rep.n_val, rep.n_test, rep.val_metric, rep.test_metric);
+    if (rep.n_val != 0 || rep.n_test != 0 || !std::isnan(rep.val_metric) || !std::isnan(rep.test_metric)) {
+      printf("      a fold that was never scored must report NaN, not a number\n"); fails++;
+    }
+  }
+  // ---- cancellation fires between minibatches, not only between epochs ------
+  { Rows r; for(int i=0;i<400;i++){r.uid.push_back(i);r.uts.push_back((1000.0+i)*DAY);r.ux.push_back(1.0);
+      r.eid.push_back(i);r.euid.push_back(i);r.ets.push_back((999.0+i)*DAY);r.eamt.push_back(1.0);}
+    Database db = Make(r);
+    int calls = 0; bool thrown = false;
+    try { auto st = Parse("TRAIN MODEL c PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 5, hidden = 8, batch = 64)");
+          Model m; TrainModel(db, st, m, [&]() { if (++calls == 3) throw std::runtime_error("pql: cancelled"); }); }
+    catch (const std::exception &) { thrown = true; }
+    printf("  %-34s cancel callback fired %d times before the throw\n", "cancel mid-epoch", calls);
+    // 240 training rows at batch 64 is four minibatches per epoch, so a third
+    // call that stops the run proves the check runs inside the epoch.
+    if (!thrown || calls != 3) { printf("      the cancel check must run once per minibatch\n"); fails++; }
+    auto st2 = Parse("TRAIN MODEL c2 PREDICT COUNT(events) FOR users AT ts HORIZON 30 DAYS OPTIONS (epochs = 2, hidden = 8)");
+    Model m2; TrainModel(db, st2, m2);
+    int pcalls = 0; bool pthrown = false;
+    try { RunPredict(db, m2, Parse("PREDICT COUNT(events) FOR users USING MODEL c2"), [&]() { if (++pcalls == 1) throw std::runtime_error("pql: cancelled"); }); }
+    catch (const std::exception &) { pthrown = true; }
+    if (!pthrown) { printf("      PREDICT ignored its cancel callback\n"); fails++; }
+  }
   printf("\n%s\n", fails ? "FAILURES" : "every degenerate case handled");
   return fails ? 1 : 0;
 }

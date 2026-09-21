@@ -17,9 +17,11 @@ CREATE OR REPLACE TABLE orders AS
   FROM customers c, range(20) r(k) WHERE k < (c.id % 18);
 
 -- customers with a long history also order again inside the horizon
+-- (id%9=0 never coincides with id%18>9, so the refund rule here is its own:
+-- otherwise the refunds model below would have no positive example at all)
 INSERT INTO orders
   SELECT 800000+c.id, c.id, c.last_seen + INTERVAL '1 day' * 12, 30.0,
-         CASE WHEN c.id%9=0 THEN 'refunded' ELSE 'paid' END
+         CASE WHEN c.id%4=0 THEN 'refunded' ELSE 'paid' END
   FROM customers c WHERE (c.id % 18) > 9;
 
 -- 1. will this customer order again in the next 30 days?
