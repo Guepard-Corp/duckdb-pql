@@ -109,6 +109,24 @@ window. If the model does not beat it, you know.
 | `pr_auc` | for rare yes/no targets, the more honest score |
 | `features` | how many features PQL built for you |
 
+## DuckDB version support
+
+| branch | builds against | used by the registry as |
+|---|---|---|
+| `main` | the current stable DuckDB (v1.5.5) | `ref` |
+| `next` | DuckDB `main` (v2.0-cyanoptera) | `ref_next` |
+
+PQL is a parser extension, and the parser extension API changed between the
+two: on v1.5.5 it receives the statement as a string, on v2.0 as a token
+stream it reports back how much of it consumed. Result column names changed
+type as well. One source file, `src/pql_extension.cpp`, differs between the
+branches; the language itself is the same file on both.
+
+Keeping both means the registry tests PQL against the next DuckDB release on
+every change, so PQL keeps working the day that release ships rather than
+disappearing until someone fixes it. When v2.0 is released, `next` becomes
+`main`.
+
 ## Learn more
 
 - [Tutorial](docs/tutorial.md): a 15-minute walk from first model to backtest, with real output

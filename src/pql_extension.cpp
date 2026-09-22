@@ -1,5 +1,26 @@
 #define DUCKDB_EXTENSION_MAIN
 
+// PQL's DuckDB binding, on `main`: built against the current stable DuckDB
+// (v1.5.5).
+//
+// The extension is maintained on two branches, as the community-extensions
+// guide recommends for an extension that cannot satisfy both APIs at once:
+//
+//   main  -> stable DuckDB (v1.5.5), the descriptor's `ref`
+//   next  -> DuckDB main,            the descriptor's `ref_next`
+//
+// Only this file differs between them. The language itself,
+// src/include/pql/pql.hpp, is identical on both and includes no DuckDB header.
+// The v1.5.5 API this file uses and its v2.0 counterpart on `next`:
+//
+//   parser extension  the statement string   vs  tokens + consumed_tokens
+//   result columns    vector<string>         vs  vector<Identifier>
+//   column names      ColumnName()           vs  ColumnName().GetIdentifierName()
+//   cancellation      IsInterrupted()        vs  InterruptCheck() + query_deadline
+//
+// When v2.0 is released, `next` becomes this branch and the two collapse
+// back into one.
+
 #include "pql_extension.hpp"
 
 #include "duckdb.hpp"
