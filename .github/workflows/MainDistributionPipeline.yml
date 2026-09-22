@@ -16,15 +16,15 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      duckdb_version: main
+      ci_tools_version: main
       extension_name: pql
 
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      duckdb_version: main
+      ci_tools_version: main
       extension_name: pql
       format_checks: 'format'
