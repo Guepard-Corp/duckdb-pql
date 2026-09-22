@@ -8,6 +8,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -1387,10 +1388,29 @@ TableFunction PqlExecFunction() {
 	return fn;
 }
 
+// A table function carries no description of its own, so the registry's
+// generated page lists it as NULL. Attach one here.
+static CreateTableFunctionInfo Described(TableFunction fn, const char *description, const char *example,
+                                         vector<string> parameter_names) {
+	CreateTableFunctionInfo info(std::move(fn));
+	FunctionDescription desc;
+	desc.description = description;
+	desc.examples.push_back(example);
+	desc.parameter_names = std::move(parameter_names);
+	desc.categories.push_back("pql");
+	info.descriptions.push_back(std::move(desc));
+	return info;
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
-	loader.RegisterFunction(PqlExecFunction());
+	loader.RegisterFunction(Described(
+	    PqlExecFunction(), "Run a PQL statement and return its result as a table.",
+	    "SELECT * FROM pql_exec('PREDICT customers.churned FOR customers USING MODEL churn')", {"statement"}));
 	TableFunction models("pql_models", vector<LogicalType>(), PqlScan, PqlModelsBind, PqlInit);
-	loader.RegisterFunction(models);
+	loader.RegisterFunction(Described(std::move(models),
+	                                  "List the PQL models trained in this session, with the statement that "
+	                                  "defined each one.",
+	                                  "SELECT * FROM pql_models()", {}));
 	auto &db = loader.GetDatabaseInstance();
 	ParserExtension pql_ext;
 	pql_ext.parse_function = PqlParseFunction;
