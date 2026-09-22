@@ -1,9 +1,29 @@
 #define DUCKDB_EXTENSION_MAIN
 
+// PQL's DuckDB binding, on the `next` branch: built against DuckDB main
+// (v2.0-cyanoptera).
+//
+// The extension is maintained on two branches, as the community-extensions
+// guide recommends for an extension that cannot satisfy both APIs at once:
+//
+//   main  -> stable DuckDB (v1.5.5), the descriptor's `ref`
+//   next  -> DuckDB main,            the descriptor's `ref_next`
+//
+// Only this file differs between them. The language itself,
+// src/include/pql/pql.hpp, is identical on both and includes no DuckDB header.
+// The v2.0 API this file uses and its v1.5.5 counterpart on `main`:
+//
+//   parser extension  tokens + consumed_tokens   vs  the statement string
+//   result columns    vector<Identifier>         vs  vector<string>
+//   column names      ColumnName().GetIdentifierName() vs ColumnName()
+//   cancellation      InterruptCheck() + query_deadline vs IsInterrupted()
+//
+// When v2.0 is released, this branch becomes `main` and the two collapse
+// back into one.
+
 #include "pql_extension.hpp"
 
 #include "duckdb.hpp"
-#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
@@ -119,9 +139,9 @@ static pql::Frame LoadFrame(Connection &con, const std::string &table) {
 	frame.columns.resize(ncol);
 	std::string select;
 	for (idx_t c = 0; c < ncol; c++) {
-		const std::string cname = probe->ColumnName(c);
+		const std::string cname = probe->ColumnName(c).GetIdentifierName();
 		frame.columns[c].name = cname;
-		frame.columns[c].type = MapType(probe->types[c]);
+		frame.columns[c].type = MapType(probe->GetTypes()[c]);
 		if (!select.empty()) {
 			select += ", ";
 		}
@@ -337,12 +357,12 @@ static void CollectFilterColumns(const pql::FilterNode *f, std::set<std::string>
 // nothing. Resolve them through DuckDB's own parser before anything reads them.
 static bool ParseTimestampLiteral(const std::string &text, double &micros_out) {
 	Value v(text);
-	Value converted;
 	string err;
-	if (!v.DefaultTryCastAs(LogicalType::TIMESTAMP, converted, &err) || converted.IsNull()) {
+	auto converted = v.DefaultTryCastAs(LogicalType::TIMESTAMP, &err);
+	if (!converted.has_value() || converted->IsNull()) {
 		return false;
 	}
-	micros_out = double(Timestamp::GetEpochMicroSeconds(converted.GetValue<timestamp_t>()));
+	micros_out = double(Timestamp::GetEpochMicroSeconds(converted->GetValue<timestamp_t>()));
 	return true;
 }
 
@@ -890,7 +910,7 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 //===--------------------------------------------------------------------===//
 
 struct PqlBindData : public TableFunctionData {
-	vector<string> names;
+	vector<Identifier> names;
 	vector<LogicalType> types;
 	// Result rows are produced during bind and replayed by PqlScan. They go
 	// into DuckDB's own columnar row store as they are emitted: kept as a
@@ -921,7 +941,7 @@ struct PqlBindData : public TableFunctionData {
 		if (!rows || staged == 0) {
 			return;
 		}
-		staging.SetCardinality(staged);
+		staging.SetCardinalityUnsafe(staged);
 		rows->Append(staging);
 		staging.Reset();
 		staged = 0;
@@ -933,11 +953,17 @@ struct PqlGlobalState : public GlobalTableFunctionState {
 	bool started = false;
 };
 
-// Training calls this once per epoch and PREDICT once per batch, so a user
-// interrupt (Ctrl-C, connection.interrupt()) lands within one step.
+// InterruptCheck evaluates the deadline only every 256th call and training calls
+// this once per epoch, so max_execution_time is checked here directly.
 static void CheckCancelled(ClientContext &context) {
-	if (context.IsInterrupted()) {
-		throw InterruptException();
+	context.InterruptCheck();
+	if (!context.query_deadline.IsValid()) {
+		return;
+	}
+	using namespace std::chrono;
+	const auto now = NumericCast<idx_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+	if (now >= context.query_deadline.GetIndex()) {
+		throw InterruptException("Query exceeded maximum execution time");
 	}
 }
 
@@ -996,8 +1022,10 @@ static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &
 		std::lock_guard<std::mutex> guard(entry->lock);
 		entry->registry.Put(stmt.model, std::move(model));
 	}
-	bind.names = {"model", "target", "train_rows", "val_rows", "test_rows", "positives", "metric", "val",
-	              "test",  "pr_auc", "baseline",   "censored", "no_anchor", "features",  "epochs"};
+	bind.names = {Identifier("model"),     Identifier("target"),    Identifier("train_rows"), Identifier("val_rows"),
+	              Identifier("test_rows"), Identifier("positives"), Identifier("metric"),     Identifier("val"),
+	              Identifier("test"),      Identifier("pr_auc"),    Identifier("baseline"),   Identifier("censored"),
+	              Identifier("no_anchor"), Identifier("features"),  Identifier("epochs")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
 	              LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::DOUBLE,
 	              LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::DOUBLE,  LogicalType::BIGINT,
@@ -1071,18 +1099,18 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	// still the moment the forecast is made from, so it is still reported.
 	const bool literal_anchor = (effective.anchor_is_literal || generated_anchor) && !preds.empty();
 	const bool with_anchor = anchor_out >= 0 || literal_anchor;
-	bind.names = {"entity", "prediction"};
+	bind.names = {Identifier("entity"), Identifier("prediction")};
 	bind.types = {key_logical, LogicalType::DOUBLE};
 	if (with_anchor) {
-		bind.names = {"entity", "anchor", "prediction"};
+		bind.names = {Identifier("entity"), Identifier("anchor"), Identifier("prediction")};
 		bind.types = {key_logical, LogicalType::TIMESTAMP, LogicalType::DOUBLE};
 		if (anchor_out >= 0) {
-			bind.names[1] = entity.columns[(size_t)anchor_out].name;
+			bind.names[1] = Identifier(entity.columns[(size_t)anchor_out].name);
 		}
 	}
 	bind.Begin(context);
 	if (key_col >= 0) {
-		bind.names[0] = entity.columns[(size_t)key_col].name;
+		bind.names[0] = Identifier(entity.columns[(size_t)key_col].name);
 	}
 	for (const auto &p : preds) {
 		const Value key_value = key_col < 0 ? Value::BIGINT((int64_t)p.entity_row)
@@ -1112,7 +1140,7 @@ static void RunExplainStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	}
 	pql::Database db = LoadDatabase(context, effective);
 	auto imp = pql::RunExplain(db, *model, effective);
-	bind.names = {"feature", "slots", "importance"};
+	bind.names = {Identifier("feature"), Identifier("slots"), Identifier("importance")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::DOUBLE};
 	bind.Begin(context);
 	for (const auto &f : imp) {
@@ -1157,9 +1185,10 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	}
 	const LogicalType key_logical =
 	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
-	bind.names = {"entity", "anchor", "predicted", "actual", "error", "baseline"};
+	bind.names = {Identifier("entity"), Identifier("anchor"), Identifier("predicted"),
+	              Identifier("actual"), Identifier("error"),  Identifier("baseline")};
 	if (key_col >= 0) {
-		bind.names[0] = entity.columns[(size_t)key_col].name;
+		bind.names[0] = Identifier(entity.columns[(size_t)key_col].name);
 	}
 	bind.types = {key_logical,         LogicalType::TIMESTAMP, LogicalType::DOUBLE,
 	              LogicalType::DOUBLE, LogicalType::DOUBLE,    LogicalType::DOUBLE};
@@ -1173,7 +1202,8 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 }
 
 static void RunShowModels(ClientContext &context, PqlBindData &bind) {
-	bind.names = {"model", "target", "entity", "kind", "features", "statement"};
+	bind.names = {Identifier("model"), Identifier("target"),   Identifier("entity"),
+	              Identifier("kind"),  Identifier("features"), Identifier("statement")};
 	bind.types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	              LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR};
 	bind.Begin(context);
@@ -1189,7 +1219,7 @@ static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 }
 
 static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<PqlBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("pql_exec: the statement is NULL");
@@ -1252,7 +1282,7 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 			                            "ignore that",
 			                            stmt.model);
 		}
-		bind->names = {"dropped"};
+		bind->names = {Identifier("dropped")};
 		bind->types = {LogicalType::BOOLEAN};
 		bind->Begin(context);
 		bind->Emit({Value::BOOLEAN(dropped)});
@@ -1268,7 +1298,7 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 // SHOW MODELS cannot reach the parser extension: DuckDB's own SHOW grammar
 // accepts it and fails later at catalog lookup. pql_models() is the usable form.
 static unique_ptr<FunctionData> PqlModelsBind(ClientContext &context, TableFunctionBindInput &,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind = make_uniq<PqlBindData>();
 	RunShowModels(context, *bind);
 	bind->Flush();
@@ -1285,7 +1315,7 @@ static void PqlScan(ClientContext &, TableFunctionInput &data, DataChunk &output
 	auto &bind = data.bind_data->Cast<PqlBindData>();
 	auto &state = data.global_state->Cast<PqlGlobalState>();
 	if (!bind.rows) {
-		output.SetCardinality(0);
+		output.SetCardinalityUnsafe(0);
 		return;
 	}
 	if (!state.started) {
@@ -1314,44 +1344,31 @@ struct PqlParseData : public ParserExtensionParseData {
 	}
 };
 
-// DuckDB hands a parser extension one statement at a time, only after its own
-// parser has rejected it, and with the terminating ';' still attached when the
-// statement came from a multi-statement string.
-static std::string StripStatement(const std::string &query) {
-	std::string text = query;
-	StringUtil::Trim(text);
-	while (!text.empty() && text.back() == ';') {
-		text.pop_back();
-		StringUtil::Trim(text);
+// Rebuild statement text from the token view. String literals keep their quotes
+// when the tokenizer preserved them and are re-quoted otherwise, so the PQL
+// parser sees the same literal the user wrote.
+static std::string Reassemble(const vector<SimpleToken> &tokens, idx_t upto) {
+	std::string out;
+	for (idx_t i = 0; i < upto; i++) {
+		const auto &t = tokens[i];
+		if (!out.empty()) {
+			out += ' ';
+		}
+		if (t.type == TokenType::STRING_LITERAL && (t.text.empty() || t.text[0] != '\'')) {
+			out += "'" + t.text + "'";
+		} else {
+			out += t.text;
+		}
 	}
-	return text;
+	return out;
 }
 
-static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const string &query) {
-	const std::string text = StripStatement(query);
-	if (text.empty()) {
+static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const vector<SimpleToken> &tokens) {
+	if (tokens.empty()) {
 		return ParserExtensionParseResult();
 	}
-	// Decide from the leading keywords whether this is ours at all; anything
-	// else gets DuckDB's own error. The tokenizer can throw on an unterminated
-	// literal, which is also not ours to report unless the statement is.
-	std::string first;
-	std::string second;
-	try {
-		auto tokens = pql::Tokenize(text);
-		if (!tokens.empty()) {
-			first = tokens[0].upper;
-		}
-		if (tokens.size() > 1) {
-			second = tokens[1].upper;
-		}
-	} catch (const pql::ParseError &) {
-		auto head = pql::ToUpper(text.substr(0, 8));
-		if (head.rfind("TRAIN", 0) != 0 && head.rfind("PREDICT", 0) != 0) {
-			return ParserExtensionParseResult();
-		}
-		first = head.rfind("TRAIN", 0) == 0 ? "TRAIN" : "PREDICT";
-	}
+	const std::string first = pql::ToUpper(tokens[0].text);
+	const std::string second = tokens.size() > 1 ? pql::ToUpper(tokens[1].text) : "";
 	// EXPLAIN is matched only with MODEL after it, so DuckDB's own EXPLAIN keeps
 	// working on every other statement.
 	const bool ours = first == "TRAIN" || first == "PREDICT" || (first == "BACKTEST" && second == "MODEL") ||
@@ -1360,19 +1377,30 @@ static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const 
 	if (!ours) {
 		return ParserExtensionParseResult();
 	}
+	// Claim through the statement terminator, or the whole tail if there is none.
+	idx_t upto = tokens.size();
+	for (idx_t i = 0; i < tokens.size(); i++) {
+		if (tokens[i].type == TokenType::TERMINATOR || tokens[i].text == ";") {
+			upto = i;
+			break;
+		}
+	}
+	const std::string query = Reassemble(tokens, upto);
 	try {
-		pql::Parse(text); // validate now so errors surface at parse time
+		pql::Parse(query); // validate now so errors surface at parse time
 	} catch (const pql::ParseError &e) {
 		ParserExtensionParseResult err(std::string("PQL: ") + e.what());
-		err.error_location = e.position;
+		err.consumed_tokens = -1;
 		return err;
 	}
-	return ParserExtensionParseResult(make_uniq<PqlParseData>(text));
+	ParserExtensionParseResult result(make_uniq<PqlParseData>(query));
+	result.consumed_tokens = (int64_t)upto;
+	return result;
 }
 
 static ParserExtensionPlanResult PqlPlanFunction(ParserExtensionInfo *, ClientContext &context,
                                                  unique_ptr<ParserExtensionParseData> parse_data) {
-	auto &data = reinterpret_cast<PqlParseData &>(*parse_data);
+	auto &data = parse_data->Cast<PqlParseData>();
 	ParserExtensionPlanResult result;
 	result.function = PqlExecFunction();
 	result.parameters.push_back(Value(data.query));
