@@ -1,0 +1,235 @@
+# name: test/sql/pql_optimize.test
+# description: OPTIMIZE and EXPLAIN OPTIMIZE: plans built from predictions
+# group: [sql]
+
+require pql
+
+# Trucks with a repair history; a quarter are on the 'care' plan, which halves
+# how often the risky ones come back for a repair.
+statement ok
+CREATE TABLE trucks AS
+  SELECT i AS id, TIMESTAMP '2026-01-01' + INTERVAL '1 day' * ((i * 7) % 200) AS as_of,
+         (i % 12) AS age, 50 + (i * 37 % 150) AS service_cost, (i % 3) + 1 AS crew,
+         CASE WHEN i % 4 = 0 THEN 'care' ELSE 'basic' END AS plan
+  FROM range(800) t(i);
+
+statement ok
+CREATE TABLE repairs AS
+  SELECT row_number() OVER () AS id, t.id AS truck_id, t.as_of - INTERVAL '1 day' * (k * 9 + 1) AS at
+  FROM trucks t, range(20) r(k) WHERE k < (t.id % 15);
+
+statement ok
+INSERT INTO repairs
+  SELECT 900000 + t.id, t.id, t.as_of + INTERVAL '1 day' * 5
+  FROM trucks t WHERE (t.id % 15) > 8 AND (t.plan = 'basic' OR t.id % 3 = 0);
+
+statement ok
+TRAIN MODEL breakdown PREDICT EXISTS(repairs) FOR trucks AT as_of HORIZON 30 DAYS OPTIONS (epochs = 60, hidden = 32);
+
+# ---------------------------------------------------------------------------
+# Which rows to act on
+# ---------------------------------------------------------------------------
+
+# the statement form and the table function agree
+statement ok
+OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown;
+
+query I
+SELECT count(*) FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown');
+----
+5
+
+# a plan row is keyed and anchored like a PREDICT row
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown'));
+----
+id	BIGINT
+as_of	TIMESTAMP
+prediction	DOUBLE
+objective	DOUBLE
+
+# five bays hold the five trucks worth most, by PREDICT's own numbers
+query I
+SELECT abs((SELECT sum(objective) FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown'))
+         - (SELECT sum(v) FROM (SELECT p.prediction * 4200 - t.service_cost AS v
+                                FROM pql_exec('PREDICT EXISTS(repairs) FOR trucks USING MODEL breakdown') p
+                                JOIN trucks t USING (id) ORDER BY v DESC LIMIT 5))) < 1e-6;
+----
+true
+
+# with no limit, exactly the trucks worth servicing
+query I
+SELECT (SELECT count(*) FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) USING MODEL breakdown'))
+     = (SELECT count(*) FROM pql_exec('PREDICT EXISTS(repairs) FOR trucks USING MODEL breakdown') p
+        JOIN trucks t USING (id) WHERE p.prediction * 4200 - t.service_cost > 0);
+----
+true
+
+# a budget is kept, and with whole-number costs the plan is proven best
+query I
+SELECT sum(t.service_cost) <= 2000
+FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO SUM(service_cost) <= 2000 USING MODEL breakdown') p
+JOIN trucks t USING (id);
+----
+true
+
+query TII
+SELECT measure, value IS NOT NULL, bound IS NOT NULL
+FROM pql_exec('EXPLAIN OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO SUM(service_cost) <= 2000 USING MODEL breakdown');
+----
+objective	true	true
+SUM(service_cost) <= 2000	true	true
+rows	true	false
+selected	true	false
+
+query I
+SELECT value = bound FROM pql_exec('EXPLAIN OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO SUM(service_cost) <= 2000 USING MODEL breakdown')
+WHERE measure = 'objective';
+----
+true
+
+# the plan EXPLAIN describes is the plan OPTIMIZE returns
+query I
+SELECT (SELECT round(sum(objective), 6) FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO SUM(service_cost) <= 2000 USING MODEL breakdown'))
+     = (SELECT round(value, 6) FROM pql_exec('EXPLAIN OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO SUM(service_cost) <= 2000 USING MODEL breakdown') WHERE measure = 'objective');
+----
+true
+
+# a timestamp compared as a timestamp, in WHERE and inside a FILTERed limit
+query III
+SELECT count(*), bool_and(t.as_of >= TIMESTAMP '2026-03-01'), count(*) FILTER (WHERE t.as_of >= TIMESTAMP '2026-06-01') <= 2
+FROM pql_exec('OPTIMIZE trucks WHERE as_of >= ''2026-03-01'' MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 6 AND COUNT(*) FILTER (WHERE as_of >= ''2026-06-01'') <= 2 USING MODEL breakdown') p
+JOIN trucks t USING (id);
+----
+6	true	true
+
+query I
+SELECT value = (SELECT count(*) FROM trucks WHERE as_of >= TIMESTAMP '2026-03-01')
+FROM pql_exec('EXPLAIN OPTIMIZE trucks WHERE as_of >= ''2026-03-01'' MAXIMIZE SUM(prediction) USING MODEL breakdown')
+WHERE measure = 'rows';
+----
+true
+
+# MINIMIZE with a minimum: the cheapest three
+query I
+SELECT sum(objective) FROM pql_exec('OPTIMIZE trucks MINIMIZE SUM(service_cost) SUBJECT TO COUNT(*) >= 3 USING MODEL breakdown');
+----
+150
+
+# a limit on the model's own answer: no truck below even odds
+query I
+SELECT bool_and(prediction >= 0.5) AND count(*) > 0
+FROM pql_exec('OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) FILTER (WHERE prediction < 0.5) <= 0 USING MODEL breakdown');
+----
+true
+
+# ... but WHERE picks the rows before anything is predicted
+statement error
+OPTIMIZE trucks WHERE prediction > 0.5 MAXIMIZE SUM(prediction) USING MODEL breakdown;
+----
+<REGEX>:.*WHERE picks the rows before anything is predicted.*
+
+# ---------------------------------------------------------------------------
+# CHOOSE: a value per row
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pql_exec('OPTIMIZE trucks CHOOSE plan IN (''basic'', ''care'') MINIMIZE SUM(prediction * 4200 + CASE plan WHEN ''care'' THEN 300 ELSE 0 END) USING MODEL breakdown'));
+----
+id	BIGINT
+as_of	TIMESTAMP
+plan	VARCHAR
+prediction	DOUBLE
+objective	DOUBLE
+
+# every truck gets a plan, and a cap on one choice holds
+query II
+SELECT count(*), count(*) FILTER (WHERE plan = 'care') <= 150
+FROM pql_exec('OPTIMIZE trucks CHOOSE plan IN (''basic'', ''care'') MINIMIZE SUM(prediction * 4200 + CASE plan WHEN ''care'' THEN 300 ELSE 0 END) SUBJECT TO COUNT(*) FILTER (WHERE plan = ''care'') <= 150 USING MODEL breakdown');
+----
+800	true
+
+# EXPLAIN reports the status quo and one row per choice
+query T
+SELECT string_agg(measure, ' | ' ORDER BY measure) FROM pql_exec('EXPLAIN OPTIMIZE trucks CHOOSE plan IN (''basic'', ''care'') MINIMIZE SUM(prediction * 4200 + CASE plan WHEN ''care'' THEN 300 ELSE 0 END) SUBJECT TO COUNT(*) FILTER (WHERE plan = ''care'') <= 150 USING MODEL breakdown');
+----
+COUNT(*) FILTER (WHERE plan = 'care') <= 150 | objective | plan = 'basic' | plan = 'care' | rows | status quo
+
+# ... and the plan is predicted to do no worse than today
+query I
+SELECT max(value) FILTER (WHERE measure = 'objective') <= max(value) FILTER (WHERE measure = 'status quo')
+FROM pql_exec('EXPLAIN OPTIMIZE trucks CHOOSE plan IN (''basic'', ''care'') MINIMIZE SUM(prediction * 4200 + CASE plan WHEN ''care'' THEN 300 ELSE 0 END) USING MODEL breakdown');
+----
+true
+
+# a whole-number lever comes back as a whole number
+query T
+SELECT DISTINCT typeof(crew) FROM pql_exec('OPTIMIZE trucks CHOOSE crew IN (1, 3) MAXIMIZE SUM(prediction) USING MODEL breakdown');
+----
+BIGINT
+
+# the lever is untouched afterwards
+query II
+SELECT count(*) FILTER (WHERE plan = 'care'), count(*) FROM trucks;
+----
+200	800
+
+# ---------------------------------------------------------------------------
+# What is refused, and where
+# ---------------------------------------------------------------------------
+
+statement error
+OPTIMIZE trucks CHOOSE plan IN ('basic', 'gold') MAXIMIZE SUM(prediction) USING MODEL breakdown;
+----
+<REGEX>:.*never saw plan = 'gold' while training.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) >= 900 USING MODEL breakdown;
+----
+<REGEX>:.*no plan can meet COUNT\(\*\) >= 900: the most any plan reaches is 800.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 2 AND COUNT(*) >= 3 USING MODEL breakdown;
+----
+<REGEX>:.*no plan meets all of these limits together.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) < 9 USING MODEL breakdown;
+----
+<REGEX>:.*written with <= or >=.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction * plan) USING MODEL breakdown;
+----
+<REGEX>:.*'plan' is text.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL nope;
+----
+<REGEX>:.*no model named 'nope'.*
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction);
+----
+<REGEX>:.*needs USING MODEL.*
+
+statement ok
+UPDATE trucks SET service_cost = NULL WHERE id = 7;
+
+statement error
+OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) USING MODEL breakdown;
+----
+<REGEX>:.*1 of 800 rows have no value for the objective: service_cost is NULL there.*
+
+query I
+SELECT count(*) > 0 FROM pql_exec('OPTIMIZE trucks WHERE service_cost IS NOT NULL MAXIMIZE SUM(prediction * 4200 - service_cost) USING MODEL breakdown');
+----
+true
+
+# DuckDB's own EXPLAIN is still DuckDB's
+statement ok
+EXPLAIN SELECT 42;
+
+# and a script mixing the two runs in order
+statement ok
+SELECT 1; OPTIMIZE trucks WHERE id < 10 MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 1 USING MODEL breakdown; SELECT 2;

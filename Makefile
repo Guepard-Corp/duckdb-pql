@@ -9,7 +9,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 -include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 #### Standalone tests of the language itself (no DuckDB build needed)
-CPP_TESTS=parse model categorical links degenerate fuzz
+CPP_TESTS=parse model categorical links degenerate fuzz optimize
 CPP_TEST_DIR=build/cpp_tests
 CXX ?= c++
 
@@ -24,7 +24,7 @@ test_cpp: | $(CPP_TEST_DIR)
 	done
 
 test_cpp_sanitize: | $(CPP_TEST_DIR)
-	@set -e; for t in fuzz degenerate links; do \
+	@set -e; for t in fuzz degenerate links optimize; do \
 		echo "== test_$$t (asan+ubsan)"; \
 		$(CXX) -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -I src/include \
 			-o $(CPP_TEST_DIR)/san_$$t test/cpp/test_$$t.cpp; \

@@ -207,6 +207,54 @@ Those are `TRAIN`'s own `test` and `baseline` columns, reproduced to four
 decimals by a separate path over the same rows. Two independent routes agreeing
 is what tells you both are right.
 
+## From a prediction to a decision
+
+A prediction says what will happen. `OPTIMIZE` says what to do about it. Say
+the team can call 50 customers this week, a call is worth more the higher the
+tier, it only matters for customers who would not come back on their own, and
+no more than 20 of the calls can go to the EU desk:
+
+```sql
+OPTIMIZE customers
+  MAXIMIZE SUM((1 - prediction) * tier * 100)
+  SUBJECT TO COUNT(*) <= 50 AND COUNT(*) FILTER (WHERE region = 'EU') <= 20
+  USING MODEL reorder;
+```
+```
+┌──────┬─────────────────────┬────────────┬───────────┐
+│  id  │      last_seen      │ prediction │ objective │
+├──────┼─────────────────────┼────────────┼───────────┤
+│  972 │ 2025-02-06 00:00:00 │   1.32e-08 │     700.0 │
+│ 1224 │ 2025-01-13 00:00:00 │   1.99e-08 │     700.0 │
+│  ... │                 ... │        ... │       ... │
+│  545 │ 2025-07-05 00:00:00 │     0.0213 │     685.1 │
+└──────┴─────────────────────┴────────────┴───────────┘
+```
+
+Fifty rows, the most valuable first: the tier-7 customers least likely to
+reorder, 20 of them in the EU, since the EU desk is full. `prediction` is the
+model's answer and `objective` is what that row adds to the total.
+
+`EXPLAIN OPTIMIZE` gives the totals instead of the rows:
+
+```
+│              measure                       │  value  │  bound  │
+│ objective                                  │ 34843.5 │ 34843.5 │
+│ COUNT(*) <= 50                             │    50.0 │    50.0 │
+│ COUNT(*) FILTER (WHERE region = 'EU') <= 20│    20.0 │    20.0 │
+│ rows                                       │  1500.0 │         │
+│ selected                                   │    50.0 │         │
+```
+
+`bound` beside the objective is the best any plan could reach. When it equals
+the objective, as here, the plan is proven to be the best one. Beside a limit,
+it is the limit.
+
+`OPTIMIZE` can also choose a value for each row instead of choosing rows, which
+is how you would pick an offer per customer or a price per product: see
+[`OPTIMIZE`](reference.md#optimize-from-a-prediction-to-a-decision) in the
+reference, including what that needs from your history to be trustworthy.
+
 ## It is all still SQL
 
 ```sql

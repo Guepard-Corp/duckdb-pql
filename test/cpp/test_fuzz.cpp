@@ -33,6 +33,16 @@ static const char *kSeeds[] = {
     "SHOW MODELS",
     "DROP MODEL m",
     "PREDICT users.x FOR users WHERE NOT (a = 1 OR b < 2) AND c >= 3 USING MODEL m",
+    "OPTIMIZE trucks WHERE status = 'active' MAXIMIZE SUM(prediction * 4200 - service_cost) "
+    "SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown",
+    "EXPLAIN OPTIMIZE customers AS c CHOOSE c.offer IN ('none', '10%', '20%') "
+    "MAXIMIZE SUM(prediction - CASE offer WHEN '10%' THEN 5 WHEN '20%' THEN 10 ELSE 0 END) "
+    "SUBJECT TO SUM(CASE WHEN offer = '10%' THEN 5 ELSE 0 END) <= 500 AND "
+    "COUNT(*) FILTER (WHERE offer = '20%') >= 3 USING MODEL spend",
+    "OPTIMIZE p AT '2024-01-01' CHOOSE price IN (9.5, 12, -1) MINIMIZE SUM(-(prediction * price) / (1 + -cost)) "
+    "USING MODEL demand",
+    "OPTIMIZE t WHERE \"prediction\" > 1 MAXIMIZE SUM(CASE WHEN prediction >= 0.5 THEN prediction END) "
+    "SUBJECT TO COUNT(*) FILTER (WHERE prediction < 0.2 OR x IN (1, 2)) <= 3 USING MODEL m",
     nullptr};
 
 static std::vector<std::string> Tokens(const std::string &s) {
@@ -133,6 +143,18 @@ int main(int argc, char **argv) {
 	                          "YEARS",
 	                          "HOURS",
 	                          "DAY",
+	                          "OPTIMIZE",
+	                          "MAXIMIZE",
+	                          "MINIMIZE",
+	                          "CHOOSE",
+	                          "SUBJECT",
+	                          "CASE",
+	                          "WHEN",
+	                          "THEN",
+	                          "ELSE",
+	                          "END",
+	                          "FILTER",
+	                          "prediction",
 	                          "<",
 	                          ">",
 	                          "<=",
@@ -166,6 +188,9 @@ int main(int argc, char **argv) {
 	int nalpha = 0;
 	while (alphabet[nalpha])
 		nalpha++;
+	int nseeds = 0;
+	while (kSeeds[nseeds])
+		nseeds++;
 	long parsed = 0, rejected = 0, roundtrip_fail = 0, badpos = 0, other = 0;
 	for (long iter = 0; iter < iters; iter++) {
 		// build an input: a mutated seed, or pure noise
@@ -177,7 +202,7 @@ int main(int argc, char **argv) {
 				in += " ";
 			}
 		} else {
-			auto tk = Tokens(kSeeds[rng() % 10]);
+			auto tk = Tokens(kSeeds[rng() % nseeds]);
 			const int muts = 1 + (int)(rng() % 4);
 			for (int m = 0; m < muts && !tk.empty(); m++) {
 				const size_t at = rng() % tk.size();

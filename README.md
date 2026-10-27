@@ -53,12 +53,13 @@ That model is useless (0.439 is a coin flip) because the toy data has nothing
 to learn from: `churned` is `i % 5`, which no column explains. That is the point: PQL always tells you how
 good the model actually is, on rows it never trained on.
 
-## The five statements
+## The six statements
 
 | statement | what it does |
 |---|---|
 | `TRAIN MODEL name PREDICT target FOR table ...` | build a model and report its score |
 | `PREDICT target FOR table [WHERE ...] USING MODEL name` | one prediction per row |
+| `OPTIMIZE table MAXIMIZE SUM(...) SUBJECT TO ... USING MODEL name` | turn the predictions into a plan: which rows to act on, or a value per row |
 | `BACKTEST MODEL name` | replay the model row by row against what really happened |
 | `EXPLAIN MODEL name` | which features it relies on |
 | `DROP MODEL name` | forget it |
@@ -98,6 +99,21 @@ For forecasts, PQL only ever shows the model what was known before each row's
 anchor time, so the answer cannot leak into the features. `TRAIN` reports a
 `baseline` next to the score: what you would get by just repeating the last
 window. If the model does not beat it, you know.
+
+## From a prediction to a decision
+
+```sql
+OPTIMIZE customers
+  MAXIMIZE SUM((1 - prediction) * tier * 100)
+  SUBJECT TO COUNT(*) <= 50
+  USING MODEL reorder;
+```
+
+Fifty calls this week: the customers worth most who would not order again on
+their own. `CHOOSE offer IN ('none', '10%', '20%')` picks a value per row
+instead, by asking the model what each one would change. `EXPLAIN OPTIMIZE`
+reports the plan's total beside the best any plan could reach, so you know how
+good it is.
 
 ## Reading the score
 
