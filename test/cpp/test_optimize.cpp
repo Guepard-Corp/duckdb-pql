@@ -77,12 +77,14 @@ static void Err(const std::string &sql, const char *want) {
 
 static void Grammar() {
 	std::printf("== grammar: accepts, and echoes as written\n");
-	Ok("OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL m", "OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL m");
+	Ok("OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL m",
+	   "OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL m");
 	Ok("optimize trucks maximize sum(prediction * 4200 - service_cost) subject to count(*) <= 5 using model breakdown",
 	   "OPTIMIZE trucks MAXIMIZE SUM(prediction * 4200 - service_cost) SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown");
 	Ok("OPTIMIZE trucks AS t WHERE t.status = 'active' MINIMIZE SUM(t.cost) SUBJECT TO COUNT(*) >= 3 USING MODEL m",
 	   "OPTIMIZE trucks AS t WHERE t.status = 'active' MINIMIZE SUM(t.cost) SUBJECT TO COUNT(*) >= 3 USING MODEL m");
-	Ok("OPTIMIZE trucks t MAXIMIZE SUM(prediction) USING MODEL m", "OPTIMIZE trucks AS t MAXIMIZE SUM(prediction) USING MODEL m");
+	Ok("OPTIMIZE trucks t MAXIMIZE SUM(prediction) USING MODEL m",
+	   "OPTIMIZE trucks AS t MAXIMIZE SUM(prediction) USING MODEL m");
 	// clauses in any order, the way TRAIN and PREDICT take them
 	Ok("OPTIMIZE c USING MODEL m SUBJECT TO SUM(x) <= 10 MAXIMIZE SUM(prediction) WHERE a = 1 CHOOSE o IN ('p', 'q')",
 	   "OPTIMIZE c WHERE a = 1 CHOOSE o IN ('p', 'q') MAXIMIZE SUM(prediction) SUBJECT TO SUM(x) <= 10 USING MODEL m");
@@ -90,7 +92,8 @@ static void Grammar() {
 	   "OPTIMIZE c CHOOSE c.offer IN ('none', '10%', '20%') MAXIMIZE SUM(prediction) USING MODEL m");
 	Ok("OPTIMIZE p CHOOSE price IN (9.99, 12, -1, +3) MAXIMIZE SUM(prediction * price) USING MODEL d",
 	   "OPTIMIZE p CHOOSE price IN (9.99, 12, -1, 3) MAXIMIZE SUM(prediction * price) USING MODEL d");
-	Ok("OPTIMIZE c AT seen MAXIMIZE SUM(prediction) USING MODEL m", "OPTIMIZE c AT seen MAXIMIZE SUM(prediction) USING MODEL m");
+	Ok("OPTIMIZE c AT seen MAXIMIZE SUM(prediction) USING MODEL m",
+	   "OPTIMIZE c AT seen MAXIMIZE SUM(prediction) USING MODEL m");
 	Ok("OPTIMIZE c AT '2024-01-01' MAXIMIZE SUM(prediction) USING MODEL m",
 	   "OPTIMIZE c AT '2024-01-01' MAXIMIZE SUM(prediction) USING MODEL m");
 	Ok("EXPLAIN OPTIMIZE c MAXIMIZE SUM(prediction) USING MODEL m",
@@ -120,7 +123,8 @@ static void Grammar() {
 	expr("+a", "a");
 	expr("((a))", "a");
 	expr("a - -b", "a - -b");
-	expr("CASE WHEN x = 'p' THEN 1 WHEN x = 'q' THEN 2 ELSE 0 END", "CASE WHEN x = 'p' THEN 1 WHEN x = 'q' THEN 2 ELSE 0 END");
+	expr("CASE WHEN x = 'p' THEN 1 WHEN x = 'q' THEN 2 ELSE 0 END",
+	     "CASE WHEN x = 'p' THEN 1 WHEN x = 'q' THEN 2 ELSE 0 END");
 	expr("CASE x WHEN 'p' THEN 1 WHEN 'q' THEN 2 END", "CASE x WHEN 'p' THEN 1 WHEN 'q' THEN 2 END");
 	expr("CASE WHEN a > 1 AND b < 2 THEN CASE c WHEN 1 THEN 2 END END * 3",
 	     "CASE WHEN (a > 1 AND b < 2) THEN CASE c WHEN 1 THEN 2 END END * 3");
@@ -139,7 +143,8 @@ static void Grammar() {
 	Ok("OPTIMIZE t WHERE \"prediction\" > 0.5 MAXIMIZE SUM(x) USING MODEL m",
 	   "OPTIMIZE t WHERE \"prediction\" > 0.5 MAXIMIZE SUM(x) USING MODEL m");
 	// Outside OPTIMIZE nothing changes: a filter's `prediction` is a column.
-	Ok("PREDICT t.x FOR t WHERE prediction > 1 USING MODEL m", "PREDICT t.x FOR t WHERE \"prediction\" > 1 USING MODEL m");
+	Ok("PREDICT t.x FOR t WHERE prediction > 1 USING MODEL m",
+	   "PREDICT t.x FOR t WHERE \"prediction\" > 1 USING MODEL m");
 
 	std::printf("== grammar: rejects\n");
 	Err("OPTIMIZE t USING MODEL m", "needs a goal");
@@ -179,7 +184,8 @@ static void Grammar() {
 	Err("OPTIMIZE t MAXIMIZE SUM(--a\n) USING MODEL m", "expected a number, a column");
 	Err("EXPLAIN OPTIMIZE", "expected table to optimize over");
 	Err("OPTIMIZE MAXIMIZE SUM(x) USING MODEL m", "unexpected token 'SUM'");
-	Err("OPTIMIZE t WHERE prediction > 0.5 MAXIMIZE SUM(x) USING MODEL m", "WHERE picks the rows before anything is predicted");
+	Err("OPTIMIZE t WHERE prediction > 0.5 MAXIMIZE SUM(x) USING MODEL m",
+	    "WHERE picks the rows before anything is predicted");
 	Err("OPTIMIZE t WHERE a = 1 AND NOT (prediction < 2) MAXIMIZE SUM(x) USING MODEL m", "cannot test prediction");
 	Err("OPTIMIZE t MAXIMIZE SUM(CASE prediction WHEN 1 THEN 2 END) USING MODEL m", "tests a prediction for equality");
 	{
@@ -197,8 +203,8 @@ static void Grammar() {
 			many += " + 1";
 		}
 		Err(many + ") USING MODEL m", "too long");
-		std::string deep = "OPTIMIZE t MAXIMIZE SUM(" + std::string(300, '(') + "1" + std::string(300, ')') +
-		                   ") USING MODEL m";
+		std::string deep =
+		    "OPTIMIZE t MAXIMIZE SUM(" + std::string(300, '(') + "1" + std::string(300, ')') + ") USING MODEL m";
 		Err(deep, "nested too deeply");
 		std::string negs = "OPTIMIZE t MAXIMIZE SUM(";
 		for (int i = 0; i < 300; i++) {
@@ -262,7 +268,8 @@ static void Expressions() {
 	Frame f;
 	f.name = "t";
 	f.nrows = 1;
-	Column x = MakeCol("x", ColType::DOUBLE, 1), y = MakeCol("y", ColType::INT64, 1), z = MakeCol("z", ColType::DOUBLE, 1);
+	Column x = MakeCol("x", ColType::DOUBLE, 1), y = MakeCol("y", ColType::INT64, 1),
+	       z = MakeCol("z", ColType::DOUBLE, 1);
 	x.num[0] = 2;
 	y.num[0] = 0;
 	z.valid[0] = 0;
@@ -411,8 +418,8 @@ static void Simplex() {
 	}
 	{
 		// Beale's example: Dantzig's rule cycles on it forever; Bland's must not.
-		SmallLP lp = MakeLP(3, 4, {0.25, -8, -1, 9, 0.5, -12, -0.5, 3, 0, 0, 1, 0}, {0, 0, 1}, {0, 0, 0},
-		                    {0.75, -20, 0.5, -6});
+		SmallLP lp =
+		    MakeLP(3, 4, {0.25, -8, -1, 9, 0.5, -12, -0.5, 3, 0, 0, 1, 0}, {0, 0, 1}, {0, 0, 0}, {0.75, -20, 0.5, -6});
 		SolveSmallLP(lp);
 		CHECK(lp.status == SmallLP::Status::OPTIMAL && std::fabs(lp.value - 1.25) < 1e-9, "Beale: status %d value %g",
 		      (int)lp.status, lp.value);
@@ -659,8 +666,8 @@ static void SolverVsBrute() {
 					ta.gap += opt - got;
 					if (m == 1 && !integers) {
 						// One limit: within one row's swing of the best.
-						CHECK(opt - got <= range + tol, "%s, instance %d: one limit, gap %g over a row's range %g", name,
-						      t, opt - got, range);
+						CHECK(opt - got <= range + tol, "%s, instance %d: one limit, gap %g over a row's range %g",
+						      name, t, opt - got, range);
 					}
 				}
 			} else {
@@ -678,9 +685,10 @@ static void SolverVsBrute() {
 		}
 	}
 	for (const auto &ta : paths) {
-		std::printf("   %-20s %d problems, %d with a plan: %d optimal, %d missed, mean gap %.4f; %d proven impossible\n",
-		            ta.name, ta.instances, ta.feasible, ta.optimal, ta.missed, ta.feasible ? ta.gap / ta.feasible : 0.0,
-		            ta.proven);
+		std::printf(
+		    "   %-20s %d problems, %d with a plan: %d optimal, %d missed, mean gap %.4f; %d proven impossible\n",
+		    ta.name, ta.instances, ta.feasible, ta.optimal, ta.missed, ta.feasible ? ta.gap / ta.feasible : 0.0,
+		    ta.proven);
 		if (ta.must_be_exact) {
 			CHECK(ta.optimal == ta.feasible && ta.missed == 0, "%s should be exact on problems this small", ta.name);
 		}
@@ -784,8 +792,8 @@ static void SolverAtScale() {
 			general.dp_cells = 0;
 			const OptSolution s = SolveOpt(P, general);
 			CHECK(s.feasible && Meets(P, s.choice), "knapsack %d: no feasible plan", t);
-			CHECK(s.objective <= opt + 1e-6 && s.bound >= opt - 1e-6, "knapsack %d: plan %g, optimum %g, bound %g",
-			      t, s.objective, opt, s.bound);
+			CHECK(s.objective <= opt + 1e-6 && s.bound >= opt - 1e-6, "knapsack %d: plan %g, optimum %g, bound %g", t,
+			      s.objective, opt, s.bound);
 			CHECK(opt - s.objective <= vmax + 1e-6, "knapsack %d: gap %g over one item's value %g", t,
 			      opt - s.objective, vmax);
 			worst = std::max(worst, (opt - s.objective) / std::max(1.0, opt));
@@ -817,8 +825,8 @@ static void SolverAtScale() {
 			P.b = {double(cap)};
 			const double opt = ChoiceDP(P, cost, cap);
 			const OptSolution dp = SolveOpt(P);
-			CHECK(dp.exact && std::fabs(dp.objective - opt) < 1e-6, "choice %d by DP: %g, optimum %g", t,
-			      dp.objective, opt);
+			CHECK(dp.exact && std::fabs(dp.objective - opt) < 1e-6, "choice %d by DP: %g, optimum %g", t, dp.objective,
+			      opt);
 			OptSettings general;
 			general.dp_cells = 0;
 			const OptSolution s = SolveOpt(P, general);
@@ -855,8 +863,8 @@ static void SolverAtScale() {
 		P.b = {2000};
 		const OptSolution s = SolveOpt(P);
 		const double relaxed = KnapsackDP(val, w, 2000);
-		std::printf("   near ties, costs not whole: plan %.2f, relaxed optimum %.2f, bound %.2f\n", s.objective, relaxed,
-		            s.bound);
+		std::printf("   near ties, costs not whole: plan %.2f, relaxed optimum %.2f, bound %.2f\n", s.objective,
+		            relaxed, s.bound);
 		CHECK(s.feasible && Meets(P, s.choice), "near ties: no feasible plan");
 		CHECK(s.objective >= relaxed * (1 - 1e-3), "near ties: plan %g is more than 0.1%% below %g", s.objective,
 		      relaxed);
@@ -872,7 +880,7 @@ static void SolverAtScale() {
 		P.v.assign(n * 2, 0.0);
 		P.a.assign(1, std::vector<double>(n * 2, 0.0));
 		for (size_t i = 0; i < n; i++) {
-			P.v[i * 2 + 1] = -3; // MINIMIZE cost 3 ...
+			P.v[i * 2 + 1] = -3;    // MINIMIZE cost 3 ...
 			P.a[0][i * 2 + 1] = -1; // ... SUBJECT TO COUNT(*) >= 50
 		}
 		P.b = {-50};
@@ -1015,8 +1023,8 @@ static void Regressions() {
 		for (int c : s.choice) {
 			taken += c;
 		}
-		CHECK(s.feasible && s.usage[0] <= 100 + 1e-6 && taken == 10, "an outlier cost: %zu rows, usage %g of 100", taken,
-		      s.usage[0]);
+		CHECK(s.feasible && s.usage[0] <= 100 + 1e-6 && taken == 10, "an outlier cost: %zu rows, usage %g of 100",
+		      taken, s.usage[0]);
 	}
 	{
 		// The same problem with its values scaled up: pricing ties used to grow
@@ -1211,8 +1219,8 @@ static void EndToEndChoose() {
 			const std::string &v = oc.dict.values[oc.code[p.entity_row]];
 			sq += p.value - (v == "10%" ? 10 : v == "20%" ? 20 : 0);
 		}
-		CHECK(std::fabs(sq - o.status_quo) < 1e-6 * (1 + std::fabs(sq)), "status quo %g, PREDICT says %g",
-		      o.status_quo, sq);
+		CHECK(std::fabs(sq - o.status_quo) < 1e-6 * (1 + std::fabs(sq)), "status quo %g, PREDICT says %g", o.status_quo,
+		      sq);
 		CHECK(o.objective >= o.status_quo, "the plan is predicted to beat the status quo");
 	}
 	{
@@ -1250,23 +1258,26 @@ static void EndToEndChoose() {
 			na += s == 0;
 		}
 		const double budget = 10.0 * double(na / 2);
-		OptimizeOutcome b = Opt(db, m, head + "MAXIMIZE SUM(prediction - " + cost + ") SUBJECT TO SUM(" + cost +
-		                                   ") <= " + TidyNumber(budget) + " USING MODEL spend");
+		OptimizeOutcome b = Opt(db, m,
+		                        head + "MAXIMIZE SUM(prediction - " + cost + ") SUBJECT TO SUM(" + cost +
+		                            ") <= " + TidyNumber(budget) + " USING MODEL spend");
 		size_t ten = 0, ten_a = 0, twenty = 0;
 		for (const auto &r : b.plan) {
 			ten += r.choice == 1;
 			ten_a += r.choice == 1 && seg[r.entity_row] == 0;
 			twenty += r.choice == 2;
 		}
-		std::printf("   budget %.0f: %zu at 10%% (%zu in segment a), %zu at 20%%, spent %.0f; objective %.1f, bound %.1f\n",
-		            budget, ten, ten_a, twenty, b.usage[0], b.objective, b.bound);
+		std::printf(
+		    "   budget %.0f: %zu at 10%% (%zu in segment a), %zu at 20%%, spent %.0f; objective %.1f, bound %.1f\n",
+		    budget, ten, ten_a, twenty, b.usage[0], b.objective, b.bound);
 		CHECK(b.usage.size() == 1 && b.usage[0] <= budget + 1e-6, "budget broken: %g > %g", b.usage[0], budget);
 		CHECK(b.usage[0] >= budget - 20, "budget left unused: %g of %g", b.usage[0], budget);
 		CHECK(ten_a >= ten * 95 / 100, "the 10%% offers should go to segment a: %zu of %zu", ten_a, ten);
 		CHECK(b.objective <= b.bound + 1e-9 && b.bound - b.objective <= 30, "budget gap %g", b.bound - b.objective);
 		CHECK(b.objective < o.objective, "a binding budget cannot beat no budget");
-		OptimizeOutcome e = Opt(db, m, "EXPLAIN " + head + "MAXIMIZE SUM(prediction - " + cost + ") SUBJECT TO SUM(" +
-		                                   cost + ") <= " + TidyNumber(budget) + " USING MODEL spend");
+		OptimizeOutcome e = Opt(db, m,
+		                        "EXPLAIN " + head + "MAXIMIZE SUM(prediction - " + cost + ") SUBJECT TO SUM(" + cost +
+		                            ") <= " + TidyNumber(budget) + " USING MODEL spend");
 		bool same = e.plan.size() == b.plan.size() && e.objective == b.objective;
 		for (size_t i = 0; same && i < e.plan.size(); i++) {
 			same = e.plan[i].choice == b.plan[i].choice && e.plan[i].entity_row == b.plan[i].entity_row;
@@ -1275,8 +1286,9 @@ static void EndToEndChoose() {
 	}
 	{
 		// A cap on how many get any offer, written with FILTER.
-		OptimizeOutcome c = Opt(db, m, head + "MAXIMIZE SUM(prediction - " + cost +
-		                                   ") SUBJECT TO COUNT(*) FILTER (WHERE offer != 'none') <= 100 USING MODEL spend");
+		OptimizeOutcome c = Opt(db, m,
+		                        head + "MAXIMIZE SUM(prediction - " + cost +
+		                            ") SUBJECT TO COUNT(*) FILTER (WHERE offer != 'none') <= 100 USING MODEL spend");
 		size_t offered = 0;
 		for (const auto &r : c.plan) {
 			offered += r.choice != 0;
@@ -1286,8 +1298,8 @@ static void EndToEndChoose() {
 	}
 	{
 		// WHERE reads the lever as it stands: only customers on no offer today.
-		OptimizeOutcome w = Opt(db, m, head + "WHERE offer = 'none' MAXIMIZE SUM(prediction - " + cost +
-		                                   ") USING MODEL spend");
+		OptimizeOutcome w =
+		    Opt(db, m, head + "WHERE offer = 'none' MAXIMIZE SUM(prediction - " + cost + ") USING MODEL spend");
 		size_t none_now = 0;
 		for (int x : offer) {
 			none_now += x == 0;
@@ -1318,7 +1330,8 @@ static void EndToEndChoose() {
 	std::printf("== end to end: what CHOOSE refuses\n");
 	{
 		// Other numeric columns take part in the arithmetic as they stand.
-		OptimizeOutcome t = Opt(db, m, head + "MAXIMIZE SUM(prediction - " + cost + " - tenure / tier) USING MODEL spend");
+		OptimizeOutcome t =
+		    Opt(db, m, head + "MAXIMIZE SUM(prediction - " + cost + " - tenure / tier) USING MODEL spend");
 		const Frame &cf = db.At("customers");
 		double shift = 0;
 		for (size_t r = 0; r < n; r++) {
@@ -1342,8 +1355,11 @@ static void EndToEndChoose() {
 		}
 		CHECK(same, "a refusal after the lever was tried still puts it back");
 	}
-	Refused([&] { Opt(db, m, "OPTIMIZE customers CHOOSE offer IN ('none', '50%') MAXIMIZE SUM(prediction) USING MODEL spend"); },
-	        "never saw offer = '50%'", "an offer the model never saw");
+	Refused(
+	    [&] {
+		    Opt(db, m, "OPTIMIZE customers CHOOSE offer IN ('none', '50%') MAXIMIZE SUM(prediction) USING MODEL spend");
+	    },
+	    "never saw offer = '50%'", "an offer the model never saw");
 	Refused([&] { Opt(db, m, "OPTIMIZE customers CHOOSE offer IN (1, 2) MAXIMIZE SUM(prediction) USING MODEL spend"); },
 	        "is text, so CHOOSE lists text values", "numbers for a text lever");
 	Refused([&] { Opt(db, m, "OPTIMIZE customers CHOOSE spend IN (1, 2) MAXIMIZE SUM(prediction) USING MODEL spend"); },
@@ -1356,18 +1372,28 @@ static void EndToEndChoose() {
 	        "tier = 9 is outside every value 'tier' has in 'customers' (1 to 3)", "a lever value outside the data");
 	Refused([&] { Opt(db, m, "OPTIMIZE customers CHOOSE nope IN (1) MAXIMIZE SUM(prediction) USING MODEL spend"); },
 	        "not a column of 'customers'", "a lever that does not exist");
-	Refused([&] { Opt(db, m, "OPTIMIZE customers AS c CHOOSE x.offer IN ('none') MAXIMIZE SUM(prediction) USING MODEL spend"); },
-	        "but the plan is over 'customers'", "a lever on another relation");
+	Refused(
+	    [&] {
+		    Opt(db, m, "OPTIMIZE customers AS c CHOOSE x.offer IN ('none') MAXIMIZE SUM(prediction) USING MODEL spend");
+	    },
+	    "but the plan is over 'customers'", "a lever on another relation");
 	Refused([&] { Opt(db, m, head + "MAXIMIZE SUM(prediction * offer) USING MODEL spend"); }, "is text",
 	        "arithmetic on a text lever");
-	Refused([&] {
-		Opt(db, m, head + "MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) FILTER (WHERE offer = 'none') >= 3001 USING MODEL spend");
-	}, "no plan can meet COUNT(*) FILTER (WHERE offer = 'none') >= 3001: the most any plan reaches is 3000",
-	        "a minimum larger than the table");
-	Refused([&] {
-		Opt(db, m, head + "MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) FILTER (WHERE offer = 'none') <= 10 AND "
-		                  "COUNT(*) FILTER (WHERE offer != 'none') <= 10 USING MODEL spend");
-	}, "no plan meets all of these limits together", "limits that contradict each other");
+	Refused(
+	    [&] {
+		    Opt(db, m,
+		        head + "MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) FILTER (WHERE offer = 'none') >= 3001 USING MODEL "
+		               "spend");
+	    },
+	    "no plan can meet COUNT(*) FILTER (WHERE offer = 'none') >= 3001: the most any plan reaches is 3000",
+	    "a minimum larger than the table");
+	Refused(
+	    [&] {
+		    Opt(db, m,
+		        head + "MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) FILTER (WHERE offer = 'none') <= 10 AND "
+		               "COUNT(*) FILTER (WHERE offer != 'none') <= 10 USING MODEL spend");
+	    },
+	    "no plan meets all of these limits together", "limits that contradict each other");
 	{
 		// A model that never read the lever.
 		const Model blind = Train(db, "TRAIN MODEL blind PREDICT customers.spend FOR customers EXCLUDE (id, offer) "
@@ -1412,8 +1438,9 @@ static void EndToEndPrice() {
 	db.BuildLinks({});
 	const Model m = Train(db, "TRAIN MODEL demand PREDICT deals.units FOR deals EXCLUDE (id) "
 	                          "OPTIONS (epochs = 100, hidden = 32)");
-	OptimizeOutcome o = Opt(db, m, "OPTIMIZE deals CHOOSE price IN (5, 7, 9, 11) MAXIMIZE SUM(prediction * price) "
-	                               "USING MODEL demand");
+	OptimizeOutcome o = Opt(db, m,
+	                        "OPTIMIZE deals CHOOSE price IN (5, 7, 9, 11) MAXIMIZE SUM(prediction * price) "
+	                        "USING MODEL demand");
 	// Revenue p(100 - 4p) peaks at 11 of these for a; p(100 - 9p) at 5 for b.
 	size_t right = 0;
 	for (const auto &r : o.plan) {
@@ -1421,8 +1448,11 @@ static void EndToEndPrice() {
 	}
 	std::printf("   right price for %zu of %zu\n", right, n);
 	CHECK(right >= n * 8 / 10, "right price for only %zu of %zu", right, n);
-	Refused([&] { Opt(db, m, "OPTIMIZE deals CHOOSE price IN (5, 13) MAXIMIZE SUM(prediction * price) USING MODEL demand"); },
-	        "price = 13 is outside every value 'price' has in 'deals' (5 to 11)", "a price never tried");
+	Refused(
+	    [&] {
+		    Opt(db, m, "OPTIMIZE deals CHOOSE price IN (5, 13) MAXIMIZE SUM(prediction * price) USING MODEL demand");
+	    },
+	    "price = 13 is outside every value 'price' has in 'deals' (5 to 11)", "a price never tried");
 	Refused([&] { Opt(db, m, "OPTIMIZE deals CHOOSE price IN ('high') MAXIMIZE SUM(prediction) USING MODEL demand"); },
 	        "is a number, so CHOOSE lists numbers", "text for a numeric lever");
 }
@@ -1495,12 +1525,13 @@ static void EndToEndSelect() {
 	for (const auto &p : preds) {
 		value.emplace_back(p.value * 1000 - cost.num[p.entity_row], p.entity_row);
 	}
-	std::sort(value.begin(), value.end(), [](const std::pair<double, uint32_t> &a, const std::pair<double, uint32_t> &b) {
-		return a.first > b.first;
-	});
+	std::sort(
+	    value.begin(), value.end(),
+	    [](const std::pair<double, uint32_t> &a, const std::pair<double, uint32_t> &b) { return a.first > b.first; });
 	{
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
-		                               "SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown");
+		OptimizeOutcome o = Opt(db, m,
+		                        "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
+		                        "SUBJECT TO COUNT(*) <= 5 USING MODEL breakdown");
 		bool same = o.plan.size() == 5;
 		for (size_t i = 0; same && i < 5; i++) {
 			same = o.plan[i].entity_row == value[i].second && std::fabs(o.plan[i].objective - value[i].first) < 1e-9;
@@ -1516,7 +1547,8 @@ static void EndToEndSelect() {
 	}
 	{
 		// No limit: every truck worth servicing, and none that is not.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) USING MODEL breakdown");
+		OptimizeOutcome o =
+		    Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) USING MODEL breakdown");
 		size_t positive = 0;
 		for (const auto &v : value) {
 			positive += v.first > 0;
@@ -1525,8 +1557,9 @@ static void EndToEndSelect() {
 	}
 	{
 		// A budget: a knapsack, against its dynamic programme.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
-		                               "SUBJECT TO SUM(service_cost) <= 600 USING MODEL breakdown");
+		OptimizeOutcome o = Opt(db, m,
+		                        "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
+		                        "SUBJECT TO SUM(service_cost) <= 600 USING MODEL breakdown");
 		std::vector<double> val;
 		std::vector<int> w;
 		double vmax = 0;
@@ -1545,7 +1578,8 @@ static void EndToEndSelect() {
 	}
 	{
 		// MINIMIZE with a minimum: the three cheapest.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks MINIMIZE SUM(service_cost) SUBJECT TO COUNT(*) >= 3 USING MODEL breakdown");
+		OptimizeOutcome o =
+		    Opt(db, m, "OPTIMIZE trucks MINIMIZE SUM(service_cost) SUBJECT TO COUNT(*) >= 3 USING MODEL breakdown");
 		std::vector<double> costs;
 		for (const auto &p : preds) {
 			costs.push_back(cost.num[p.entity_row]);
@@ -1561,8 +1595,9 @@ static void EndToEndSelect() {
 	}
 	{
 		// A limit on the model's own answer: no truck below even odds.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
-		                               "SUBJECT TO COUNT(*) FILTER (WHERE prediction < 0.5) <= 0 USING MODEL breakdown");
+		OptimizeOutcome o = Opt(db, m,
+		                        "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
+		                        "SUBJECT TO COUNT(*) FILTER (WHERE prediction < 0.5) <= 0 USING MODEL breakdown");
 		bool none_low = true;
 		for (const auto &r : o.plan) {
 			none_low = none_low && r.prediction >= 0.5;
@@ -1571,16 +1606,18 @@ static void EndToEndSelect() {
 	}
 	{
 		// A FILTERed limit and a WHERE together.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks WHERE age >= 2 MAXIMIZE SUM(prediction) "
-		                               "SUBJECT TO COUNT(*) <= 10 AND COUNT(*) FILTER (WHERE age > 8) <= 2 USING MODEL breakdown");
+		OptimizeOutcome o =
+		    Opt(db, m,
+		        "OPTIMIZE trucks WHERE age >= 2 MAXIMIZE SUM(prediction) "
+		        "SUBJECT TO COUNT(*) <= 10 AND COUNT(*) FILTER (WHERE age > 8) <= 2 USING MODEL breakdown");
 		size_t old = 0;
 		bool in_where = true;
 		for (const auto &r : o.plan) {
 			old += age.num[r.entity_row] > 8;
 			in_where = in_where && age.num[r.entity_row] >= 2;
 		}
-		CHECK(o.plan.size() == 10 && old <= 2 && in_where, "WHERE and FILTER respected: %zu rows, %zu old", o.plan.size(),
-		      old);
+		CHECK(o.plan.size() == 10 && old <= 2 && in_where, "WHERE and FILTER respected: %zu rows, %zu old",
+		      o.plan.size(), old);
 		CHECK(o.usage.size() == 2 && o.usage[0] == 10 && o.usage[1] == (double)old, "usage per limit");
 	}
 	{
@@ -1590,17 +1627,31 @@ static void EndToEndSelect() {
 		        "service_cost is NULL", "a NULL cost");
 		// ... and leaving the row out is the way past it.
 		OptimizeOutcome o =
-		    Opt(copy, m, "OPTIMIZE trucks WHERE service_cost IS NOT NULL MAXIMIZE SUM(prediction - service_cost) "
-		                 "USING MODEL breakdown");
+		    Opt(copy, m,
+		        "OPTIMIZE trucks WHERE service_cost IS NOT NULL MAXIMIZE SUM(prediction - service_cost) "
+		        "USING MODEL breakdown");
 		CHECK(o.candidates == preds.size() - 1, "WHERE ... IS NOT NULL leaves exactly that row out");
 		Refused([&] { Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(1 / (age - age)) USING MODEL breakdown"); },
 		        "divides by zero", "a division by zero");
-		Refused([&] { Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) >= 601 USING MODEL breakdown"); },
-		        "the most any plan reaches is 600", "more rows than there are");
-		Refused([&] { Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO SUM(service_cost) <= -1 USING MODEL breakdown"); },
-		        "no plan can meet SUM(service_cost) <= -1: the least any plan reaches is 0", "a negative budget");
-		Refused([&] { Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 2 AND COUNT(*) >= 3 USING MODEL breakdown"); },
-		        "no plan meets all of these limits together", "contradicting counts");
+		Refused(
+		    [&] {
+			    Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) >= 601 USING MODEL breakdown");
+		    },
+		    "the most any plan reaches is 600", "more rows than there are");
+		Refused(
+		    [&] {
+			    Opt(db, m,
+			        "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO SUM(service_cost) <= -1 USING MODEL "
+			        "breakdown");
+		    },
+		    "no plan can meet SUM(service_cost) <= -1: the least any plan reaches is 0", "a negative budget");
+		Refused(
+		    [&] {
+			    Opt(db, m,
+			        "OPTIMIZE trucks MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 2 AND COUNT(*) >= 3 USING MODEL "
+			        "breakdown");
+		    },
+		    "no plan meets all of these limits together", "contradicting counts");
 		Refused([&] { Opt(db, m, "OPTIMIZE trucks MAXIMIZE SUM(ts) USING MODEL breakdown"); }, "is a timestamp",
 		        "arithmetic on a timestamp");
 		Refused([&] { Opt(db, m, "OPTIMIZE trucks CHOOSE ts IN (1) MAXIMIZE SUM(prediction) USING MODEL breakdown"); },
@@ -1610,15 +1661,22 @@ static void EndToEndSelect() {
 	}
 	{
 		// Nothing matches: an empty plan, not an error, unless a minimum says otherwise.
-		OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks WHERE age > 100 MAXIMIZE SUM(prediction) USING MODEL breakdown");
+		OptimizeOutcome o =
+		    Opt(db, m, "OPTIMIZE trucks WHERE age > 100 MAXIMIZE SUM(prediction) USING MODEL breakdown");
 		CHECK(o.plan.empty() && o.candidates == 0 && o.objective == 0, "no candidates: an empty plan");
-		Refused([&] { Opt(db, m, "OPTIMIZE trucks WHERE age > 100 MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) >= 1 USING MODEL breakdown"); },
-		        "the most any plan reaches is 0", "a minimum over no candidates");
+		Refused(
+		    [&] {
+			    Opt(db, m,
+			        "OPTIMIZE trucks WHERE age > 100 MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) >= 1 USING MODEL "
+			        "breakdown");
+		    },
+		    "the most any plan reaches is 0", "a minimum over no candidates");
 	}
 	{
 		// The same statement twice is the same plan.
-		const std::string sql = "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
-		                        "SUBJECT TO SUM(service_cost) <= 900 AND COUNT(*) FILTER (WHERE age > 6) <= 3 USING MODEL breakdown";
+		const std::string sql =
+		    "OPTIMIZE trucks MAXIMIZE SUM(prediction * 1000 - service_cost) "
+		    "SUBJECT TO SUM(service_cost) <= 900 AND COUNT(*) FILTER (WHERE age > 6) <= 3 USING MODEL breakdown";
 		OptimizeOutcome a = Opt(db, m, sql), b = Opt(db, m, sql);
 		bool same = a.plan.size() == b.plan.size() && a.objective == b.objective && a.bound == b.bound;
 		for (size_t i = 0; same && i < a.plan.size(); i++) {
@@ -1635,9 +1693,10 @@ static void EndToEndSage() {
 	Database db = Fleet(17, 1500, true);
 	const Model m = Train(db, "TRAIN MODEL risk PREDICT EXISTS(repairs) FOR trucks AT ts HORIZON 30 DAYS "
 	                          "OPTIONS (arch = 'sage', epochs = 60, hidden = 32)");
-	OptimizeOutcome o = Opt(db, m, "OPTIMIZE trucks CHOOSE plan IN ('basic', 'care') "
-	                               "MINIMIZE SUM(prediction * 1000 + CASE plan WHEN 'care' THEN 150 ELSE 0 END) "
-	                               "USING MODEL risk");
+	OptimizeOutcome o = Opt(db, m,
+	                        "OPTIMIZE trucks CHOOSE plan IN ('basic', 'care') "
+	                        "MINIMIZE SUM(prediction * 1000 + CASE plan WHEN 'care' THEN 150 ELSE 0 END) "
+	                        "USING MODEL risk");
 	CHECK(o.plan.size() == 1500, "every truck gets a plan");
 	// The model must have learned that care lowers the risk, on average.
 	Frame &f = db.At("trucks");

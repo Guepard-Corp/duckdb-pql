@@ -152,13 +152,13 @@ inline std::string ToUpper(const std::string &s) {
 // addressable as "horizon" when quoted.
 inline bool IsPqlKeyword(const std::string &up) {
 	static const char *kw[] = {
-	    "TRAIN",    "MODEL",    "PREDICT",  "FOR",    "WHERE",   "AT",      "HORIZON", "USING", "GRAPH", "SPLIT",
-	    "TEMPORAL", "VALIDATE", "TEST",     "FROM",   "OPTIONS", "AS",      "AND",     "OR",    "NOT",   "IN",
-	    "IS",       "NULL",     "COUNT",    "EXISTS", "SUM",     "AVG",     "MIN",     "MAX",   "DAY",   "DAYS",
-	    "WEEK",     "WEEKS",    "MONTH",    "MONTHS", "YEAR",    "YEARS",   "HOUR",    "HOURS", "DROP",  "SHOW",
-	    "MODELS",   "EVERY",    "BACKTEST", "TO",     "EXPLAIN", "EXCLUDE", "REPLACE", "IF",    "OPTIMIZE",
-	    "MAXIMIZE", "MINIMIZE", "CHOOSE",   "SUBJECT", "CASE",   "WHEN",    "THEN",    "ELSE",  "END",   "FILTER",
-	    "PREDICTION", nullptr};
+	    "TRAIN",   "MODEL",    "PREDICT",  "FOR",      "WHERE",    "AT",         "HORIZON",  "USING",   "GRAPH",
+	    "SPLIT",   "TEMPORAL", "VALIDATE", "TEST",     "FROM",     "OPTIONS",    "AS",       "AND",     "OR",
+	    "NOT",     "IN",       "IS",       "NULL",     "COUNT",    "EXISTS",     "SUM",      "AVG",     "MIN",
+	    "MAX",     "DAY",      "DAYS",     "WEEK",     "WEEKS",    "MONTH",      "MONTHS",   "YEAR",    "YEARS",
+	    "HOUR",    "HOURS",    "DROP",     "SHOW",     "MODELS",   "EVERY",      "BACKTEST", "TO",      "EXPLAIN",
+	    "EXCLUDE", "REPLACE",  "IF",       "OPTIMIZE", "MAXIMIZE", "MINIMIZE",   "CHOOSE",   "SUBJECT", "CASE",
+	    "WHEN",    "THEN",     "ELSE",     "END",      "FILTER",   "PREDICTION", nullptr};
 	for (int i = 0; kw[i]; i++) {
 		if (up == kw[i]) {
 			return true;
@@ -1370,8 +1370,9 @@ private:
 						throw ParseError("a CHOOSE value is too large to represent", vt.pos);
 					}
 					for (const auto &prev : st.optimize.choices) {
-						const bool same = prev.kind == v.kind && (v.kind == Literal::Kind::NUMBER ? prev.number == v.number
-						                                                                          : prev.text == v.text);
+						const bool same =
+						    prev.kind == v.kind &&
+						    (v.kind == Literal::Kind::NUMBER ? prev.number == v.number : prev.text == v.text);
 						if (same) {
 							throw ParseError("CHOOSE lists " + v.ToString() + " twice", vt.pos);
 						}
@@ -1595,15 +1596,16 @@ private:
 		}
 		if (t.kind == Tok::IDENT || t.kind == Tok::KEYWORD) {
 			if (Peek(1).kind == Tok::PUNCT && Peek(1).text == "(") {
-				const bool agg = t.upper == "SUM" || t.upper == "COUNT" || t.upper == "AVG" || t.upper == "MIN" ||
-				                 t.upper == "MAX";
+				const bool agg =
+				    t.upper == "SUM" || t.upper == "COUNT" || t.upper == "AVG" || t.upper == "MIN" || t.upper == "MAX";
 				throw ParseError(agg ? std::string("aggregates do not nest: SUM(...) takes a value per row")
 				                     : "'" + t.text + "(' is not something PQL can compute; use + - * / and CASE",
 				                 t.pos);
 			}
 			// The bare word is the model's answer for the row. A column that happens
 			// to be called prediction is still reachable quoted, or qualified.
-			if (t.kind == Tok::KEYWORD && t.upper == "PREDICTION" && !(Peek(1).kind == Tok::PUNCT && Peek(1).text == ".")) {
+			if (t.kind == Tok::KEYWORD && t.upper == "PREDICTION" &&
+			    !(Peek(1).kind == Tok::PUNCT && Peek(1).text == ".")) {
 				Next();
 				node->kind = Expr::Kind::PREDICTION;
 				return node;
@@ -1840,7 +1842,8 @@ private:
 		}
 		auto node = std::unique_ptr<FilterNode>(new FilterNode());
 		node->kind = FilterNode::Kind::CMP;
-		if (pred_ctx_ != PredCtx::NONE && PeekKw("PREDICTION") && !(Peek(1).kind == Tok::PUNCT && Peek(1).text == ".")) {
+		if (pred_ctx_ != PredCtx::NONE && PeekKw("PREDICTION") &&
+		    !(Peek(1).kind == Tok::PUNCT && Peek(1).text == ".")) {
 			if (pred_ctx_ == PredCtx::REFUSED) {
 				throw ParseError("WHERE picks the rows before anything is predicted, so it cannot test prediction; "
 				                 "put the condition in a total instead, e.g. COUNT(*) FILTER (WHERE prediction > 0.5), "
@@ -7397,8 +7400,7 @@ inline void SolveSmallLP(SmallLP &lp, double tol = 1e-10, const CancelCheck &can
 					continue;
 				}
 				const double ratio = T[(size_t)i * W + (size_t)N] / aiq;
-				if (r < 0 || ratio < best - tol ||
-				    (ratio <= best + tol && basis[(size_t)i] < basis[(size_t)r])) {
+				if (r < 0 || ratio < best - tol || (ratio <= best + tol && basis[(size_t)i] < basis[(size_t)r])) {
 					r = i;
 					best = ratio;
 				}
@@ -8824,8 +8826,9 @@ inline int ResolveLever(const Frame &entity, const Model &model, const Statement
 		}
 	}
 	if (col.type == ColType::TIMESTAMP) {
-		throw std::runtime_error("pql: '" + col.name + "' is a timestamp; CHOOSE picks a value for a column the model "
-		                                               "reads as an input, and timestamps are not inputs");
+		throw std::runtime_error("pql: '" + col.name +
+		                         "' is a timestamp; CHOOSE picks a value for a column the model "
+		                         "reads as an input, and timestamps are not inputs");
 	}
 	const FeatureSpec::CatCol *cat = nullptr;
 	bool numeric_input = false;
@@ -8869,9 +8872,10 @@ inline int ResolveLever(const Frame &entity, const Model &model, const Statement
 			}
 		}
 		if (!cat->one_hot) {
-			throw std::runtime_error("pql: '" + col.name + "' has more distinct values than MAX_CATEGORIES, so model '" +
-			                         model.name + "' only knows how common each value is, not what it does. Retrain "
-			                                      "with OPTIONS (max_categories = " +
+			throw std::runtime_error("pql: '" + col.name +
+			                         "' has more distinct values than MAX_CATEGORIES, so model '" + model.name +
+			                         "' only knows how common each value is, not what it does. Retrain "
+			                         "with OPTIONS (max_categories = " +
 			                         std::to_string(cat->labels.size()) + ") to choose it");
 		}
 		for (const auto &v : spec.choices) {
@@ -8880,8 +8884,8 @@ inline int ResolveLever(const Frame &entity, const Model &model, const Statement
 				seen = seen || l == v.text;
 			}
 			if (!seen) {
-				throw std::runtime_error("pql: model '" + model.name + "' never saw " + col.name + " = " + v.ToString() +
-				                         " while training, so it has no idea what that choice does");
+				throw std::runtime_error("pql: model '" + model.name + "' never saw " + col.name + " = " +
+				                         v.ToString() + " while training, so it has no idea what that choice does");
 			}
 		}
 		return c;
@@ -9013,7 +9017,7 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 	const size_t K = out.choosing ? spec.choices.size() : 1;
 	const size_t m = spec.constraints.size();
 	std::vector<Prediction> rows;
-	std::vector<double> pred, obj;          // n * K
+	std::vector<double> pred, obj;           // n * K
 	std::vector<std::vector<double>> con(m); // per constraint, n * K
 	size_t missing_rows = 0;
 	std::string missing_why, missing_where;
@@ -9151,8 +9155,8 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 				const OptConstraint &c = spec.constraints[j];
 				double extreme = 0;
 				for (size_t i = 0; i < n; i++) {
-					double e = c.at_most ? std::numeric_limits<double>::infinity()
-					                     : -std::numeric_limits<double>::infinity();
+					double e =
+					    c.at_most ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
 					for (size_t k = 0; k < KP; k++) {
 						const double v = out.choosing ? con[j][i * K + k] : (k == 1 ? con[j][i] : 0.0);
 						e = c.at_most ? std::min(e, v) : std::max(e, v);
@@ -9162,9 +9166,10 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 				const bool impossible = c.at_most ? extreme > c.limit.number + 1e-9 * std::max(1.0, std::fabs(extreme))
 				                                  : extreme < c.limit.number - 1e-9 * std::max(1.0, std::fabs(extreme));
 				if (impossible) {
-					throw std::runtime_error("pql: no plan can meet " + c.ToString() + ": " +
-					                         (c.at_most ? "the least any plan reaches is " : "the most any plan reaches is ") +
-					                         TidyNumber(extreme));
+					throw std::runtime_error(
+					    "pql: no plan can meet " + c.ToString() + ": " +
+					    (c.at_most ? "the least any plan reaches is " : "the most any plan reaches is ") +
+					    TidyNumber(extreme));
 				}
 			}
 			std::string all;
