@@ -22,6 +22,17 @@ EXPLAIN MODEL <name> [ FOR <table> ] [ WHERE <filter> ]
 
 DROP MODEL [IF EXISTS] <name>
 
+[EXPLAIN] OPTIMIZE <table> [AS <alias>]
+  [ WHERE <filter> ]                        -- the rows a plan may act on
+  [ AT <column> | AT <timestamp> ]
+  [ CHOOSE <column> IN (<value>, ...) ]     -- a value per row, instead of which rows
+  MAXIMIZE | MINIMIZE <total>
+  [ SUBJECT TO <total> (<= | >=) <number> [ AND ... ] ]
+  USING MODEL <name>
+
+  <total> := SUM(<expression>) [ FILTER (WHERE <filter>) ]
+           | COUNT(*)          [ FILTER (WHERE <filter>) ]
+
 SELECT * FROM pql_models()               -- the models in this session
 ```
 
@@ -109,6 +120,115 @@ contribution across its slots and make every piece look unimportant.
 `arch = 'sage'` models are refused: their inputs are gathered from the graph per
 batch rather than laid out as a vector, so there is nothing to permute.
 
+### `OPTIMIZE`: from a prediction to a decision
+
+A prediction says what will happen. `OPTIMIZE` says what to do about it, given
+what each action is worth and what you can afford. It asks one of two things.
+
+**Which rows to act on.** Five service bays this week, a breakdown costs 4200,
+a service costs what the truck's row says:
+
+```sql
+OPTIMIZE trucks WHERE status = 'active'
+  MAXIMIZE SUM(prediction * 4200 - service_cost)
+  SUBJECT TO COUNT(*) <= 5
+  USING MODEL breakdown;
+```
+
+The result is the rows to act on, the most valuable first, keyed and anchored
+the way `PREDICT`'s rows are: the key, the anchor when the model has one,
+`prediction`, and `objective`, which is that row's share of the total. Without
+`SUBJECT TO`, it is every row whose share is worth having.
+
+**A value per row.** `CHOOSE` names a column and the values it may take, and
+`OPTIMIZE` picks one for every row:
+
+```sql
+OPTIMIZE customers
+  CHOOSE offer IN ('none', '10%', '20%')
+  MAXIMIZE SUM(prediction - CASE offer WHEN '10%' THEN 10 WHEN '20%' THEN 20 ELSE 0 END)
+  SUBJECT TO SUM(CASE offer WHEN '10%' THEN 10 WHEN '20%' THEN 20 ELSE 0 END) <= 5000
+  USING MODEL spend;
+```
+
+To learn what an offer does, PQL sets each row's `offer` to each value in turn
+and predicts again. Inside the totals, `offer` reads the value being tried, so
+costs can depend on it. The result has a row for every candidate with the value
+chosen, in a column named after the lever. A numeric column works the same way:
+`CHOOSE price IN (9.99, 12.99, 14.99)` with `MAXIMIZE SUM(prediction * price)`.
+`WHERE` reads the lever as it stands today, so `WHERE offer = 'none'` plans for
+the customers on no offer now.
+
+**Expressions** are numbers, the entity's numeric columns, `prediction`, `+ - *
+/`, and `CASE`, in both its forms. Text only appears in comparisons, inside
+`CASE WHEN` or `FILTER (WHERE ...)`. The bare word `prediction` is the model's
+answer; a column of that name is still reachable quoted or qualified.
+
+A row whose total has no value is refused: a `NULL` in a column it reads, or a
+division by zero. SQL's `SUM` would skip that row, which in a plan means treating
+an unknown cost as free, and the plan would then fill up with exactly those rows.
+Leave them out with `WHERE ... IS NOT NULL` instead. One departure from SQL: a
+`CASE` with no `ELSE` and no matching `WHEN` is 0, not `NULL`. Inside a `SUM` they
+mean the same thing.
+
+**Limits** are `<=` or `>=`. An exact `=` is rarely reachable with whole
+choices, so bound a total from both sides instead. `FILTER (WHERE ...)` narrows a
+total to some rows: `COUNT(*) FILTER (WHERE offer != 'none') <= 300` is at most
+300 offers.
+
+**`EXPLAIN OPTIMIZE`** solves the same plan and reports its totals:
+
+| measure | value | bound |
+|---|---|---|
+| `objective` | the plan's total | the best any plan meeting the limits could reach |
+| `status quo` | the total with every lever as it is today (`CHOOSE` only) | |
+| each limit, as written | the plan's total for it | the limit |
+| `rows` | the rows the plan was chosen from | |
+| `<lever> = <value>`, or `selected` | how many rows got it | |
+
+`status quo` is what today's levers are predicted to score, for comparison;
+nothing makes it meet the limits, and it often does not.
+
+When `bound` equals `value` on the objective, the plan is proven to be the best
+one. That is the case for every limit written in whole units at a size the
+solver can tabulate (a count, a budget in whole currency units), for problems
+small enough to enumerate, and whenever its search finishes. Otherwise the gap
+between the two is how much better a plan could possibly be, which on thousands
+of rows is usually a rounding error.
+
+A plan that cannot meet its limits is an error, not an empty result. The message
+says which limit no plan can meet on its own, or that the limits contradict each
+other. When the solver could not prove either, it says it found no plan and
+that one may still exist.
+
+The limits are meant to be a handful: a budget, a capacity, a cap or a minimum
+per segment. With a few dozen the plan is still usually proven best or close to
+it. With hundreds, say a minimum for each of hundreds of small groups, the
+search can stop short: the gap to the bound widens, and it can fail to find a
+plan that exists.
+
+**What `CHOOSE` refuses.** The question "what if this row's offer were X" only
+has an answer when the model reads `offer` as an input, and only for values it
+saw while training. So `CHOOSE` refuses:
+
+- a column the model does not read: a key, a constant, an `EXCLUDE`d column, or
+  one with nearly one value per row;
+- a text value that never appeared in training, which would set no input at all;
+- a text column with more values than `MAX_CATEGORIES`, which the model only
+  knows by how common each value is (retrain with a higher `max_categories`);
+- a number outside every value the column has in the table;
+- the model's own target, its anchor, and timestamps.
+
+**How far to trust a plan.** The model's answer to "what if" is only as good as
+the history behind it. If offers went mostly to customers who were about to buy
+anyway, the model learns that offers come before purchases, not that they cause
+them, and the plan will hand out offers where they change nothing. History
+where the lever was set at random, or by a rule that only uses columns the model
+can see, is what makes the answer causal. And a plan is chosen because the model
+scores it highly, so its `objective` leans optimistic: it is the model's
+estimate, not a measurement. Try the plan on part of the rows before rolling it
+out to all of them.
+
 ### Anchors: `AT` or `EVERY`
 
 Use `AT <column>` when your rows already carry the moment they are about, and a
@@ -187,6 +307,14 @@ of a PQL statement at all; its parser rejects it before the extension is
 reached. `EXPLAIN MODEL` is a separate thing and is described above.)
 
 **Models** live for the session: not persisted, not transactional.
+
+**`OPTIMIZE`** plans with one model per statement, and its levers are columns of
+the entity it plans over. It estimates a plan's value with the same model that
+chose it, so there is no `BACKTEST` for a plan yet: replaying a policy against
+history needs outcomes for the actions that were not taken, which takes
+off-policy evaluation or an experiment. Its solver is exact for whole-number
+limits it can tabulate and for small problems; otherwise it reports the bound
+alongside the plan rather than claiming the plan is the best.
 
 **Reproducibility is per build.** The same statement on the same data gives the
 same model every time within one binary, which is tested. It is not bit-identical

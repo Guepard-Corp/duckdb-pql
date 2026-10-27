@@ -345,7 +345,9 @@ static void CollectFilterColumns(const pql::FilterNode *f, std::set<std::string>
 		return;
 	}
 	if (f->kind == pql::FilterNode::Kind::CMP) {
-		out.insert(pql::ToUpper(f->ref.name));
+		if (!f->prediction) {
+			out.insert(pql::ToUpper(f->ref.name));
+		}
 		return;
 	}
 	for (const auto &c : f->children) {
@@ -689,6 +691,9 @@ static void ResolveFilterTimestamps(pql::FilterNode *f, const TableSchema *schem
 		}
 		return;
 	}
+	if (f->prediction) {
+		return; // compares the model's answer, a number
+	}
 	const std::string up = pql::ToUpper(f->ref.name);
 	for (size_t i = 0; i < schema->columns.size(); i++) {
 		if (pql::ToUpper(schema->columns[i]) != up) {
@@ -701,6 +706,23 @@ static void ResolveFilterTimestamps(pql::FilterNode *f, const TableSchema *schem
 		}
 		return;
 	}
+}
+
+static void ResolveExprTimestamps(pql::Expr *e, const TableSchema *schema) {
+	if (!e) {
+		return;
+	}
+	for (auto &w : e->when) {
+		ResolveFilterTimestamps(w.get(), schema);
+	}
+	for (auto &a : e->args) {
+		ResolveExprTimestamps(a.get(), schema);
+	}
+}
+
+static void ResolveAggregateTimestamps(pql::OptAggregate &a, const TableSchema *schema) {
+	ResolveFilterTimestamps(a.filter.get(), schema);
+	ResolveExprTimestamps(a.expr.get(), schema);
 }
 
 static const TableSchema *FindSchema(const std::vector<TableSchema> &schema, const std::string &name) {
@@ -995,6 +1017,28 @@ static Value KeyValue(const pql::Column &kc, size_t row) {
 	}
 }
 
+// The column that identifies an entity row in a result, so it can be joined
+// back: "id", else "<singular>_id", else any declared parent key on the table.
+static int EntityKeyColumn(const pql::Database &db, const pql::Frame &entity) {
+	int key_col = entity.Find("id");
+	if (key_col < 0) {
+		std::string sing = entity.name;
+		if (sing.size() > 1 && (sing.back() == 's' || sing.back() == 'S')) {
+			sing.pop_back();
+		}
+		key_col = entity.Find(sing + "_id");
+	}
+	if (key_col < 0) {
+		for (const auto &fk : db.fks) {
+			if (pql::ToUpper(fk.parent_table) == pql::ToUpper(entity.name)) {
+				key_col = entity.Find(fk.parent_column);
+				break;
+			}
+		}
+	}
+	return key_col;
+}
+
 static void RunTrain(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
 	// Checked before any work, not after: refusing at the end would mean the user
 	// waited for a model that is then thrown away.
@@ -1057,24 +1101,7 @@ static void RunPredictStmt(ClientContext &context, pql::Statement &stmt, PqlBind
 	// Echo an identifying column alongside the prediction so a result row can be
 	// joined back. The entity's first declared key is the natural choice.
 	const pql::Frame &entity = db.At(effective.entity_table);
-	// Prefer the entity's own key: "id", else "<singular>_id", else any declared
-	// parent key on this table.
-	int key_col = entity.Find("id");
-	if (key_col < 0) {
-		std::string sing = entity.name;
-		if (sing.size() > 1 && (sing.back() == 's' || sing.back() == 'S')) {
-			sing.pop_back();
-		}
-		key_col = entity.Find(sing + "_id");
-	}
-	if (key_col < 0) {
-		for (const auto &fk : db.fks) {
-			if (pql::ToUpper(fk.parent_table) == pql::ToUpper(entity.name)) {
-				key_col = entity.Find(fk.parent_column);
-				break;
-			}
-		}
-	}
+	const int key_col = EntityKeyColumn(db, entity);
 	// Emit the key in its own type. Forcing it through a DOUBLE turned every
 	// string key into 0.0 and lost precision past 2^53, so the documented
 	// join-back silently produced nothing.
@@ -1160,22 +1187,7 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	auto rows = pql::RunBacktest(db, *model, effective);
 
 	const pql::Frame &entity = db.At(effective.entity_table);
-	int key_col = entity.Find("id");
-	if (key_col < 0) {
-		std::string sing = entity.name;
-		if (sing.size() > 1 && (sing.back() == 's' || sing.back() == 'S')) {
-			sing.pop_back();
-		}
-		key_col = entity.Find(sing + "_id");
-	}
-	if (key_col < 0) {
-		for (const auto &fk : db.fks) {
-			if (pql::ToUpper(fk.parent_table) == pql::ToUpper(entity.name)) {
-				key_col = entity.Find(fk.parent_column);
-				break;
-			}
-		}
-	}
+	const int key_col = EntityKeyColumn(db, entity);
 	const LogicalType key_logical =
 	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
 	bind.names = {"entity", "anchor", "predicted", "actual", "error", "baseline"};
@@ -1190,6 +1202,127 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		                                    : KeyValue(entity.columns[(size_t)key_col], r.entity_row);
 		bind.Emit({key_value, Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)), Value::DOUBLE(r.predicted),
 		           Value::DOUBLE(r.actual), Value::DOUBLE(r.predicted - r.actual), Value::DOUBLE(r.baseline)});
+	}
+}
+
+// A plan, or with EXPLAIN its totals. The plan is one row per entity it acts on
+// (every candidate when CHOOSE is used, with the value chosen), keyed and
+// anchored the way PREDICT's rows are, so it joins back the same way.
+static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
+	std::shared_ptr<const pql::Model> model;
+	{
+		auto entry = GetRegistryEntry(context);
+		std::lock_guard<std::mutex> guard(entry->lock);
+		model = entry->registry.Get(stmt.model);
+	}
+	if (!model) {
+		throw InvalidInputException("pql: no model named '%s'; TRAIN it first", stmt.model);
+	}
+	// The model's target decides which tables matter, as it does for PREDICT.
+	pql::Statement load = stmt;
+	load.target = model->spec_stmt.target;
+	pql::Database db = LoadDatabase(context, load);
+	const auto out = pql::RunOptimize(db, *model, stmt, [&context]() { CheckCancelled(context); });
+	const pql::OptimizeSpec &spec = stmt.optimize;
+
+	if (spec.explain) {
+		bind.names = {"measure", "value", "bound"};
+		bind.types = {LogicalType::VARCHAR, LogicalType::DOUBLE, LogicalType::DOUBLE};
+		bind.Begin(context);
+		const Value none(LogicalType::DOUBLE);
+		bind.Emit({Value("objective"), Value::DOUBLE(out.objective), Value::DOUBLE(out.bound)});
+		if (out.has_status_quo) {
+			bind.Emit({Value("status quo"), Value::DOUBLE(out.status_quo), none});
+		}
+		for (size_t j = 0; j < spec.constraints.size(); j++) {
+			bind.Emit({Value(spec.constraints[j].ToString()), Value::DOUBLE(out.usage[j]),
+			           Value::DOUBLE(spec.constraints[j].limit.number)});
+		}
+		bind.Emit({Value("rows"), Value::DOUBLE((double)out.candidates), none});
+		if (out.choosing) {
+			for (size_t k = 0; k < spec.choices.size(); k++) {
+				bind.Emit({Value(spec.lever.ToString() + " = " + spec.choices[k].ToString()),
+				           Value::DOUBLE((double)out.counts[k]), none});
+			}
+		} else {
+			bind.Emit({Value("selected"), Value::DOUBLE((double)out.counts[1]), none});
+		}
+		return;
+	}
+
+	const pql::Frame &entity = db.At(stmt.entity_table);
+	const int key_col = EntityKeyColumn(db, entity);
+	const LogicalType key_logical =
+	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
+	// The anchor is reported exactly when PREDICT would report it.
+	pql::Statement eff = stmt;
+	if (eff.anchor.name.empty() && !eff.anchor_is_literal) {
+		eff.anchor = model->spec_stmt.anchor;
+	}
+	eff.every = model->spec_stmt.every;
+	const bool generated_anchor = model->spec_stmt.every.present;
+	const int anchor_out = (eff.anchor_is_literal || generated_anchor) ? -1 : pql::ResolveAnchorColumn(entity, eff);
+	const bool with_anchor = anchor_out >= 0 || ((eff.anchor_is_literal || generated_anchor) && !out.plan.empty());
+	LogicalType lever_logical = LogicalType::VARCHAR;
+	const pql::Column *lever = out.lever_col >= 0 ? &entity.columns[(size_t)out.lever_col] : nullptr;
+	if (lever) {
+		switch (lever->type) {
+		case pql::ColType::CATEGORY:
+			lever_logical = LogicalType::VARCHAR;
+			break;
+		case pql::ColType::INT64:
+			lever_logical = LogicalType::BIGINT;
+			break;
+		case pql::ColType::BOOL:
+			lever_logical = LogicalType::BOOLEAN;
+			break;
+		default:
+			lever_logical = LogicalType::DOUBLE;
+			break;
+		}
+	}
+	auto lever_value = [&](int k) -> Value {
+		const pql::Literal &v = spec.choices[(size_t)k];
+		switch (lever->type) {
+		case pql::ColType::CATEGORY:
+			return Value(v.text);
+		case pql::ColType::INT64:
+			return Value::BIGINT((int64_t)v.number);
+		case pql::ColType::BOOL:
+			return Value::BOOLEAN(v.number != 0.0);
+		default:
+			return Value::DOUBLE(v.number);
+		}
+	};
+	bind.names = {key_col >= 0 ? entity.columns[(size_t)key_col].name : std::string("entity")};
+	bind.types = {key_logical};
+	if (with_anchor) {
+		bind.names.push_back(anchor_out >= 0 ? entity.columns[(size_t)anchor_out].name : std::string("anchor"));
+		bind.types.push_back(LogicalType::TIMESTAMP);
+	}
+	if (lever) {
+		bind.names.push_back(lever->name);
+		bind.types.push_back(lever_logical);
+	}
+	bind.names.push_back("prediction");
+	bind.types.push_back(LogicalType::DOUBLE);
+	bind.names.push_back("objective");
+	bind.types.push_back(LogicalType::DOUBLE);
+	bind.Begin(context);
+	std::vector<Value> row;
+	for (const auto &r : out.plan) {
+		row.clear();
+		row.push_back(key_col < 0 ? Value::BIGINT((int64_t)r.entity_row)
+		                          : KeyValue(entity.columns[(size_t)key_col], r.entity_row));
+		if (with_anchor) {
+			row.push_back(Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)));
+		}
+		if (lever) {
+			row.push_back(lever_value(r.choice));
+		}
+		row.push_back(Value::DOUBLE(r.prediction));
+		row.push_back(Value::DOUBLE(r.objective));
+		bind.Emit(row);
 	}
 }
 
@@ -1237,12 +1370,19 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 	if (stmt.has_to) {
 		ResolveTemporalLiteral(stmt.backtest_to, "BACKTEST TO");
 	}
-	if (stmt.kind == pql::StmtKind::TRAIN || stmt.kind == pql::StmtKind::PREDICT) {
+	if (stmt.kind == pql::StmtKind::TRAIN || stmt.kind == pql::StmtKind::PREDICT ||
+	    stmt.kind == pql::StmtKind::OPTIMIZE) {
 		Connection probe(DatabaseInstance::GetDatabase(context));
 		const std::vector<TableSchema> sch = LoadSchema(probe);
-		ResolveFilterTimestamps(stmt.filter.get(), FindSchema(sch, stmt.entity_table));
+		const TableSchema *entity_schema = FindSchema(sch, stmt.entity_table);
+		ResolveFilterTimestamps(stmt.filter.get(), entity_schema);
 		if (!stmt.target.target_table.empty() && stmt.target.target_table != "*") {
 			ResolveFilterTimestamps(stmt.target.filter.get(), FindSchema(sch, stmt.target.target_table));
+		}
+		// OPTIMIZE compares entity columns in its FILTERs and CASE WHENs too.
+		ResolveAggregateTimestamps(stmt.optimize.objective, entity_schema);
+		for (auto &c : stmt.optimize.constraints) {
+			ResolveAggregateTimestamps(c.total, entity_schema);
 		}
 	}
 	switch (stmt.kind) {
@@ -1260,6 +1400,9 @@ static unique_ptr<FunctionData> PqlBind(ClientContext &context, TableFunctionBin
 		break;
 	case pql::StmtKind::SHOW_MODELS:
 		RunShowModels(context, *bind);
+		break;
+	case pql::StmtKind::OPTIMIZE:
+		RunOptimizeStmt(context, stmt, *bind);
 		break;
 	case pql::StmtKind::DROP_MODEL: {
 		bool dropped;
@@ -1367,17 +1510,32 @@ static ParserExtensionParseResult PqlParseFunction(ParserExtensionInfo *, const 
 			second = tokens[1].upper;
 		}
 	} catch (const pql::ParseError &) {
-		auto head = pql::ToUpper(text.substr(0, 8));
-		if (head.rfind("TRAIN", 0) != 0 && head.rfind("PREDICT", 0) != 0) {
-			return ParserExtensionParseResult();
+		// The first two words, read without the tokenizer that just failed.
+		std::vector<std::string> words;
+		std::string cur;
+		for (size_t i = 0; i <= text.size() && words.size() < 2; i++) {
+			const unsigned char c = i < text.size() ? (unsigned char)text[i] : ' ';
+			if (std::isalnum(c) || c == '_') {
+				cur.push_back((char)c);
+			} else {
+				if (!cur.empty()) {
+					words.push_back(pql::ToUpper(cur));
+				}
+				cur.clear();
+				if (!std::isspace(c)) {
+					break;
+				}
+			}
 		}
-		first = head.rfind("TRAIN", 0) == 0 ? "TRAIN" : "PREDICT";
+		first = words.size() > 0 ? words[0] : std::string();
+		second = words.size() > 1 ? words[1] : std::string();
 	}
-	// EXPLAIN is matched only with MODEL after it, so DuckDB's own EXPLAIN keeps
-	// working on every other statement.
-	const bool ours = first == "TRAIN" || first == "PREDICT" || (first == "BACKTEST" && second == "MODEL") ||
-	                  (first == "EXPLAIN" && second == "MODEL") || (first == "DROP" && second == "MODEL") ||
-	                  (first == "SHOW" && second == "MODELS");
+	// EXPLAIN is matched only with MODEL or OPTIMIZE after it, so DuckDB's own
+	// EXPLAIN keeps working on every other statement.
+	const bool ours = first == "TRAIN" || first == "PREDICT" || first == "OPTIMIZE" ||
+	                  (first == "BACKTEST" && second == "MODEL") ||
+	                  (first == "EXPLAIN" && (second == "MODEL" || second == "OPTIMIZE")) ||
+	                  (first == "DROP" && second == "MODEL") || (first == "SHOW" && second == "MODELS");
 	if (!ours) {
 		return ParserExtensionParseResult();
 	}

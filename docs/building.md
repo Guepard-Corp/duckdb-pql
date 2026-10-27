@@ -23,8 +23,8 @@ The language itself is tested without DuckDB. Each file under
 [`pql.hpp`](../src/include/pql/pql.hpp):
 
 ```bash
-make test_cpp             # parse, model, categorical, links, degenerate, fuzz
-make test_cpp_sanitize    # the fuzzer and the degenerate harness under ASan/UBSan
+make test_cpp             # parse, model, categorical, links, degenerate, fuzz, optimize
+make test_cpp_sanitize    # the fuzzer, the degenerate harness, links and optimize under ASan/UBSan
 ```
 
 | file | what it covers |
@@ -35,6 +35,7 @@ make test_cpp_sanitize    # the fuzzer and the degenerate harness under ASan/UBS
 | `test_links.cpp` | link tables and windows against a brute-force oracle over random schemas |
 | `test_degenerate.cpp` | databases that should not exist: empty, one row, duplicate keys, NaN, infinity, cancellation |
 | `test_fuzz.cpp` | mutated statements and garbage, checking that anything accepted round-trips |
+| `test_optimize.cpp` | `OPTIMIZE`: grammar, expressions, the solver against brute force and exact programmes, and plans whose best answer is known |
 | `test_memory.cpp` | allocation discipline (see below) |
 
 PQL was developed inside a fork of DuckDB, where the same header is compiled

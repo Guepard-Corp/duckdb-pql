@@ -100,6 +100,45 @@ against 61.80, persistence 94.98) while carrying 30 features to `sage`'s 641
 parameters. `sage` earns its keep where structure reaches further than one hop,
 which is what the two-hop number above measures.
 
+## Deciding: `OPTIMIZE`
+
+`OPTIMIZE` turns predictions into a plan. Each candidate row takes one of a few
+options (act on it or not, or one value of a `CHOOSE` column), and the plan
+maximises a total under linear limits. That is the multiple-choice knapsack
+problem, which is NP-hard, so the solver is built to say how good its answer is.
+
+**What a choice changes** is asked of the model directly: the lever column is
+set to each value in turn for every candidate row, and the rows are predicted
+again through the same path `PREDICT` uses. Nothing else about a row moves, so
+the difference between two of its predictions is what the model thinks the
+lever does. The column is put back afterwards, whatever happens.
+
+**The solver** tries, in order:
+
+1. If every row taking its own best option already meets the limits, that is the
+   answer.
+2. A problem small enough to enumerate is enumerated.
+3. Limits whose coefficients are whole at some power of ten (counts, budgets in
+   whole units) are solved exactly by dynamic programming over their totals,
+   when the table fits. When the costs are not whole, the same table is built
+   twice on a grid: with costs rounded up, any plan that fits also fits the real
+   limits; with costs rounded down, every real plan fits, so its best value
+   bounds them all.
+4. Otherwise the linear relaxation is solved by column generation over a small
+   simplex. Its dual is a price per unit of each limit, and at any prices p the
+   value `SUM_i max_k (v - p.a) + p.b` bounds every plan, whether or not the
+   relaxation converged. A plan is read off at those prices, repaired if it
+   breaks a limit, and improved a row at a time.
+5. A depth-first search then runs over the rows those prices leave open. An
+   option whose shortfall against its row's best at p exceeds the gap to the best
+   plan so far cannot be in a better one, which fixes most rows outright.
+   Finishing the search proves the plan optimal; running out of nodes leaves it
+   and the bound as they were.
+
+The tests hold the solver to brute force on thousands of random problems, along
+each of these paths with the ones before it switched off, to exact programmes on
+larger knapsacks, and the simplex to an optimality certificate on every answer.
+
 ## Performance
 
 The language lives in one self-contained header,
@@ -136,6 +175,10 @@ as written.
 
 [`examples/shop_demo.sql`](../examples/shop_demo.sql) is self-contained:
 it creates its own tables and trains three models end to end.
+
+[`examples/optimize_demo.sql`](../examples/optimize_demo.sql) is
+self-contained too: a breakdown forecast turned into a maintenance plan, with
+service bays, a budget, and a plan chosen per truck.
 
 [`examples/sunnyside_demo.sql`](../examples/sunnyside_demo.sql) runs
 against a real point-of-sale database, with
