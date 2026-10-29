@@ -133,7 +133,7 @@ int main() {
 		Model m;
 		auto rep = TrainModel(db, st, m);
 		printf("   metric=%s val=%.4f classification=%d\n", rep.metric_name.c_str(), rep.val_metric,
-		       (int)m.classification);
+		       (int)m.target.classification);
 	}
 	{
 		printf("== D. inner filter narrows the label\n");
@@ -700,13 +700,13 @@ int main() {
 			Model m;
 			TrainReport r = TrainModel(db, st, m);
 			bool finite_w = true;
-			for (float w : m.w1) {
+			for (float w : static_cast<const MlpLearner &>(*m.learner).w1) {
 				if (!std::isfinite(w)) {
 					finite_w = false;
 					break;
 				}
 			}
-			for (float w : m.w3) {
+			for (float w : static_cast<const MlpLearner &>(*m.learner).w3) {
 				if (!std::isfinite(w)) {
 					finite_w = false;
 					break;

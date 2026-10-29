@@ -264,6 +264,7 @@ PREDICT COUNT(txns) FOR accounts WHERE balance < -100 USING MODEL churn;
 | `LAYERS` | 1 | 1 or 2 (`sage` only) |
 | `MAX_CATEGORIES` | 16 | 0 to 4096; above it a text column is frequency-encoded rather than given a slot per value |
 | `L2` | 0 | 0 to 1; decoupled weight decay, on weights and not biases |
+| `LOG_TARGET` | 0 | 0 or 1; fit a non-negative attribute on `log1p` and read it back with `expm1` (skewed counts and amounts) |
 
 ### Result columns
 

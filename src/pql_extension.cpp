@@ -808,6 +808,20 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 			want.insert(pql::ToUpper(fk.child_table));
 		}
 	}
+	// History through a parent: the tables the entity points at and their
+	// children, so a panel row reads its customer's transactions without the
+	// history being copied per row.
+	for (const auto &fk : all_fks) {
+		if (!same(fk.child_table, stmt.entity_table) || same(fk.parent_table, stmt.entity_table)) {
+			continue;
+		}
+		want.insert(pql::ToUpper(fk.parent_table));
+		for (const auto &fk2 : all_fks) {
+			if (same(fk2.parent_table, fk.parent_table) && !same(fk2.child_table, stmt.entity_table)) {
+				want.insert(pql::ToUpper(fk2.child_table));
+			}
+		}
+	}
 	// A child with no timestamp of its own is dated through a foreign key
 	// (line_items are dated by their transaction), so the table holding that
 	// clock has to be loaded even though it is not itself a child of the entity.
@@ -1337,7 +1351,7 @@ static void RunShowModels(ClientContext &context, PqlBindData &bind) {
 		// The defining statement, echoed back in full. Copy it to retrain, or read
 		// it to see exactly what a model was given.
 		bind.Emit({Value(m->name), Value(m->spec_stmt.target.ToString()), Value(m->spec_stmt.entity_table),
-		           Value(m->classification ? "classification" : "regression"), Value::BIGINT(m->features.width),
+		           Value(m->target.classification ? "classification" : "regression"), Value::BIGINT(m->features.width),
 		           Value(m->spec_stmt.ToString())});
 	}
 }

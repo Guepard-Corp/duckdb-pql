@@ -12,9 +12,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 
-# pql/pql.hpp is a self-contained translation unit (grammar, features, model,
-# training) with no dependency beyond the C++17 standard library. The binding
-# in pql_extension.cpp is the only file that includes it together with DuckDB.
+# pql/pql.hpp includes the language in parts (grammar, data, features, the
+# learners, training, prediction, optimisation), all header-only with no
+# dependency beyond the C++17 standard library. The binding in
+# pql_extension.cpp is the only file that includes it together with DuckDB.
 set(EXTENSION_SOURCES src/pql_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

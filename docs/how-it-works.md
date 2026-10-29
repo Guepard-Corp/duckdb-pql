@@ -141,9 +141,12 @@ larger knapsacks, and the simplex to an optimality certificate on every answer.
 
 ## Performance
 
-The language lives in one self-contained header,
-[`src/include/pql/pql.hpp`](../src/include/pql/pql.hpp), which never includes a
-DuckDB header.
+The language lives in self-contained headers under
+[`src/include/pql/`](../src/include/pql/), one per part (grammar, data,
+features, each learner, training, prediction, the optimiser), pulled in by
+[`pql.hpp`](../src/include/pql/pql.hpp); none of them includes a DuckDB header.
+A learning algorithm is one header behind the `Learner` interface in
+`learner.hpp`, picked by `ARCH`.
 
 Children live in a CSR arena: one flat array per link, contiguous per-parent
 slices, and the child layer's own features and gate masks are permuted into that

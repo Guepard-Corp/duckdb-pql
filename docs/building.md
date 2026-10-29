@@ -20,7 +20,7 @@ LOAD 'build/release/extension/pql/pql.duckdb_extension';
 
 The language itself is tested without DuckDB. Each file under
 [`test/cpp`](../test/cpp) is a standalone program against
-[`pql.hpp`](../src/include/pql/pql.hpp):
+[`pql.hpp`](../src/include/pql/pql.hpp) and the headers it includes:
 
 ```bash
 make test_cpp             # parse, model, categorical, links, degenerate, fuzz, optimize
@@ -38,7 +38,7 @@ make test_cpp_sanitize    # the fuzzer, the degenerate harness, links and optimi
 | `test_optimize.cpp` | `OPTIMIZE`: grammar, expressions, the solver against brute force and exact programmes, and plans whose best answer is known |
 | `test_memory.cpp` | allocation discipline (see below) |
 
-PQL was developed inside a fork of DuckDB, where the same header is compiled
+PQL was developed inside a fork of DuckDB, where the same headers are compiled
 in-tree as part of `core_functions`. That fork, with its own tests and the
 history of the language, is the `duckdb-fork` branch of this repository.
 
