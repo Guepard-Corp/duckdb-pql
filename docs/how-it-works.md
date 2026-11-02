@@ -102,10 +102,20 @@ which is what the two-hop number above measures.
 
 ## Deciding: `OPTIMIZE`
 
-`OPTIMIZE` turns predictions into a plan. Each candidate row takes one of a few
-options (act on it or not, or one value of a `CHOOSE` column), and the plan
-maximises a total under linear limits. That is the multiple-choice knapsack
-problem, which is NP-hard, so the solver is built to say how good its answer is.
+`OPTIMIZE` turns predictions into a plan. It is one statement with three forms,
+and two solvers behind them:
+
+| form | decision | solver |
+|---|---|---|
+| plain `OPTIMIZE` | act on a row or not | the knapsack below (`solver.hpp`) |
+| `OPTIMIZE ... CHOOSE` | one value of a column per row | the knapsack below (`solver.hpp`) |
+| `OPTIMIZE ... ASSIGN` | a resource per row, optionally in sequence | the assignment search further down (`assign.hpp`), bounded through the knapsack |
+
+In the first two forms each candidate row takes one of a few options, and the
+plan maximises a total under linear limits over the whole plan. That is the
+multiple-choice knapsack problem, which is NP-hard, so the solver is built to say
+how good its answer is. `ASSIGN` is different in kind: a row's value depends on
+what else its resource does, so it is solved as a constraint model of its own.
 
 **What a choice changes** is asked of the model directly: the lever column is
 set to each value in turn for every candidate row, and the rows are predicted
@@ -138,6 +148,36 @@ lever does. The column is put back afterwards, whatever happens.
 The tests hold the solver to brute force on thousands of random problems, along
 each of these paths with the ones before it switched off, to exact programmes on
 larger knapsacks, and the simplex to an optimality certificate on every answer.
+
+**Tasks on resources: `OPTIMIZE ... ASSIGN`.** The knapsack above decides one
+option per row under global totals. `ASSIGN` is for plans where a placement's value depends on
+the rest of the resource's plan: a truck's second load starts where the first
+ended, a machine pays a changeover between two products. It is a constraint
+model, solved the way such models are in practice (`assign.hpp`):
+
+1. *Ruin.* A task is picked at random, and from the resources of its nearest
+   neighbours a short string of consecutive tasks is taken out (sometimes with
+   a few kept in the middle). Strings, not scattered tasks, are what free up
+   room: the slack lets a reinsertion reorder a whole stretch. This is SISR,
+   "slack induction by string removals" (Christiaens and Vanden Berghe, 2020),
+   among the strongest known methods for routing with time windows.
+2. *Recreate.* The removed tasks, and unplaced tasks near them, go back one at
+   a time where each adds the most, in an order drawn from a few rules (random,
+   most valuable, earliest window), each position skipped with a small chance.
+   A task worth more on nothing stays on nothing. Every position keeps the
+   latest moment its task may begin without making a later one late, so an
+   insertion is checked in constant time.
+3. *Accept* by simulated annealing on a cooling schedule; deterministic for a
+   seed. A copy of every new best is polished by local search (exchange the
+   ends of two resources' sequences, swap two tasks, move one, swap a placed
+   task for an unplaced one) and kept as the answer.
+4. *Bound.* With sequencing relaxed (every task at its cheapest possible
+   setup) the problem is a multiple-choice knapsack over the per-resource
+   limits, which the first solver bounds from above; no plan beats that bound,
+   and `EXPLAIN` reports it beside the plan. It is loose when setups matter.
+
+The model is asked once per resource and once for `ELSE`, exactly as `CHOOSE`
+asks it per value, so `prediction` is the value of *this task on this resource*.
 
 ## Performance
 

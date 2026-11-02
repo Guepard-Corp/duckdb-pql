@@ -298,6 +298,10 @@ struct FilterNode {
 	bool prediction = false;
 	CmpOp op = CmpOp::EQ;
 	std::vector<Literal> values;
+	// In ONLY IF the right-hand side may be a column too, so a task and a
+	// resource can be compared: `resource.equipment = equipment`.
+	bool rhs_is_ref = false;
+	Ref rhs;
 	// AND / OR / NOT
 	std::vector<std::unique_ptr<FilterNode>> children;
 
@@ -308,6 +312,8 @@ struct FilterNode {
 		o->prediction = prediction;
 		o->op = op;
 		o->values = values;
+		o->rhs_is_ref = rhs_is_ref;
+		o->rhs = rhs;
 		for (auto &c : children) {
 			o->children.push_back(c->Copy());
 		}
@@ -367,6 +373,9 @@ struct FilterNode {
 			}
 			return s + ")";
 		}
+		}
+		if (rhs_is_ref) {
+			return s + rhs.ToString();
 		}
 		return s + (values.empty() ? std::string("?") : values[0].ToString());
 	}
@@ -547,14 +556,30 @@ struct TemporalSplit {
 };
 
 // Arithmetic over one entity row, for OPTIMIZE's objective and constraints:
-// numbers, numeric columns, the model's `prediction`, + - * /, and CASE. Kept
-// as written so a statement echoes the way it was typed.
+// numbers, numeric columns, the model's `prediction`, + - * /, CASE,
+// DISTANCE(lat, lon, lat, lon), and in an ASSIGN statement the placement
+// values plan.setup / plan.duration / plan.begin and the columns of the
+// resource (resource.x) or the task placed before (prev.x). Kept as written so
+// a statement echoes the way it was typed.
 struct Expr {
-	enum class Kind : uint8_t { NUMBER, COLUMN, PREDICTION, NEG, ADD, SUB, MUL, DIV, CASE } kind = Kind::NUMBER;
+	enum class Kind : uint8_t {
+		NUMBER,
+		COLUMN,
+		PREDICTION,
+		NEG,
+		ADD,
+		SUB,
+		MUL,
+		DIV,
+		CASE,
+		DISTANCE,
+		PLAN
+	} kind = Kind::NUMBER;
 	double number = 0;
-	std::string text; // NUMBER: the spelling it was read with
+	std::string text; // NUMBER: the spelling it was read with; PLAN: setup, duration or begin
 	Ref ref;          // COLUMN
 	int col = -1;     // COLUMN: resolved against a frame by BindExpr
+	int frame = 0;    // COLUMN: 0 the task row, 1 the previous task (prev.), 2 the resource (resource.)
 	// NEG: one operand. ADD..DIV: two. CASE: one THEN value per condition, then
 	// the ELSE value when there is one.
 	std::vector<std::unique_ptr<Expr>> args;
@@ -572,6 +597,7 @@ struct Expr {
 		o->text = text;
 		o->ref = ref;
 		o->col = col;
+		o->frame = frame;
 		for (const auto &a : args) {
 			o->args.push_back(a->Copy());
 		}
@@ -610,6 +636,15 @@ struct Expr {
 			return ref.ToString();
 		case Kind::PREDICTION:
 			return "prediction";
+		case Kind::PLAN:
+			return "plan." + text;
+		case Kind::DISTANCE: {
+			std::string s = "DISTANCE(";
+			for (size_t i = 0; i < args.size(); i++) {
+				s += (i ? ", " : "") + args[i]->ToString();
+			}
+			return s + ")";
+		}
 		case Kind::NEG: {
 			// Two minus signs in a row would read back as a line comment.
 			const Expr &a = *args[0];
@@ -676,11 +711,92 @@ struct OptAggregate {
 
 struct OptConstraint {
 	OptAggregate total;
+	bool per = false; // PER <lever>: one limit per resource (ASSIGN only)
+	Ref per_lever;
 	bool at_most = true; // <= when true, >= otherwise
 	Literal limit;
+	bool limit_is_ref = false; // the limit is a column of the resource (resource.hours)
+	Ref limit_ref;
 
 	std::string ToString() const {
-		return total.ToString() + (at_most ? " <= " : " >= ") + limit.ToString();
+		return total.ToString() + (per ? " PER " + per_lever.ToString() : "") + (at_most ? " <= " : " >= ") +
+		       (limit_is_ref ? limit_ref.ToString() : limit.ToString());
+	}
+};
+
+// ASSIGN <lever> OVER <table>.<key> [ELSE <value>]: place every task row on a
+// resource, or on nothing. With SEQUENCE the tasks on a resource are ordered
+// and the solver knows how long each takes (DURATION), what it costs to get
+// from one to the next (START from the resource's own position, SETUP from the
+// previous task), and when a task may begin (WINDOW).
+struct AssignSpec {
+	Ref lever;             // the task column that will hold the resource key
+	Ref resources;         // OVER <table>.<key column>
+	bool has_else = false; // ELSE <value>: what the lever reads when a task is not placed
+	Literal else_value;
+	std::unique_ptr<FilterNode> only_if; // ONLY IF: which (task, resource) pairs are allowed
+	bool sequenced = false;
+	Ref free_from;                                // SEQUENCE FROM resource.<time column>
+	std::unique_ptr<Expr> start, setup, duration; // hours
+	bool has_window = false;
+	Ref window_from, window_to;
+
+	AssignSpec() = default;
+	AssignSpec(AssignSpec &&) = default;
+	AssignSpec &operator=(AssignSpec &&) = default;
+	AssignSpec(const AssignSpec &o) {
+		*this = o;
+	}
+	AssignSpec &operator=(const AssignSpec &o) {
+		if (this != &o) {
+			lever = o.lever;
+			resources = o.resources;
+			has_else = o.has_else;
+			else_value = o.else_value;
+			only_if = o.only_if ? o.only_if->Copy() : nullptr;
+			sequenced = o.sequenced;
+			free_from = o.free_from;
+			start = o.start ? o.start->Copy() : nullptr;
+			setup = o.setup ? o.setup->Copy() : nullptr;
+			duration = o.duration ? o.duration->Copy() : nullptr;
+			has_window = o.has_window;
+			window_from = o.window_from;
+			window_to = o.window_to;
+		}
+		return *this;
+	}
+
+	bool Present() const {
+		return !lever.name.empty();
+	}
+
+	std::string ToString() const {
+		std::string s = "ASSIGN " + lever.ToString() + " OVER " + resources.ToString();
+		if (has_else) {
+			s += " ELSE " + else_value.ToString();
+		}
+		if (only_if) {
+			s += " ONLY IF " + only_if->ToString();
+		}
+		if (sequenced) {
+			s += " SEQUENCE";
+			if (!free_from.name.empty()) {
+				s += " FROM " + free_from.ToString();
+			}
+			if (start) {
+				s += " START " + start->ToString();
+			}
+			if (setup) {
+				s += " SETUP " + setup->ToString();
+			}
+			if (duration) {
+				s += " DURATION " + duration->ToString();
+			}
+			if (has_window) {
+				s += " WINDOW BETWEEN " + window_from.ToString() + " AND " + window_to.ToString();
+			}
+		}
+		return s;
 	}
 };
 
@@ -693,9 +809,13 @@ struct OptimizeSpec {
 	std::vector<OptConstraint> constraints;
 	Ref lever;                    // CHOOSE <lever>; empty name means "which rows"
 	std::vector<Literal> choices; // CHOOSE ... IN (<choices>)
+	AssignSpec assign;            // ASSIGN ... OVER ...; the other way a lever is decided
 
 	bool Choosing() const {
 		return !lever.name.empty();
+	}
+	bool Assigning() const {
+		return assign.Present();
 	}
 };
 
@@ -792,6 +912,9 @@ struct Statement : StatementData {
 				s += " AT " + anchor_literal.ToString();
 			} else if (!anchor.name.empty()) {
 				s += " AT " + anchor.ToString();
+			}
+			if (o.Assigning()) {
+				s += " " + o.assign.ToString();
 			}
 			if (o.Choosing()) {
 				s += " CHOOSE " + o.lever.ToString() + " IN (";
@@ -1213,7 +1336,133 @@ private:
 
 	static bool IsClauseStart(const std::string &up) {
 		return up == "WHERE" || up == "AT" || up == "HORIZON" || up == "USING" || up == "SPLIT" || up == "OPTIONS" ||
-		       up == "EVERY" || up == "FROM" || up == "TO";
+		       up == "EVERY" || up == "FROM" || up == "TO" || up == "ASSIGN";
+	}
+
+	// The words of ASSIGN are read in place rather than reserved, so a column
+	// called start, duration or window stays usable everywhere else.
+	bool PeekWord(const char *w) const {
+		const Token &t = Peek();
+		return (t.kind == Tok::IDENT || t.kind == Tok::KEYWORD) && t.upper == w;
+	}
+	bool AcceptWord(const char *w) {
+		if (PeekWord(w)) {
+			Next();
+			return true;
+		}
+		return false;
+	}
+	void ExpectWord(const char *w) {
+		if (!AcceptWord(w)) {
+			throw ParseError(std::string("expected ") + w + " but found '" + Peek().text + "'", Peek().pos);
+		}
+	}
+
+	// Which of a task row's neighbours an expression or filter may name: the
+	// resource it is placed on, the task placed before it, and the placement
+	// values a plan gives it. Outside ASSIGN none of them exist.
+	enum Allow : uint8_t { ALLOW_RESOURCE = 1, ALLOW_PREV = 2, ALLOW_PLAN = 4 };
+	uint8_t allow_ = 0;
+	bool saw_plan_ = false; // a plan.* value was used; needs ASSIGN
+	bool saw_per_ = false;  // a PER limit was written; needs ASSIGN
+	struct AllowScope {
+		uint8_t &slot;
+		uint8_t saved;
+		AllowScope(uint8_t &s, uint8_t v) : slot(s), saved(s) {
+			slot = v;
+		}
+		~AllowScope() {
+			slot = saved;
+		}
+	};
+	void CheckQualifier(const Ref &r, uint32_t pos) const {
+		const std::string q = ToUpper(r.qualifier);
+		if (q == "PREV" && !(allow_ & ALLOW_PREV)) {
+			throw ParseError("prev. is the task placed before this one, which only SETUP knows", pos);
+		}
+		if (q == "RESOURCE" && !(allow_ & ALLOW_RESOURCE)) {
+			throw ParseError("resource. is the resource a task is placed on; it belongs in ONLY IF, in SEQUENCE's "
+			                 "expressions, and on the right of a PER limit",
+			                 pos);
+		}
+		if (q == "PLAN") {
+			throw ParseError("plan. values are plan.setup, plan.duration and plan.begin, used in a total", pos);
+		}
+	}
+
+	// ASSIGN <lever> OVER <table>.<key> [ELSE <value>] [ONLY IF <filter>]
+	//   [SEQUENCE [FROM resource.<column>] [START <expr>] [SETUP <expr>] [DURATION <expr>]
+	//             [WINDOW BETWEEN <column> AND <column>]]
+	void ParseAssign(AssignSpec &a) {
+		a.lever = ParseRef();
+		ExpectWord("OVER");
+		const Token &rt = Peek();
+		a.resources = ParseRef();
+		if (a.resources.qualifier.empty() || a.resources.name == "*") {
+			throw ParseError("OVER names the resource table and its key column, e.g. OVER trucks.unit", rt.pos);
+		}
+		if (AcceptWord("ELSE")) {
+			const Token &vt = Peek();
+			a.else_value = ParseLiteral();
+			if (a.else_value.kind == Literal::Kind::NUL) {
+				throw ParseError("ELSE names the value the lever takes when a task is placed on nothing, e.g. "
+				                 "ELSE 'carrier'; it cannot be NULL",
+				                 vt.pos);
+			}
+			a.has_else = true;
+		}
+		bool seen_only = false, seen_seq = false, seen_from = false, seen_start = false, seen_setup = false;
+		bool seen_duration = false, seen_window = false;
+		auto needs_sequence = [&](const char *what) {
+			if (!a.sequenced) {
+				throw ParseError(std::string(what) + " belongs to SEQUENCE: write SEQUENCE " + what + " ...",
+				                 Peek().pos);
+			}
+		};
+		while (true) {
+			if (PeekWord("ONLY")) {
+				Once(seen_only, "ONLY IF");
+				Next();
+				ExpectKw("IF");
+				AllowScope scope(allow_, ALLOW_RESOURCE);
+				PredScope pscope(pred_ctx_, PredCtx::REFUSED);
+				a.only_if = ParseFilter();
+			} else if (PeekWord("SEQUENCE")) {
+				Once(seen_seq, "SEQUENCE");
+				Next();
+				a.sequenced = true;
+				if (AcceptKw("FROM")) {
+					Once(seen_from, "SEQUENCE FROM");
+					const Token &ft = Peek();
+					a.free_from = ParseRef();
+					if (ToUpper(a.free_from.qualifier) != "RESOURCE") {
+						throw ParseError("SEQUENCE FROM names when each resource becomes free, a column of the "
+						                 "resource: SEQUENCE FROM resource.<column>",
+						                 ft.pos);
+					}
+				}
+			} else if (PeekWord("START") || PeekWord("SETUP") || PeekWord("DURATION")) {
+				const std::string what = Peek().upper;
+				needs_sequence(what.c_str());
+				bool &seen = what == "START" ? seen_start : what == "SETUP" ? seen_setup : seen_duration;
+				Once(seen, what.c_str());
+				Next();
+				AllowScope scope(allow_, (uint8_t)(ALLOW_RESOURCE | (what == "SETUP" ? ALLOW_PREV : 0)));
+				std::unique_ptr<Expr> e = ParseExpr();
+				(what == "START" ? a.start : what == "SETUP" ? a.setup : a.duration) = std::move(e);
+			} else if (PeekWord("WINDOW")) {
+				needs_sequence("WINDOW");
+				Once(seen_window, "WINDOW");
+				Next();
+				ExpectWord("BETWEEN");
+				a.window_from = ParseRef();
+				ExpectKw("AND");
+				a.window_to = ParseRef();
+				a.has_window = true;
+			} else {
+				break;
+			}
+		}
 	}
 
 	// [EXPLAIN] OPTIMIZE <table> [AS <alias>] [WHERE ...] [AT ...]
@@ -1232,7 +1481,8 @@ private:
 			st.entity_alias = Next().text;
 		}
 		bool seen_where = false, seen_at = false, seen_choose = false, seen_goal = false, seen_subject = false;
-		bool seen_using = false;
+		bool seen_using = false, seen_assign = false;
+		saw_plan_ = saw_per_ = false;
 		while (Peek().kind != Tok::END && !(Peek().kind == Tok::PUNCT && Peek().text == ";")) {
 			if (PeekKw("WHERE")) {
 				Once(seen_where, "WHERE");
@@ -1248,6 +1498,10 @@ private:
 				} else {
 					st.anchor = ParseRef();
 				}
+			} else if (PeekWord("ASSIGN")) {
+				Once(seen_assign, "ASSIGN");
+				Next();
+				ParseAssign(st.optimize.assign);
 			} else if (PeekKw("CHOOSE")) {
 				Once(seen_choose, "CHOOSE");
 				Next();
@@ -1315,12 +1569,33 @@ private:
 		if (st.model.empty()) {
 			throw ParseError("OPTIMIZE needs USING MODEL <name>: the model whose predictions it plans with", 0);
 		}
+		const OptimizeSpec &o = st.optimize;
+		if (o.Assigning() && o.Choosing()) {
+			throw ParseError("ASSIGN and CHOOSE both decide the lever; write one of them", 0);
+		}
+		if (saw_plan_ && !o.Assigning()) {
+			throw ParseError("plan.setup, plan.duration and plan.begin exist only in an ASSIGN statement", 0);
+		}
+		for (const auto &c : o.constraints) {
+			if (c.per && !o.Assigning()) {
+				throw ParseError("a PER limit is one limit per resource, which needs ASSIGN ... OVER ...", 0);
+			}
+			if (c.per && ToUpper(c.per_lever.name) != ToUpper(o.assign.lever.name)) {
+				throw ParseError("PER names the lever being assigned: PER " + o.assign.lever.ToString(), 0);
+			}
+			if (!c.per && o.Assigning()) {
+				throw ParseError("in an ASSIGN statement every limit is per resource: write " + c.total.ToString() +
+				                     " PER " + o.assign.lever.ToString() + " ...",
+				                 0);
+			}
+		}
 		return st;
 	}
 
 	// SUM(<expr>) | COUNT(*), then an optional FILTER (WHERE <filter>).
 	OptAggregate ParseAggregate() {
 		PredScope scope(pred_ctx_, PredCtx::ALLOWED);
+		AllowScope ascope(allow_, ALLOW_PLAN);
 		OptAggregate agg;
 		const Token &t = Peek();
 		if (PeekKw("COUNT")) {
@@ -1355,6 +1630,11 @@ private:
 	OptConstraint ParseConstraint() {
 		OptConstraint c;
 		c.total = ParseAggregate();
+		if (AcceptWord("PER")) {
+			c.per = true;
+			c.per_lever = ParseRef();
+			saw_per_ = true;
+		}
 		const Token &o = Peek();
 		if (o.kind == Tok::PUNCT && (o.text == "<=" || o.text == ">=")) {
 			c.at_most = o.text == "<=";
@@ -1367,6 +1647,17 @@ private:
 			throw ParseError("expected <= or >= after " + c.total.ToString(), o.pos);
 		}
 		const Token &lt = Peek();
+		if ((lt.kind == Tok::IDENT || lt.kind == Tok::KEYWORD) && lt.upper != "NULL") {
+			// A column of the resource as the limit: SUM(hours) PER truck <= resource.hours.
+			c.limit_ref = ParseRef();
+			c.limit_is_ref = true;
+			if (!c.per || ToUpper(c.limit_ref.qualifier) != "RESOURCE") {
+				throw ParseError("a limit is a number, or with PER a column of the resource, written "
+				                 "resource.<column>",
+				                 lt.pos);
+			}
+			return c;
+		}
 		c.limit = ParseLiteral();
 		if (c.limit.kind != Literal::Kind::NUMBER) {
 			throw ParseError("a constraint's limit is a number", lt.pos);
@@ -1494,6 +1785,41 @@ private:
 			                 t.pos);
 		}
 		if (t.kind == Tok::IDENT || t.kind == Tok::KEYWORD) {
+			if (t.upper == "DISTANCE" && Peek(1).kind == Tok::PUNCT && Peek(1).text == "(") {
+				// Great-circle miles between two points, given as (lat, lon, lat, lon).
+				Descend(t.pos);
+				Next();
+				Next();
+				node->kind = Expr::Kind::DISTANCE;
+				for (int i = 0; i < 4; i++) {
+					if (i) {
+						ExpectPunct(",");
+					}
+					node->args.push_back(ParseExpr());
+				}
+				ExpectPunct(")");
+				depth_--;
+				return node;
+			}
+			if (t.upper == "PLAN" && Peek(1).kind == Tok::PUNCT && Peek(1).text == ".") {
+				Next();
+				Next();
+				const Token &wt = Peek();
+				const std::string what = ToUpper(ExpectIdent("plan value"));
+				if (what != "SETUP" && what != "DURATION" && what != "BEGIN") {
+					throw ParseError("plan. values are plan.setup, plan.duration and plan.begin", wt.pos);
+				}
+				if (!(allow_ & ALLOW_PLAN)) {
+					throw ParseError("plan." + ToUpper(what) +
+					                     " is only known once a plan exists; use it in "
+					                     "MAXIMIZE, MINIMIZE or SUBJECT TO",
+					                 wt.pos);
+				}
+				node->kind = Expr::Kind::PLAN;
+				node->text = what == "SETUP" ? "setup" : what == "DURATION" ? "duration" : "begin";
+				saw_plan_ = true;
+				return node;
+			}
 			if (Peek(1).kind == Tok::PUNCT && Peek(1).text == "(") {
 				const bool agg =
 				    t.upper == "SUM" || t.upper == "COUNT" || t.upper == "AVG" || t.upper == "MIN" || t.upper == "MAX";
@@ -1514,6 +1840,7 @@ private:
 			if (node->ref.name == "*") {
 				throw ParseError("'" + node->ref.ToString() + "' is not a value", t.pos);
 			}
+			CheckQualifier(node->ref, t.pos);
 			return node;
 		}
 		throw ParseError("expected a number, a column, prediction, or CASE but found '" + t.text + "'", t.pos);
@@ -1753,7 +2080,9 @@ private:
 			node->prediction = true;
 			node->ref.name = "prediction";
 		} else {
+			const uint32_t pos = Peek().pos;
 			node->ref = ParseRef();
+			CheckQualifier(node->ref, pos);
 		}
 		const Token &t = Peek();
 		if (t.kind == Tok::KEYWORD && t.upper == "IS") {
@@ -1804,6 +2133,14 @@ private:
 			throw ParseError("unknown comparison operator '" + o.text + "'", o.pos);
 		}
 		Next();
+		const Token &rt = Peek();
+		if ((allow_ & ALLOW_RESOURCE) && (rt.kind == Tok::IDENT || (rt.kind == Tok::KEYWORD && rt.upper != "NULL"))) {
+			// A column on the right, which only ONLY IF evaluates (two rows at once).
+			node->rhs = ParseRef();
+			node->rhs_is_ref = true;
+			CheckQualifier(node->rhs, rt.pos);
+			return node;
+		}
 		node->values.push_back(ParseLiteral());
 		return node;
 	}

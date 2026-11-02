@@ -114,4 +114,5 @@
 #include "pql/train.hpp"
 #include "pql/predict.hpp"
 #include "pql/solver.hpp"
+#include "pql/assign.hpp"
 #include "pql/optimize.hpp"

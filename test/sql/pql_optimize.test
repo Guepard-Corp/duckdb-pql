@@ -233,3 +233,152 @@ EXPLAIN SELECT 42;
 # and a script mixing the two runs in order
 statement ok
 SELECT 1; OPTIMIZE trucks WHERE id < 10 MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 1 USING MODEL breakdown; SELECT 2;
+
+# ---------------------------------------------------------------------------
+# ASSIGN: tasks on resources, in sequence, under one limit per resource
+
+statement ok
+CREATE TABLE crews AS SELECT * FROM (VALUES
+  ('A', 'van',    40.0, -75.0, 20.0, TIMESTAMP '2026-03-02 06:00'),
+  ('B', 'van',    41.0, -74.0, 16.0, TIMESTAMP '2026-03-02 08:00'),
+  ('C', 'reefer', 40.5, -76.0, 24.0, TIMESTAMP '2026-03-02 06:00'),
+  ('D', 'van',    39.5, -75.5, 12.0, TIMESTAMP '2026-03-02 10:00')) t(crew, kind, lat, lon, hours, free_from);
+
+# Thirty past jobs carry the crew that did them and the margin made; six are open.
+statement ok
+CREATE TABLE jobs AS
+SELECT i AS job_id,
+       TIMESTAMP '2026-01-05' + INTERVAL (i * 2) DAY AS received_at,
+       39.5 + ((i * 7) % 20) / 10.0 AS from_lat, -76.5 + ((i * 11) % 30) / 10.0 AS from_lon,
+       39.5 + ((i * 13) % 20) / 10.0 AS to_lat,  -76.5 + ((i * 3) % 30) / 10.0 AS to_lon,
+       60 + (i * 37) % 180 AS miles,
+       400 + (i * 53) % 900 AS rate,
+       CASE WHEN i % 5 = 0 THEN 'reefer' ELSE 'van' END AS kind,
+       TIMESTAMP '2026-03-02 06:00' + INTERVAL ((i % 3) * 8) HOUR AS window_from,
+       TIMESTAMP '2026-03-02 06:00' + INTERVAL ((i % 3) * 8 + 10) HOUR AS window_to,
+       CASE WHEN i < 30 THEN (ARRAY['A','B','C','D','none'])[1 + i % 5] ELSE 'none' END AS crew,
+       CASE WHEN i < 30 THEN
+            CASE WHEN i % 5 = 4 THEN (400 + (i * 53) % 900) * 0.10
+                 ELSE (400 + (i * 53) % 900) * (0.35 + 0.02 * (i % 5)) - (60 + (i * 37) % 180) * 0.8 END
+       END AS margin,
+       (i >= 30)::INT AS open
+FROM range(36) t(i);
+
+statement ok
+TRAIN MODEL job_margin PREDICT jobs.margin FOR jobs AT received_at WHERE open = 0
+  EXCLUDE (job_id, open) OPTIONS (epochs = 40, hidden = 16, seed = 1);
+
+# The plan carries where each job sits and what the placement cost; a job on
+# nothing has no sequence.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pql_exec($$
+  OPTIMIZE jobs WHERE open = 1 AT received_at
+    ASSIGN crew OVER crews.crew ELSE 'none'
+      ONLY IF resource.kind = kind OR (resource.kind = 'reefer' AND kind = 'van')
+      SEQUENCE FROM resource.free_from
+        START DISTANCE(resource.lat, resource.lon, from_lat, from_lon) / 40
+        SETUP DISTANCE(prev.to_lat, prev.to_lon, from_lat, from_lon) / 40
+        DURATION miles / 40 + 1
+        WINDOW BETWEEN window_from AND window_to
+    MAXIMIZE SUM(prediction - plan.setup * 60)
+    SUBJECT TO SUM(plan.setup + plan.duration) PER crew <= resource.hours
+    USING MODEL job_margin$$));
+----
+job_id	BIGINT
+received_at	TIMESTAMP
+crew	VARCHAR
+prediction	DOUBLE
+objective	DOUBLE
+sequence	BIGINT
+begin	TIMESTAMP
+setup	DOUBLE
+duration	DOUBLE
+
+# Every job is in the plan; the reefer crew takes the two reefer-compatible
+# jobs in order, each beginning inside its window, and the rest go to nothing.
+query ITII
+SELECT job_id, p.crew, sequence, (begin BETWEEN window_from AND window_to)::INT
+FROM pql_exec($$
+  OPTIMIZE jobs WHERE open = 1 AT received_at
+    ASSIGN crew OVER crews.crew ELSE 'none'
+      ONLY IF resource.kind = kind OR (resource.kind = 'reefer' AND kind = 'van')
+      SEQUENCE FROM resource.free_from
+        START DISTANCE(resource.lat, resource.lon, from_lat, from_lon) / 40
+        SETUP DISTANCE(prev.to_lat, prev.to_lon, from_lat, from_lon) / 40
+        DURATION miles / 40 + 1
+        WINDOW BETWEEN window_from AND window_to
+    MAXIMIZE SUM(prediction - plan.setup * 60)
+    SUBJECT TO SUM(plan.setup + plan.duration) PER crew <= resource.hours
+    USING MODEL job_margin$$) p JOIN jobs USING (job_id)
+ORDER BY job_id;
+----
+30	C	0	1
+31	none	NULL	NULL
+32	none	NULL	NULL
+33	C	1	1
+34	none	NULL	NULL
+35	none	NULL	NULL
+
+# EXPLAIN reports each limit per resource, against that resource's own cap.
+query TRR
+SELECT measure, round(value, 1), round(bound, 1) FROM pql_exec($$
+  EXPLAIN OPTIMIZE jobs WHERE open = 1 AT received_at
+    ASSIGN crew OVER crews.crew ELSE 'none'
+      ONLY IF resource.kind = kind OR (resource.kind = 'reefer' AND kind = 'van')
+      SEQUENCE FROM resource.free_from
+        START DISTANCE(resource.lat, resource.lon, from_lat, from_lon) / 40
+        SETUP DISTANCE(prev.to_lat, prev.to_lon, from_lat, from_lon) / 40
+        DURATION miles / 40 + 1
+        WINDOW BETWEEN window_from AND window_to
+    MAXIMIZE SUM(prediction - plan.setup * 60)
+    SUBJECT TO SUM(plan.setup + plan.duration) PER crew <= resource.hours
+    USING MODEL job_margin$$)
+WHERE measure LIKE '%for%' OR measure = 'rows';
+----
+SUM(plan.setup + plan.duration) PER crew <= resource."hours" for 'A'	0.0	20.0
+SUM(plan.setup + plan.duration) PER crew <= resource."hours" for 'B'	0.0	16.0
+SUM(plan.setup + plan.duration) PER crew <= resource."hours" for 'C'	10.4	24.0
+SUM(plan.setup + plan.duration) PER crew <= resource."hours" for 'D'	0.0	12.0
+rows	6.0	NULL
+
+# Without SEQUENCE it is an assignment under per-resource counts: one job per
+# crew, the plan meets its bound.
+query TRR
+SELECT measure, round(value, 2), round(bound, 2) FROM pql_exec($$
+  EXPLAIN OPTIMIZE jobs WHERE open = 1 AT received_at
+    ASSIGN crew OVER crews.crew ELSE 'none' ONLY IF resource.kind = kind
+    MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) PER crew <= 1 USING MODEL job_margin$$)
+WHERE measure = 'objective' OR measure LIKE 'crew = %';
+----
+objective	1424.12	1424.12
+crew = 'A'	0.00	NULL
+crew = 'B'	1.00	NULL
+crew = 'C'	1.00	NULL
+crew = 'D'	1.00	NULL
+crew = 'none'	3.00	NULL
+
+# What ASSIGN refuses.
+statement error
+OPTIMIZE jobs WHERE open = 1 AT received_at ASSIGN crew OVER crews.crew MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 2 USING MODEL job_margin;
+----
+every limit is per resource
+
+statement error
+OPTIMIZE jobs WHERE open = 1 AT received_at ASSIGN crew OVER crews.nope ELSE 'none' MAXIMIZE SUM(prediction) USING MODEL job_margin;
+----
+not a column of 'crews'
+
+statement error
+OPTIMIZE jobs WHERE open = 1 AT received_at ASSIGN crew OVER crews.crew ELSE 'A' MAXIMIZE SUM(prediction) USING MODEL job_margin;
+----
+also a key of 'crews'
+
+statement error
+OPTIMIZE jobs WHERE open = 1 AT received_at ASSIGN crew OVER crews.crew CHOOSE crew IN ('A') MAXIMIZE SUM(prediction) USING MODEL job_margin;
+----
+ASSIGN and CHOOSE both decide the lever
+
+statement error
+OPTIMIZE jobs WHERE open = 1 AT received_at CHOOSE crew IN ('A', 'B') MAXIMIZE SUM(prediction - plan.setup) USING MODEL job_margin;
+----
+exist only in an ASSIGN statement

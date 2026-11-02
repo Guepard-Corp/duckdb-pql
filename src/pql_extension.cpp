@@ -800,6 +800,14 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 	// nothing else is read at all.
 	std::set<std::string> want;
 	want.insert(pql::ToUpper(stmt.entity_table));
+	// ASSIGN places the entity's rows on the rows of another table; that table
+	// is read whole, like the entity, since its text columns take part in ONLY IF.
+	const std::string resource_up = stmt.kind == pql::StmtKind::OPTIMIZE && stmt.optimize.Assigning()
+	                                    ? pql::ToUpper(stmt.optimize.assign.resources.qualifier)
+	                                    : std::string();
+	if (!resource_up.empty()) {
+		want.insert(resource_up);
+	}
 	if (!stmt.target.target_table.empty() && stmt.target.target_table != "*") {
 		want.insert(pql::ToUpper(stmt.target.target_table));
 	}
@@ -895,7 +903,7 @@ static pql::Database LoadDatabase(ClientContext &context, const pql::Statement &
 		}
 		// The entity's own text columns are features, so they are read. Elsewhere a
 		// text column is still only read when a filter or a key names it.
-		const bool is_entity = pql::ToUpper(t.name) == entity_up;
+		const bool is_entity = pql::ToUpper(t.name) == entity_up || pql::ToUpper(t.name) == resource_up;
 		std::vector<size_t> keep;
 		for (size_t c = 0; c < t.columns.size(); c++) {
 			const pql::ColType ty = t.types[c];
@@ -1249,13 +1257,22 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 			bind.Emit({Value("status quo"), Value::DOUBLE(out.status_quo), none});
 		}
 		for (size_t j = 0; j < spec.constraints.size(); j++) {
+			if (out.assigning) {
+				// One row per resource: its usage against its own cap.
+				for (size_t r = 0; r < out.resources; r++) {
+					bind.Emit({Value(spec.constraints[j].ToString() + " for " + out.choices[r].ToString()),
+					           Value::DOUBLE(out.usage_per[j][r]), Value::DOUBLE(out.caps_per[j * out.resources + r])});
+				}
+				continue;
+			}
 			bind.Emit({Value(spec.constraints[j].ToString()), Value::DOUBLE(out.usage[j]),
 			           Value::DOUBLE(spec.constraints[j].limit.number)});
 		}
 		bind.Emit({Value("rows"), Value::DOUBLE((double)out.candidates), none});
 		if (out.choosing) {
-			for (size_t k = 0; k < spec.choices.size(); k++) {
-				bind.Emit({Value(spec.lever.ToString() + " = " + spec.choices[k].ToString()),
+			const pql::Ref &lever_ref = out.assigning ? spec.assign.lever : spec.lever;
+			for (size_t k = 0; k < out.choices.size(); k++) {
+				bind.Emit({Value(lever_ref.ToString() + " = " + out.choices[k].ToString()),
 				           Value::DOUBLE((double)out.counts[k]), none});
 			}
 		} else {
@@ -1296,7 +1313,7 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		}
 	}
 	auto lever_value = [&](int k) -> Value {
-		const pql::Literal &v = spec.choices[(size_t)k];
+		const pql::Literal &v = out.choices[(size_t)k];
 		switch (lever->type) {
 		case pql::ColType::CATEGORY:
 			return Value(v.text);
@@ -1322,6 +1339,17 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	bind.types.push_back(LogicalType::DOUBLE);
 	bind.names.push_back("objective");
 	bind.types.push_back(LogicalType::DOUBLE);
+	if (out.assigning) {
+		// Where the task sits on its resource and what the placement cost it.
+		bind.names.push_back("sequence");
+		bind.types.push_back(LogicalType::BIGINT);
+		bind.names.push_back("begin");
+		bind.types.push_back(out.begin_is_timestamp ? LogicalType::TIMESTAMP : LogicalType::DOUBLE);
+		bind.names.push_back("setup");
+		bind.types.push_back(LogicalType::DOUBLE);
+		bind.names.push_back("duration");
+		bind.types.push_back(LogicalType::DOUBLE);
+	}
 	bind.Begin(context);
 	std::vector<Value> row;
 	for (const auto &r : out.plan) {
@@ -1336,6 +1364,19 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		}
 		row.push_back(Value::DOUBLE(r.prediction));
 		row.push_back(Value::DOUBLE(r.objective));
+		if (out.assigning) {
+			const bool placed = r.sequence >= 0;
+			row.push_back(placed ? Value::BIGINT(r.sequence) : Value(LogicalType::BIGINT));
+			if (!placed) {
+				row.push_back(Value(out.begin_is_timestamp ? LogicalType::TIMESTAMP : LogicalType::DOUBLE));
+			} else if (out.begin_is_timestamp) {
+				row.push_back(Value::TIMESTAMP(timestamp_t((int64_t)std::llround(r.begin))));
+			} else {
+				row.push_back(Value::DOUBLE(r.begin));
+			}
+			row.push_back(placed ? Value::DOUBLE(r.setup) : Value(LogicalType::DOUBLE));
+			row.push_back(placed ? Value::DOUBLE(r.duration) : Value(LogicalType::DOUBLE));
+		}
 		bind.Emit(row);
 	}
 }

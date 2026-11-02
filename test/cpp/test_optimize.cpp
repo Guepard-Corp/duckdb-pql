@@ -75,6 +75,33 @@ static void Err(const std::string &sql, const char *want) {
 	}
 }
 
+// ASSIGN: the clause echoes as written, and what it refuses.
+static void AssignGrammar() {
+	printf("== grammar: ASSIGN echoes as written\n");
+	Ok("OPTIMIZE jobs WHERE open = 1 AT received_at ASSIGN crew OVER crews.crew ELSE 'none' "
+	   "ONLY IF (resource.kind = kind OR (resource.kind = 'reefer' AND kind = 'van')) "
+	   "SEQUENCE FROM resource.free_from START DISTANCE(resource.lat, resource.lon, from_lat, from_lon) / 40 "
+	   "SETUP DISTANCE(prev.to_lat, prev.to_lon, from_lat, from_lon) / 40 DURATION miles / 40 + 1 "
+	   "WINDOW BETWEEN window_from AND window_to MAXIMIZE SUM(prediction - plan.setup * 60) "
+	   "SUBJECT TO SUM(plan.setup + plan.duration) PER crew <= resource.\"hours\" USING MODEL m");
+	Ok("OPTIMIZE shifts ASSIGN nurse OVER nurses.id ONLY IF resource.grade >= grade MAXIMIZE SUM(prediction) "
+	   "SUBJECT TO COUNT(*) PER nurse <= resource.max_shifts AND SUM(load) PER nurse <= 40 USING MODEL fit");
+	printf("== grammar: what ASSIGN refuses\n");
+	Err("OPTIMIZE t ASSIGN a OVER r.id CHOOSE a IN ('x') MAXIMIZE SUM(prediction) USING MODEL m",
+	    "ASSIGN and CHOOSE both decide the lever");
+	Err("OPTIMIZE t MAXIMIZE SUM(plan.setup) USING MODEL m", "exist only in an ASSIGN statement");
+	Err("OPTIMIZE t MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) PER a <= 3 USING MODEL m", "needs ASSIGN");
+	Err("OPTIMIZE t ASSIGN a OVER r.id MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 3 USING MODEL m",
+	    "every limit is per resource");
+	Err("OPTIMIZE t ASSIGN a OVER r MAXIMIZE SUM(prediction) USING MODEL m", "resource table and its key column");
+	Err("OPTIMIZE t ASSIGN a OVER r.id START 1 MAXIMIZE SUM(prediction) USING MODEL m", "belongs to SEQUENCE");
+	Err("OPTIMIZE t ASSIGN a OVER r.id SEQUENCE START prev.x MAXIMIZE SUM(prediction) USING MODEL m",
+	    "only SETUP knows");
+	Err("OPTIMIZE t ASSIGN a OVER r.id MAXIMIZE SUM(plan.hours) USING MODEL m",
+	    "plan.setup, plan.duration and plan.begin");
+	Err("OPTIMIZE t ASSIGN a OVER r.id MAXIMIZE SUM(resource.x) USING MODEL m", "belongs in ONLY IF");
+}
+
 static void Grammar() {
 	std::printf("== grammar: accepts, and echoes as written\n");
 	Ok("OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL m",
@@ -1729,6 +1756,7 @@ static void EndToEndSage() {
 
 int main() {
 	Grammar();
+	AssignGrammar();
 	Expressions();
 	Simplex();
 	SolverVsBrute();

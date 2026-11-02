@@ -22,16 +22,23 @@ EXPLAIN MODEL <name> [ FOR <table> ] [ WHERE <filter> ]
 
 DROP MODEL [IF EXISTS] <name>
 
-[EXPLAIN] OPTIMIZE <table> [AS <alias>]
-  [ WHERE <filter> ]                        -- the rows a plan may act on
-  [ AT <column> | AT <timestamp> ]
-  [ CHOOSE <column> IN (<value>, ...) ]     -- a value per row, instead of which rows
+[EXPLAIN] OPTIMIZE <table> [AS <alias>]   -- one statement, three forms:
+  [ WHERE <filter> ]                        --   neither clause: which rows to act on
+  [ AT <column> | AT <timestamp> ]          --   CHOOSE: a value per row
+                                            --   ASSIGN: a resource per row (at most one of the two)
+  [ CHOOSE <column> IN (<value>, ...) ]
+  [ ASSIGN <column> OVER <table>.<key> [ ELSE <value> ]
+      [ ONLY IF <filter> ]
+      [ SEQUENCE [ FROM resource.<column> ]
+          [ START <expression> ] [ SETUP <expression> ] [ DURATION <expression> ]
+          [ WINDOW BETWEEN <column> AND <column> ] ] ]
   MAXIMIZE | MINIMIZE <total>
   [ SUBJECT TO <total> (<= | >=) <number> [ AND ... ] ]
   USING MODEL <name>
 
   <total> := SUM(<expression>) [ FILTER (WHERE <filter>) ]
            | COUNT(*)          [ FILTER (WHERE <filter>) ]
+  with ASSIGN, each limit is per resource:  <total> PER <column> (<= | >=) (<number> | resource.<column>)
 
 SELECT * FROM pql_models()               -- the models in this session
 ```
@@ -123,7 +130,20 @@ batch rather than laid out as a vector, so there is nothing to permute.
 ### `OPTIMIZE`: from a prediction to a decision
 
 A prediction says what will happen. `OPTIMIZE` says what to do about it, given
-what each action is worth and what you can afford. It asks one of two things.
+what each action is worth and what you can afford. It is one statement with
+three forms, which differ in what is decided:
+
+| form | decides | limits | rows interact | solver |
+|---|---|---|---|---|
+| no `CHOOSE` or `ASSIGN` | which rows to act on | totals over the plan | only through the totals | multiple-choice knapsack |
+| `CHOOSE <column> IN (...)` | one value per row, from a list | totals over the plan | only through the totals | multiple-choice knapsack |
+| `ASSIGN <column> OVER <table>.<key>` | which row of another table (a resource) each row goes to, or none | per resource (`PER`), and with `SEQUENCE` the order, setups and time windows | through the resource they share | string-removal search, with a knapsack bound |
+
+The first two are covered here. `ASSIGN` has [its own section](#optimize--assign-tasks-on-resources):
+with it, a row's value depends on what else its resource does (a crew's hours
+run out, a truck's next load starts where the last one ended), which a choice
+per row under global totals cannot express. A statement uses `CHOOSE` or
+`ASSIGN`, not both.
 
 **Which rows to act on.** Five service bays this week, a breakdown costs 4200,
 a service costs what the truck's row says:
@@ -265,6 +285,70 @@ PREDICT COUNT(txns) FOR accounts WHERE balance < -100 USING MODEL churn;
 | `MAX_CATEGORIES` | 16 | 0 to 4096; above it a text column is frequency-encoded rather than given a slot per value |
 | `L2` | 0 | 0 to 1; decoupled weight decay, on weights and not biases |
 | `LOG_TARGET` | 0 | 0 or 1; fit a non-negative attribute on `log1p` and read it back with `expm1` (skewed counts and amounts) |
+
+### OPTIMIZE ... ASSIGN: tasks on resources
+
+`ASSIGN` is the third form of `OPTIMIZE`: the same statement, the same
+`MAXIMIZE`/`MINIMIZE`, `SUBJECT TO`, `USING MODEL` and `EXPLAIN`, with the
+decision being a resource per row instead of a yes/no or a value. It places
+every row of the table (a task) on a row of another table (a resource), or on
+nothing, and judges the plan by the same totals. It is the
+form for problems where a placement's value depends on what else the
+resource does: loads on trucks, jobs on machines with changeovers, visits on
+technicians' days, shifts on staff with a cap each.
+
+```
+OPTIMIZE orders WHERE week = 1 AT received_at
+  ASSIGN truck OVER trucks.unit ELSE 'carrier'
+    ONLY IF resource.equipment = equipment
+         OR (resource.equipment = 'reefer' AND equipment = 'dry_van')
+    SEQUENCE FROM resource.free_from
+      START    1.17 * DISTANCE(resource.lat, resource.lon, pickup_lat, pickup_lon) / 50
+      SETUP    1.17 * DISTANCE(prev.delivery_lat, prev.delivery_lon, pickup_lat, pickup_lon) / 50
+      DURATION miles / 50 + 4
+      WINDOW BETWEEN pickup_from AND pickup_to
+  MAXIMIZE SUM(prediction - plan.setup * 50 * 1.24)
+  SUBJECT TO SUM(plan.setup + plan.duration) PER truck <= resource.hours
+  USING MODEL margin_bd;
+```
+
+- `ASSIGN <column> OVER <table>.<key>`: the task column that will hold the
+  resource's key, and the resource table with its key column. The model must
+  read that column (as with `CHOOSE`), and must have seen every key, and the
+  `ELSE` value, while training: the plan asks it "what is this task worth on
+  this resource?" by setting the column and predicting again.
+- `ELSE <value>`: what the column reads when a task is placed on nothing. Without
+  it every task must be placed.
+- `ONLY IF <filter>`: which pairings are allowed. The filter may compare a task
+  column with a resource column (`resource.<column>`), or either with a value.
+- `SEQUENCE`: the tasks on a resource are ordered. `START` is the hours from the
+  resource's own state to its first task, `SETUP` the hours between consecutive
+  tasks (`prev.<column>` is the task placed before), `DURATION` the hours a task
+  occupies the resource; each may name task and resource columns. `WINDOW`
+  gives two task columns a task must begin between; `FROM resource.<column>` is
+  when each resource becomes free. Windows and `FROM` are timestamps, or
+  numbers on one clock in hours. Without `SEQUENCE` the plan is an assignment
+  under per-resource limits.
+- `DISTANCE(lat1, lon1, lat2, lon2)` is great-circle miles, usable in any
+  expression.
+- In the totals, `plan.setup`, `plan.duration` and `plan.begin` are the
+  placement's values (hours; `begin` on the clock). They must enter a total
+  linearly, so the solver can price a placement.
+- `SUBJECT TO <total> PER <column> <= <number | resource.<column>>`: one limit
+  per resource; a limit may use `plan.setup` and `plan.duration`.
+
+The plan has one row per task, in table order, with the lever column holding
+the resource key or the `ELSE` value, `prediction`, `objective`, and then
+`sequence` (its position on the resource, NULL when placed on nothing),
+`begin` (a timestamp when the windows are timestamps, otherwise hours),
+`setup` and `duration`.
+
+`EXPLAIN` reports the objective and its bound, then each limit once per
+resource (`<limit> for <key>`: that resource's usage against its own cap),
+the number of rows, and how many tasks each resource and the `ELSE` value
+received. The bound relaxes the sequencing (every task at its cheapest
+possible setup) and is a true upper limit; `value = bound` means the plan is
+proven best.
 
 ### Result columns
 
