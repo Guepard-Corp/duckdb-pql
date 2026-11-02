@@ -4,6 +4,10 @@
 # distribution pipeline uses, plus the fuzzer and degenerate-data harness under
 # sanitizers, which is how most of what they guard was found.
 #
+# The macOS job runs on the Intel pool: the hosted arm64 pool (macos-latest)
+# is capacity-constrained and repeatedly cancelled the job before it started.
+# Apple clang and libc++ are the same on both.
+#
 name: Language Tests
 on:
   push:
@@ -22,7 +26,7 @@ jobs:
             cxx: g++
           - os: ubuntu-latest
             cxx: clang++
-          - os: macos-latest
+          - os: macos-15-intel
             cxx: clang++
     steps:
       - uses: actions/checkout@v4
