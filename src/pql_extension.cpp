@@ -6,8 +6,8 @@
 // The extension is maintained on two branches, as the community-extensions
 // guide recommends for an extension that cannot satisfy both APIs at once:
 //
-//   main  -> stable DuckDB (v1.5.5), the descriptor's `ref`
-//   next  -> DuckDB main,            the descriptor's `ref_next`
+//   main  -> DuckDB v1.5.x, the registry descriptor's `variegata`
+//   next  -> DuckDB v2.0,   the registry descriptor's `ref`
 //
 // Only this file differs between them. The language itself,
 // src/include/pql/pql.hpp, is identical on both and includes no DuckDB header.

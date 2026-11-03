@@ -316,10 +316,10 @@ the plan is proven best. The full grammar is in the
 
 ## DuckDB version support
 
-| branch | builds against | used by the registry as |
+| branch | builds against | descriptor key in the registry |
 |---|---|---|
-| `main` | the current stable DuckDB (v1.5.5) | `ref` |
-| `next` | DuckDB `main` (v2.0-cyanoptera) | `ref_next` |
+| `main` | DuckDB v1.5.x (the `v1.5-variegata` line) | `variegata` |
+| `next` | DuckDB v2.0 (`v2.0-cyanoptera`, the registry's current stable) | `ref` |
 
 PQL is a parser extension, and the parser extension API changed between the
 two: on v1.5.5 it receives the statement as a string, on v2.0 as a token
@@ -327,10 +327,11 @@ stream it reports back how much of it consumed. Result column names changed
 type as well. One source file, `src/pql_extension.cpp`, differs between the
 branches; the language itself is the same file on both.
 
-Keeping both means the registry tests PQL against the next DuckDB release on
-every change, so PQL keeps working the day that release ships rather than
-disappearing until someone fixes it. When v2.0 is released, `next` becomes
-`main`.
+The registry builds each DuckDB line from the commit its key names
+(`scripts/build.py` in duckdb/community-extensions: `variegata` for v1.5.x,
+`ref` for the current stable, `ref_next` for a prerelease when one is being
+tested). Keeping both branches is what lets PQL ship for both lines at once.
+When v1.5.x support is dropped, `next` becomes `main`.
 
 ## Learn more
 

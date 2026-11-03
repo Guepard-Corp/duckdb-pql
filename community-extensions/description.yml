@@ -5,7 +5,7 @@
 extension:
   name: pql
   description: Predictive queries as SQL. TRAIN a model on the tables you already have, PREDICT with it, BACKTEST it, and OPTIMIZE a plan from its predictions.
-  version: 0.2.0
+  version: 0.3.0
   language: C++
   build: cmake
   license: MIT
