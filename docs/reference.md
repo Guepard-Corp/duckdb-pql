@@ -359,6 +359,12 @@ the resource key or the `ELSE` value, `prediction`, `objective`, and then
 `begin` (a timestamp when the windows are timestamps, otherwise hours),
 `setup` and `duration`.
 
+When the plan is a pure pairing (every limit is `COUNT(*) PER <lever> <=` a cap,
+and the tasks are not sequenced, or each resource takes at most one task with no
+`WINDOW`), what each task is worth on each resource is known up front, and PQL
+solves it exactly with the Hungarian algorithm: the bound equals the objective.
+Anything else (routes, sums such as hours, floors, windows) is searched.
+
 `EXPLAIN` reports the objective and its bound, then each limit once per
 resource (`<limit> for <key>`: that resource's usage against its own cap),
 the number of rows, and how many tasks each resource and the `ELSE` value

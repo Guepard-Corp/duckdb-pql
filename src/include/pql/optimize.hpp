@@ -4,6 +4,7 @@
 #pragma once
 
 #include "pql/assign.hpp"
+#include "pql/pairing.hpp"
 #include "pql/predict.hpp"
 #include "pql/solver.hpp"
 
@@ -962,8 +963,12 @@ inline OptimizeOutcome RunAssign(Database &db, const Frame &entity, const std::s
 		}
 	}
 
-	AssignSettings settings;
-	const AssignSolution sol = SolveAssign(P, settings, cancelled);
+	// A pure pairing has an exact answer; anything else is searched.
+	AssignSolution sol;
+	if (!SolvePairing(P, sol)) {
+		AssignSettings settings;
+		sol = SolveAssign(P, settings, cancelled);
+	}
 	if (!sol.feasible) {
 		throw std::runtime_error("pql: found no plan that places every task that must be placed inside every "
 		                         "window and limit. Loosen a limit, widen a window, or give the plan an ELSE");
