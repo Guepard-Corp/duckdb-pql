@@ -1231,20 +1231,23 @@ static void RunBacktestStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 // (every candidate when CHOOSE is used, with the value chosen), keyed and
 // anchored the way PREDICT's rows are, so it joins back the same way.
 static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBindData &bind) {
+	// Without USING MODEL the plan stands on the table's own columns.
 	std::shared_ptr<const pql::Model> model;
-	{
+	if (!stmt.model.empty()) {
 		auto entry = GetRegistryEntry(context);
 		std::lock_guard<std::mutex> guard(entry->lock);
 		model = entry->registry.Get(stmt.model);
-	}
-	if (!model) {
-		throw InvalidInputException("pql: no model named '%s'; TRAIN it first", stmt.model);
+		if (!model) {
+			throw InvalidInputException("pql: no model named '%s'; TRAIN it first", stmt.model);
+		}
 	}
 	// The model's target decides which tables matter, as it does for PREDICT.
 	pql::Statement load = stmt;
-	load.target = model->spec_stmt.target;
+	if (model) {
+		load.target = model->spec_stmt.target;
+	}
 	pql::Database db = LoadDatabase(context, load);
-	const auto out = pql::RunOptimize(db, *model, stmt, [&context]() { CheckCancelled(context); });
+	const auto out = pql::RunOptimize(db, model.get(), stmt, [&context]() { CheckCancelled(context); });
 	const pql::OptimizeSpec &spec = stmt.optimize;
 
 	if (spec.explain) {
@@ -1285,15 +1288,20 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 	const int key_col = EntityKeyColumn(db, entity);
 	const LogicalType key_logical =
 	    key_col >= 0 ? KeyLogicalType(entity.columns[(size_t)key_col]) : LogicalType::BIGINT;
-	// The anchor is reported exactly when PREDICT would report it.
+	// The anchor is reported exactly when PREDICT would report it; a plan without a
+	// model predicts nothing, so it has none.
 	pql::Statement eff = stmt;
-	if (eff.anchor.name.empty() && !eff.anchor_is_literal) {
+	if (model && eff.anchor.name.empty() && !eff.anchor_is_literal) {
 		eff.anchor = model->spec_stmt.anchor;
 	}
-	eff.every = model->spec_stmt.every;
-	const bool generated_anchor = model->spec_stmt.every.present;
-	const int anchor_out = (eff.anchor_is_literal || generated_anchor) ? -1 : pql::ResolveAnchorColumn(entity, eff);
-	const bool with_anchor = anchor_out >= 0 || ((eff.anchor_is_literal || generated_anchor) && !out.plan.empty());
+	if (model) {
+		eff.every = model->spec_stmt.every;
+	}
+	const bool generated_anchor = model && model->spec_stmt.every.present;
+	const int anchor_out =
+	    !model ? -1 : (eff.anchor_is_literal || generated_anchor) ? -1 : pql::ResolveAnchorColumn(entity, eff);
+	const bool with_anchor =
+	    model && (anchor_out >= 0 || ((eff.anchor_is_literal || generated_anchor) && !out.plan.empty()));
 	LogicalType lever_logical = LogicalType::VARCHAR;
 	const pql::Column *lever = out.lever_col >= 0 ? &entity.columns[(size_t)out.lever_col] : nullptr;
 	if (lever) {
@@ -1312,8 +1320,14 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 			break;
 		}
 	}
+	// ASSIGN without a model may name a lever column the table does not have: the
+	// plan still says, as text, which resource each task went to.
+	const bool lever_out = lever != nullptr || out.assigning;
 	auto lever_value = [&](int k) -> Value {
 		const pql::Literal &v = out.choices[(size_t)k];
+		if (!lever) {
+			return Value(v.kind == pql::Literal::Kind::STRING ? v.text : v.ToString());
+		}
 		switch (lever->type) {
 		case pql::ColType::CATEGORY:
 			return Value(v.text);
@@ -1331,12 +1345,14 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		bind.names.push_back(anchor_out >= 0 ? entity.columns[(size_t)anchor_out].name : std::string("anchor"));
 		bind.types.push_back(LogicalType::TIMESTAMP);
 	}
-	if (lever) {
-		bind.names.push_back(lever->name);
+	if (lever_out) {
+		bind.names.push_back(lever ? lever->name : stmt.optimize.assign.lever.name);
 		bind.types.push_back(lever_logical);
 	}
-	bind.names.push_back("prediction");
-	bind.types.push_back(LogicalType::DOUBLE);
+	if (model) {
+		bind.names.push_back("prediction");
+		bind.types.push_back(LogicalType::DOUBLE);
+	}
 	bind.names.push_back("objective");
 	bind.types.push_back(LogicalType::DOUBLE);
 	if (out.assigning) {
@@ -1359,10 +1375,12 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		if (with_anchor) {
 			row.push_back(Value::TIMESTAMP(timestamp_t((int64_t)r.anchor)));
 		}
-		if (lever) {
+		if (lever_out) {
 			row.push_back(lever_value(r.choice));
 		}
-		row.push_back(Value::DOUBLE(r.prediction));
+		if (model) {
+			row.push_back(Value::DOUBLE(r.prediction));
+		}
 		row.push_back(Value::DOUBLE(r.objective));
 		if (out.assigning) {
 			const bool placed = r.sequence >= 0;

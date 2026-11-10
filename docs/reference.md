@@ -34,7 +34,7 @@ DROP MODEL [IF EXISTS] <name>
           [ WINDOW BETWEEN <column> AND <column> ] ] ]
   MAXIMIZE | MINIMIZE <total>
   [ SUBJECT TO <total> (<= | >=) <number> [ AND ... ] ]
-  USING MODEL <name>
+  [ USING MODEL <name> ]                    -- only to plan with `prediction` or CHOOSE
 
   <total> := SUM(<expression>) [ FILTER (WHERE <filter>) ]
            | COUNT(*)          [ FILTER (WHERE <filter>) ]
@@ -285,6 +285,22 @@ PREDICT COUNT(txns) FOR accounts WHERE balance < -100 USING MODEL churn;
 | `MAX_CATEGORIES` | 16 | 0 to 4096; above it a text column is frequency-encoded rather than given a slot per value |
 | `L2` | 0 | 0 to 1; decoupled weight decay, on weights and not biases |
 | `LOG_TARGET` | 0 | 0 or 1; fit a non-negative attribute on `log1p` and read it back with `expm1` (skewed counts and amounts) |
+
+### OPTIMIZE without a model
+
+`USING MODEL` is needed only when the plan uses what a model knows: the word
+`prediction`, or `CHOOSE` (which asks the model what each value would do).
+Without it, OPTIMIZE is constraint programming on the table's own columns: a
+value, a distance, a capacity. There is no `prediction` column in the result,
+and with `ASSIGN`, a task left on `ELSE` adds nothing to the totals, as a row
+not picked adds nothing without `ASSIGN`.
+
+```
+OPTIMIZE loads ASSIGN truck OVER trucks.truck ELSE 'partner'
+  ONLY IF resource.trailer = trailer
+  MAXIMIZE SUM(value)
+  SUBJECT TO COUNT(*) PER truck <= 1;
+```
 
 ### OPTIMIZE ... ASSIGN: tasks on resources
 

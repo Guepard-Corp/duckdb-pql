@@ -728,7 +728,7 @@ struct OptimizeOutcome {
 // a plan. `pred`, `obj` and `con` are indexed [i * K + k] over the candidate
 // rows and the choices (resources, then ELSE), as the shared loop filled them
 // with the plan values at zero.
-inline OptimizeOutcome RunAssign(Database &db, const Frame &entity, const std::string &alias, const Model &model,
+inline OptimizeOutcome RunAssign(Database &db, const Frame &entity, const std::string &alias, const Model *model,
                                  const Statement &stmt, OptimizeSpec &spec, const AssignBinding &ab,
                                  const std::vector<Prediction> &rows, const std::vector<double> &pred,
                                  const std::vector<double> &obj, const std::vector<std::vector<double>> &con,
@@ -1010,7 +1010,11 @@ inline OptimizeOutcome RunAssign(Database &db, const Frame &entity, const std::s
 	return out;
 }
 
-inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const Statement &stmt,
+// `model` is null when the statement has no USING MODEL: the plan then stands on
+// the table's own columns (the parser has refused prediction and CHOOSE), every
+// row the WHERE keeps is a candidate, and a task left on ASSIGN's ELSE adds
+// nothing to the totals, as a row not picked adds nothing without ASSIGN.
+inline OptimizeOutcome RunOptimize(Database &db, const Model *model, const Statement &stmt,
                                    const CancelCheck &cancelled = CancelCheck(),
                                    const OptSettings &settings = OptSettings()) {
 	if (stmt.kind != StmtKind::OPTIMIZE) {
@@ -1045,7 +1049,10 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 	out.assigning = spec.Assigning();
 	out.maximize = spec.maximize;
 	out.choices = spec.choices;
-	const int lever = out.choosing ? ResolveLever(entity, model, stmt, spec) : -1;
+	// Without a model the lever is only written to the plan; a column of that name
+	// is used when the table has one, so CASE and FILTER can read the value tried.
+	const int lever = !out.choosing ? -1 : model ? ResolveLever(entity, *model, stmt, spec)
+	                                             : entity.Find(spec.lever.name);
 	out.lever_col = lever;
 
 	// The rows a plan may act on, decided on the data as it stands: a WHERE that
@@ -1056,7 +1063,7 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 	}
 	Statement ps;
 	ps.kind = StmtKind::PREDICT;
-	ps.model = model.name;
+	ps.model = model ? model->name : std::string();
 	ps.entity_table = stmt.entity_table;
 	ps.entity_alias = alias;
 	ps.anchor = stmt.anchor;
@@ -1117,7 +1124,20 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 				}
 			}
 		}
-		std::vector<Prediction> ps_k = RunPredict(db, model, ps, cancelled, &candidate);
+		std::vector<Prediction> ps_k;
+		if (model) {
+			ps_k = RunPredict(db, *model, ps, cancelled, &candidate);
+		} else {
+			for (size_t r = 0; r < entity.nrows; r++) {
+				if (candidate[r]) {
+					Prediction p;
+					p.entity_row = (uint32_t)r;
+					ps_k.push_back(p);
+				}
+			}
+		}
+		// Without a model, nothing is known about a task left to ELSE: it adds nothing.
+		const bool counts = model || !(out.assigning && spec.assign.has_else && k + 1 == K);
 		if (k == 0) {
 			rows = ps_k;
 			pred.assign(rows.size() * K, 0.0);
@@ -1139,7 +1159,7 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 			for (size_t j = 0; j <= m; j++) {
 				ExprEval ev;
 				const OptAggregate &agg = j == 0 ? spec.objective : spec.constraints[j - 1].total;
-				const double val = EvalAggregateRow(agg, entity, r, p, ev);
+				const double val = counts ? EvalAggregateRow(agg, entity, r, p, ev) : 0.0;
 				if (ev.missing) {
 					if (!row_missing[i]) {
 						row_missing[i] = 1;
@@ -1167,9 +1187,9 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 	}
 
 	// What the rows are worth with every lever left as it is, from the same model.
-	if (lever >= 0) {
+	if (lever >= 0 && model) {
 		restore.Put();
-		std::vector<Prediction> now = RunPredict(db, model, ps, cancelled, &candidate);
+		std::vector<Prediction> now = RunPredict(db, *model, ps, cancelled, &candidate);
 		bool ok = now.size() == n;
 		double total = 0;
 		for (size_t i = 0; ok && i < n; i++) {
@@ -1310,6 +1330,12 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const State
 	out.bound = sgn * sol.bound;
 	out.exact = sol.exact;
 	return out;
+}
+
+inline OptimizeOutcome RunOptimize(Database &db, const Model &model, const Statement &stmt,
+                                   const CancelCheck &cancelled = CancelCheck(),
+                                   const OptSettings &settings = OptSettings()) {
+	return RunOptimize(db, &model, stmt, cancelled, settings);
 }
 
 } // namespace pql

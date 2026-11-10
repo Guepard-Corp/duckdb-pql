@@ -211,7 +211,7 @@ OPTIMIZE trucks MAXIMIZE SUM(prediction) USING MODEL nope;
 statement error
 OPTIMIZE trucks MAXIMIZE SUM(prediction);
 ----
-<REGEX>:.*needs USING MODEL.*
+<REGEX>:.*prediction is a model's answer.*
 
 statement ok
 UPDATE trucks SET service_cost = NULL WHERE id = 7;
@@ -382,3 +382,56 @@ statement error
 OPTIMIZE jobs WHERE open = 1 AT received_at CHOOSE crew IN ('A', 'B') MAXIMIZE SUM(prediction - plan.setup) USING MODEL job_margin;
 ----
 exist only in an ASSIGN statement
+
+# Without USING MODEL: constraint programming on the table's own columns.
+statement ok
+CREATE TABLE vans (truck VARCHAR, trailer VARCHAR, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO vans VALUES ('T1', 'dry_van', 32.78, -96.80), ('T2', 'reefer', 29.76, -95.37);
+
+statement ok
+CREATE TABLE parcels (parcel_id INTEGER PRIMARY KEY, trailer VARCHAR, value DOUBLE, lat DOUBLE, lon DOUBLE);
+
+statement ok
+INSERT INTO parcels VALUES (1, 'dry_van', 1500, 32.78, -96.80), (2, 'reefer', 800, 29.76, -95.37), (3, 'dry_van', 1400, 33.75, -84.39);
+
+# Which rows: the two most valuable, whatever the trucks.
+query II
+SELECT parcel_id, objective FROM pql_exec('OPTIMIZE parcels MAXIMIZE SUM(value) SUBJECT TO COUNT(*) <= 2') ORDER BY parcel_id;
+----
+1	1500.0
+3	1400.0
+
+# Which truck: the trailer must match and each truck takes one; a task left to ELSE adds nothing.
+query IIR
+SELECT parcel_id, truck, objective FROM pql_exec('OPTIMIZE parcels ASSIGN truck OVER vans.truck ELSE ''partner'' ONLY IF resource.trailer = trailer MAXIMIZE SUM(value) SUBJECT TO COUNT(*) PER truck <= 1') ORDER BY parcel_id;
+----
+1	T1	1500.0
+2	T2	800.0
+3	partner	0.0
+
+# Distance is a cost: the Atlanta load is worth the most, but both trucks are ~700 miles away.
+query II
+SELECT parcel_id, truck FROM pql_exec('OPTIMIZE parcels ASSIGN truck OVER vans.truck ELSE ''none'' SEQUENCE START DISTANCE(resource.lat, resource.lon, lat, lon) MAXIMIZE SUM(value - 1.0 * plan.setup) SUBJECT TO COUNT(*) PER truck <= 1') ORDER BY parcel_id;
+----
+1	T1
+2	T2
+3	none
+
+# No prediction column without a model.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM pql_exec('OPTIMIZE parcels MAXIMIZE SUM(value) SUBJECT TO COUNT(*) <= 2')) WHERE column_name = 'prediction';
+----
+0
+
+statement error
+OPTIMIZE parcels MAXIMIZE SUM(prediction) SUBJECT TO COUNT(*) <= 2;
+----
+<REGEX>:.*prediction is a model's answer.*
+
+statement error
+OPTIMIZE parcels CHOOSE trailer IN ('dry_van') MAXIMIZE SUM(value);
+----
+<REGEX>:.*CHOOSE asks a model.*
+
