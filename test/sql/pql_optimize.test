@@ -435,3 +435,30 @@ OPTIMIZE parcels CHOOSE trailer IN ('dry_van') MAXIMIZE SUM(value);
 ----
 <REGEX>:.*CHOOSE asks a model.*
 
+# A pure pairing (one task per resource, values known per pair) is solved exactly.
+statement ok
+CREATE TABLE rigs (rig VARCHAR, dallas DOUBLE, houston DOUBLE, atlanta DOUBLE);
+
+statement ok
+INSERT INTO rigs VALUES ('T1', 50, 100, 900), ('T2', 60, 700, 800), ('T3', 800, 120, 100);
+
+statement ok
+CREATE TABLE hauls (haul_id INTEGER PRIMARY KEY, pickup VARCHAR, value DOUBLE);
+
+statement ok
+INSERT INTO hauls VALUES (1, 'Dallas', 660), (2, 'Houston', 1310), (3, 'Atlanta', 1020);
+
+# Nearest first would send T2 800 miles to Atlanta; the best plan gives every haul a near truck.
+query II
+SELECT haul_id, rig FROM pql_exec('OPTIMIZE hauls ASSIGN rig OVER rigs.rig SEQUENCE START CASE pickup WHEN ''Dallas'' THEN resource.dallas WHEN ''Houston'' THEN resource.houston ELSE resource.atlanta END MAXIMIZE SUM(value - 1.0 * plan.setup) SUBJECT TO COUNT(*) PER rig <= 1') ORDER BY haul_id;
+----
+1	T2
+2	T1
+3	T3
+
+# Proven best: the bound is the objective.
+query RR
+SELECT value, bound FROM pql_exec('EXPLAIN OPTIMIZE hauls ASSIGN rig OVER rigs.rig SEQUENCE START CASE pickup WHEN ''Dallas'' THEN resource.dallas WHEN ''Houston'' THEN resource.houston ELSE resource.atlanta END MAXIMIZE SUM(value - 1.0 * plan.setup) SUBJECT TO COUNT(*) PER rig <= 1') WHERE measure = 'objective';
+----
+2730.0	2730.0
+
