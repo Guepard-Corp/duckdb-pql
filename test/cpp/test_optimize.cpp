@@ -175,7 +175,12 @@ static void Grammar() {
 
 	std::printf("== grammar: rejects\n");
 	Err("OPTIMIZE t USING MODEL m", "needs a goal");
-	Err("OPTIMIZE t MAXIMIZE SUM(x)", "needs USING MODEL");
+	// Without a model a plan stands on the table's own columns; prediction and CHOOSE need one.
+	Ok("OPTIMIZE t MAXIMIZE SUM(x)");
+	Ok("OPTIMIZE t ASSIGN r OVER rs.id ELSE 'none' MAXIMIZE SUM(x) SUBJECT TO COUNT(*) PER r <= 1");
+	Err("OPTIMIZE t MAXIMIZE SUM(prediction)", "prediction is a model's answer");
+	Err("OPTIMIZE t MAXIMIZE COUNT(*) FILTER (WHERE prediction > 0.5)", "prediction is a model's answer");
+	Err("OPTIMIZE t CHOOSE c IN ('a', 'b') MAXIMIZE SUM(x)", "CHOOSE asks a model");
 	Err("OPTIMIZE t MAXIMIZE SUM(x) MINIMIZE SUM(y) USING MODEL m", "duplicate MAXIMIZE/MINIMIZE");
 	Err("OPTIMIZE t MAXIMIZE AVG(x) USING MODEL m", "expected SUM(<expression>) or COUNT(*)");
 	Err("OPTIMIZE t MAXIMIZE x USING MODEL m", "expected SUM(<expression>) or COUNT(*)");

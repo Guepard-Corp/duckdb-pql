@@ -927,7 +927,7 @@ struct Statement : StatementData {
 			for (size_t i = 0; i < o.constraints.size(); i++) {
 				s += (i ? " AND " : " SUBJECT TO ") + o.constraints[i].ToString();
 			}
-			return s + " USING MODEL " + QuoteIdent(model);
+			return model.empty() ? s : s + " USING MODEL " + QuoteIdent(model);
 		}
 		s = (kind == StmtKind::TRAIN)
 		        ? ((or_replace ? "TRAIN OR REPLACE MODEL " : "TRAIN MODEL ") + QuoteIdent(model) + " PREDICT ")
@@ -1363,8 +1363,9 @@ private:
 	// values a plan gives it. Outside ASSIGN none of them exist.
 	enum Allow : uint8_t { ALLOW_RESOURCE = 1, ALLOW_PREV = 2, ALLOW_PLAN = 4 };
 	uint8_t allow_ = 0;
-	bool saw_plan_ = false; // a plan.* value was used; needs ASSIGN
-	bool saw_per_ = false;  // a PER limit was written; needs ASSIGN
+	bool saw_plan_ = false;       // a plan.* value was used; needs ASSIGN
+	bool saw_prediction_ = false; // the model's answer was used; needs USING MODEL
+	bool saw_per_ = false;        // a PER limit was written; needs ASSIGN
 	struct AllowScope {
 		uint8_t &slot;
 		uint8_t saved;
@@ -1482,7 +1483,7 @@ private:
 		}
 		bool seen_where = false, seen_at = false, seen_choose = false, seen_goal = false, seen_subject = false;
 		bool seen_using = false, seen_assign = false;
-		saw_plan_ = saw_per_ = false;
+		saw_plan_ = saw_per_ = saw_prediction_ = false;
 		while (Peek().kind != Tok::END && !(Peek().kind == Tok::PUNCT && Peek().text == ";")) {
 			if (PeekKw("WHERE")) {
 				Once(seen_where, "WHERE");
@@ -1566,10 +1567,18 @@ private:
 		if (!seen_goal) {
 			throw ParseError("OPTIMIZE needs a goal: MAXIMIZE SUM(<expression>) or MINIMIZE SUM(<expression>)", 0);
 		}
-		if (st.model.empty()) {
-			throw ParseError("OPTIMIZE needs USING MODEL <name>: the model whose predictions it plans with", 0);
-		}
 		const OptimizeSpec &o = st.optimize;
+		// A plan can stand on the table's own columns alone (a value, a distance, a
+		// capacity): constraint programming without a prediction. The model is needed
+		// only for what only a model knows.
+		if (st.model.empty() && saw_prediction_) {
+			throw ParseError("prediction is a model's answer: add USING MODEL <name>, or plan on the table's own "
+			                 "columns instead",
+			                 0);
+		}
+		if (st.model.empty() && o.Choosing()) {
+			throw ParseError("CHOOSE asks a model what each value would do: add USING MODEL <name>", 0);
+		}
 		if (o.Assigning() && o.Choosing()) {
 			throw ParseError("ASSIGN and CHOOSE both decide the lever; write one of them", 0);
 		}
@@ -1832,6 +1841,7 @@ private:
 			if (t.kind == Tok::KEYWORD && t.upper == "PREDICTION" &&
 			    !(Peek(1).kind == Tok::PUNCT && Peek(1).text == ".")) {
 				Next();
+				saw_prediction_ = true;
 				node->kind = Expr::Kind::PREDICTION;
 				return node;
 			}
@@ -2077,6 +2087,7 @@ private:
 				                 Peek().pos);
 			}
 			Next();
+			saw_prediction_ = true;
 			node->prediction = true;
 			node->ref.name = "prediction";
 		} else {
