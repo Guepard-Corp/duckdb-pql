@@ -1056,8 +1056,9 @@ inline OptimizeOutcome RunOptimize(Database &db, const Model *model, const State
 	out.choices = spec.choices;
 	// Without a model the lever is only written to the plan; a column of that name
 	// is used when the table has one, so CASE and FILTER can read the value tried.
-	const int lever = !out.choosing ? -1 : model ? ResolveLever(entity, *model, stmt, spec)
-	                                             : entity.Find(spec.lever.name);
+	const int lever = !out.choosing ? -1
+	                  : model       ? ResolveLever(entity, *model, stmt, spec)
+	                                : entity.Find(spec.lever.name);
 	out.lever_col = lever;
 
 	// The rows a plan may act on, decided on the data as it stands: a WHERE that

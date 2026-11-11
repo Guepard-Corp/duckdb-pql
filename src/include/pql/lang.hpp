@@ -1363,9 +1363,9 @@ private:
 	// values a plan gives it. Outside ASSIGN none of them exist.
 	enum Allow : uint8_t { ALLOW_RESOURCE = 1, ALLOW_PREV = 2, ALLOW_PLAN = 4 };
 	uint8_t allow_ = 0;
-	bool saw_plan_ = false; // a plan.* value was used; needs ASSIGN
+	bool saw_plan_ = false;       // a plan.* value was used; needs ASSIGN
 	bool saw_prediction_ = false; // the model's answer was used; needs USING MODEL
-	bool saw_per_ = false;  // a PER limit was written; needs ASSIGN
+	bool saw_per_ = false;        // a PER limit was written; needs ASSIGN
 	struct AllowScope {
 		uint8_t &slot;
 		uint8_t saved;

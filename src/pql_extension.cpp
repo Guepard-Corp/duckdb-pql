@@ -1298,8 +1298,9 @@ static void RunOptimizeStmt(ClientContext &context, pql::Statement &stmt, PqlBin
 		eff.every = model->spec_stmt.every;
 	}
 	const bool generated_anchor = model && model->spec_stmt.every.present;
-	const int anchor_out =
-	    !model ? -1 : (eff.anchor_is_literal || generated_anchor) ? -1 : pql::ResolveAnchorColumn(entity, eff);
+	const int anchor_out = !model                                        ? -1
+	                       : (eff.anchor_is_literal || generated_anchor) ? -1
+	                                                                     : pql::ResolveAnchorColumn(entity, eff);
 	const bool with_anchor =
 	    model && (anchor_out >= 0 || ((eff.anchor_is_literal || generated_anchor) && !out.plan.empty()));
 	LogicalType lever_logical = LogicalType::VARCHAR;
